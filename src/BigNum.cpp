@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
                 if (idx >= exponents.size()) break;
                 const uint32_t p = exponents[idx];
                 const auto t0 = std::chrono::steady_clock::now();
-                const bool isPrime = mersenne::lucas_lehmer(p, false);
+                const bool isPrime = mersenne::lucas_lehmer(p, true);
                 const auto t1 = std::chrono::steady_clock::now();
                 const std::chrono::duration<double> elapsed = t1 - t0;
                 std::lock_guard<std::mutex> lock(printMutex);
