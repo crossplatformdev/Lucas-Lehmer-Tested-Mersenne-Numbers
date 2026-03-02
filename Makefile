@@ -6,7 +6,7 @@ SRC := src/BigNum.cpp
 BIN := bin/bignum
 TEST_BIN := bin/test_bignum
 
-.PHONY: all clean test
+.PHONY: all clean test bench bench-ci
 
 BENCH_START_INDEX ?= 14
 
@@ -22,15 +22,15 @@ $(TEST_BIN): tests/test_bignum.cpp $(SRC)
 
 test: $(TEST_BIN) $(BIN)
 	./$(TEST_BIN)
-	LL_STOP_AFTER_ONE=0 ./$(BIN) 0 0
+	LL_STOP_AFTER_ONE=1 ./$(BIN) 0 1
 
 bench: $(BIN)
 	@echo "Benchmark (index=$(BENCH_START_INDEX)): 1 hilo vs máximo cores"
 	@set -e; \
 		t0=$$(date +%s%N); \
-		LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 0 >/dev/null; \
+		LL_STOP_AFTER_ONE=1 ./$(BIN) $(BENCH_START_INDEX) 1 >/dev/null; \
 		t1=$$(date +%s%N); \
-		LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 0 >/dev/null; \
+		LL_STOP_AFTER_ONE=1 ./$(BIN) $(BENCH_START_INDEX) 0 >/dev/null; \
 		t2=$$(date +%s%N); \
 		one_ms=$$(( (t1 - t0) / 1000000 )); \
 		max_ms=$$(( (t2 - t1) / 1000000 )); \
@@ -42,7 +42,8 @@ bench: $(BIN)
 
 bench-ci: $(BIN)
 	@echo "Running CI benchmark"
-	@LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 0
+	@LL_STOP_AFTER_ONE=1 ./$(BIN) $(BENCH_START_INDEX) 1
+	@LL_STOP_AFTER_ONE=1 ./$(BIN) $(BENCH_START_INDEX) 0
 
 clean:
 	rm -rf bin
