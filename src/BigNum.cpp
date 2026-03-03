@@ -24,9 +24,9 @@
 //  [Phase 1] Carmack fast-inverse-sqrt principle applied to is_prime_exponent():
 //    precompute sqrt(n) once before the trial-division loop, replacing a 128-bit
 //    i*i multiply in the loop condition with a simple 64-bit comparison.
-//  [Phase 2] fft_core() sign branch removed: caller passes pre-negated tw_im_inv
-//    for the inverse pass.  Eliminates a data-dependent branch from the butterfly
-//    inner loop, enabling the compiler to auto-vectorize with AVX2/FMA.
+//  [Phase 2] fft_core() sign branch removed: caller passes pre-negated tw_im_half_inv
+//    for the inverse n/2-point pass.  Eliminates a data-dependent branch from the
+//    butterfly inner loop, enabling the compiler to auto-vectorize with AVX2/FMA.
 //  [Phase 3] inv_mod_pow[] precomputed reciprocals (Carmack principle): carry
 //    propagation uses multiply-by-reciprocal (4 cycles) instead of divide (20+).
 //    std::nearbyint replaces std::round (single VROUNDSD vs multi-instruction).
@@ -163,11 +163,19 @@ bool is_prime_exponent(uint64_t n) {
     if ((n & 1u) == 0u) return false;
     if (n % 3u == 0u) return n == 3u;
     if (n % 5u == 0u) return n == 5u;
-    // Precompute upper bound: for n < 2^53 the hardware sqrt is within 1 ULP,
-    // so limit+1 is always >= floor(sqrt(n)).  Adding 1 is the Newton-Raphson
-    // "correction step" that guarantees we never miss a factor.
-    const uint64_t limit = static_cast<uint64_t>(std::sqrt(static_cast<double>(n))) + 1u;
-    for (uint64_t i = 7u; i <= limit; i += 2u) {
+    // Precompute floor(sqrt(n)) via hardware VSQRTSD (Carmack: one approximation
+    // before the loop, then a cheap integer comparison inside every iteration).
+    // For n < 2^53 the double result is exact.  For n >= 2^53 the floating-point
+    // sqrt may under-approximate floor(sqrt(n)) by up to 1 ULP; we correct that
+    // with at most one post-adjustment increment using an overflow-safe __uint128_t
+    // comparison (GCC/Clang extension, required by the build system anyway).
+    // The correction runs once outside the hot loop, so the inner loop body
+    // remains a plain 64-bit `i <= isqrt` comparison with no 128-bit arithmetic.
+    __extension__ typedef unsigned __int128 u128_isqrt;
+    uint64_t isqrt = static_cast<uint64_t>(std::sqrt(static_cast<double>(n)));
+    // Adjust upward until isqrt == floor(sqrt(n)).  At most one increment.
+    while ((u128_isqrt)isqrt * (u128_isqrt)isqrt < (u128_isqrt)n) ++isqrt;
+    for (uint64_t i = 7u; i <= isqrt; i += 2u) {
         if (n % i == 0u) return false;
     }
     return true;
@@ -892,10 +900,9 @@ struct FftMersenneState {
     // FFT twiddle table, length n/2:  twiddle[k] = e^{−2πik/n}.
     std::vector<double>   tw_re;        // cos(−2πk/n)
     std::vector<double>   tw_im;        // sin(−2πk/n)
-    // Pre-negated imaginary twiddles for inverse FFT – eliminates the
-    // `sign >= 0 ? tw_im : -tw_im` branch from the butterfly inner loop,
-    // enabling the compiler to auto-vectorize that loop.
-    std::vector<double>   tw_im_inv;    // = -tw_im[k]
+    // Note: the n-point inverse twiddle table is NOT stored here.
+    // The current real-FFT path uses the precomputed half-size tw_im_half_inv
+    // table instead, so a separate n-point negated table would be dead weight.
 
     // Bit-reversal permutation table (length n).
     std::vector<size_t>   bitrv;
@@ -980,13 +987,6 @@ static void fft_mersenne_init_tables(FftMersenneState& st) {
         st.tw_re[m] = std::cos(angle);
         st.tw_im[m] = std::sin(angle);
     }
-    // Pre-negated imaginary twiddles for the inverse FFT pass.
-    // Eliminates `sign >= 0 ? tw_im[m] : -tw_im[m]` from the butterfly inner
-    // loop, removing a data-dependent branch that blocks auto-vectorization.
-    st.tw_im_inv.resize(half);
-    for (size_t m = 0; m < half; ++m)
-        st.tw_im_inv[m] = -st.tw_im[m];
-
     // Per-digit tables.
     st.digit_width.resize(n);
     st.bit_pos.resize(n);
@@ -1073,8 +1073,8 @@ static void fft_mersenne_init_tables(FftMersenneState& st) {
 // In-place iterative Cooley–Tukey DIT FFT of length n (must be power of 2).
 // Data is split into re[]/im[] arrays.
 // tw_im must be the correctly-signed imaginary twiddles for the desired
-// direction: pass st.tw_im for forward (sign = +1) or st.tw_im_inv for
-// inverse (sign = -1).  The branch `sign >= 0 ? tw_im[m] : -tw_im[m]`
+// direction: pass tw_im for forward or a pre-negated table for inverse.
+// The branch `sign >= 0 ? tw_im[m] : -tw_im[m]`
 // has been removed from the inner loop; the caller pre-selects the table.
 // This eliminates a branch inside the hottest nested loop and allows the
 // compiler to auto-vectorize the butterfly with AVX2/FMA.
@@ -1123,7 +1123,7 @@ static void fft_core(double* __restrict__ re, double* __restrict__ im,
 // integer, manipulate the exponent, reinterpret as float.  Here the operation
 // is exact (no Newton-Raphson refinement needed) because we only adjust the
 // exponent, never the mantissa.
-static inline double fast_ldexp_neg(double x, int b) noexcept {
+[[maybe_unused]] static inline double fast_ldexp_neg(double x, int b) noexcept {
     uint64_t bits;
     std::memcpy(&bits, &x, sizeof(bits));
     bits -= static_cast<uint64_t>(b) << 52;   // subtract b from biased exponent
