@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <queue>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -81,7 +82,7 @@ public:
     void submit(F&& f) {
         {
             std::lock_guard<std::mutex> lk(mu_);
-            tasks_.emplace_back(std::forward<F>(f));
+            tasks_.emplace(std::forward<F>(f));
         }
         cv_.notify_one();
     }
@@ -100,7 +101,7 @@ private:
                 cv_.wait(lk, [this] { return stop_ || !tasks_.empty(); });
                 if (stop_ && tasks_.empty()) return;
                 task = std::move(tasks_.front());
-                tasks_.erase(tasks_.begin());
+                tasks_.pop();
                 ++busy_;
             }
             task();
@@ -116,7 +117,7 @@ private:
     std::condition_variable cv_;
     std::condition_variable done_cv_;
     std::vector<std::thread> workers_;
-    std::vector<std::function<void()>> tasks_;
+    std::queue<std::function<void()>> tasks_;
     unsigned busy_{0};
     bool stop_{false};
 };
@@ -182,7 +183,10 @@ static inline size_t next_pow2(size_t x) {
     if (x == 0) return 1;
     --x;
     x |= x >> 1; x |= x >> 2; x |= x >> 4;
-    x |= x >> 8; x |= x >> 16; x |= x >> 32;
+    x |= x >> 8; x |= x >> 16;
+    if constexpr (sizeof(size_t) > 4) {
+        x |= x >> 32;
+    }
     return x + 1;
 }
 
@@ -529,9 +533,12 @@ struct FftMersenneBackend {
 #ifdef HAVE_GMP
 struct GmpState {
     uint32_t p{0};
-    size_t nlimbs{0};          // ceil(p / GMP_NUMB_BITS)
-    std::vector<mp_limb_t> s;  // current value, nlimbs limbs, little-endian
-    std::vector<mp_limb_t> sq; // scratch for 2*nlimbs squaring result
+    size_t nlimbs{0};           // ceil(p / GMP_NUMB_BITS)
+    std::vector<mp_limb_t> s;   // current value, nlimbs limbs, little-endian
+    std::vector<mp_limb_t> sq;  // scratch for 2*nlimbs squaring result
+    std::vector<mp_limb_t> hi;  // scratch for hi-part extraction (2*nlimbs)
+    std::vector<mp_limb_t> lo;  // scratch for lo-part masked (nlimbs)
+    std::vector<mp_limb_t> mod; // scratch for Mersenne modulus (nlimbs)
     double max_roundoff{0.0};
 };
 
@@ -544,6 +551,13 @@ struct GmpBackend {
         st.nlimbs = (p + GMP_NUMB_BITS - 1) / GMP_NUMB_BITS;
         st.s.assign(st.nlimbs, 0);
         st.sq.resize(2 * st.nlimbs, 0);
+        st.hi.resize(2 * st.nlimbs, 0);  // worst-case: shift_limbs <= 2*nlimbs
+        st.lo.resize(st.nlimbs, 0);
+        // Pre-build Mersenne modulus (2^p − 1) for borrow correction.
+        const unsigned partial = static_cast<unsigned>(p % GMP_NUMB_BITS);
+        st.mod.assign(st.nlimbs, ~mp_limb_t(0));
+        if (partial != 0)
+            st.mod[st.nlimbs - 1] = (mp_limb_t(1) << partial) - 1;
         // s_0 = 4
         st.s[0] = 4;
         return st;
@@ -565,19 +579,19 @@ struct GmpBackend {
             carry = mpn_add_n(st.s.data(), st.sq.data(), st.sq.data() + n,
                               static_cast<mp_size_t>(n));
         } else {
-            // Extract hi starting at bit p:
-            //   hi = sq >> p  (n limbs worth)
+            // Extract hi starting at bit p using pre-allocated scratch buffer.
+            //   hi = sq >> p
             const size_t limb_offset = st.p / GMP_NUMB_BITS;
             const size_t shift_limbs = 2 * n - limb_offset;
-            std::vector<mp_limb_t> hi(shift_limbs, 0);
-            mpn_rshift(hi.data(), st.sq.data() + limb_offset,
+            std::fill(st.hi.begin(), st.hi.begin() + static_cast<ptrdiff_t>(shift_limbs), mp_limb_t(0));
+            mpn_rshift(st.hi.data(), st.sq.data() + limb_offset,
                        static_cast<mp_size_t>(shift_limbs),
                        partial);
-            // lo = sq[0..n-1] masked to p bits
-            std::vector<mp_limb_t> lo(st.sq.begin(), st.sq.begin() + static_cast<ptrdiff_t>(n));
-            lo[n - 1] &= (mp_limb_t(1) << partial) - 1;  // clear bits above p
+            // lo = sq[0..n-1] masked to p bits (use pre-allocated scratch)
+            std::copy(st.sq.begin(), st.sq.begin() + static_cast<ptrdiff_t>(n), st.lo.begin());
+            st.lo[n - 1] &= (mp_limb_t(1) << partial) - 1;  // clear bits above p
             // Only the first n limbs of hi are used; higher limbs are 0 since sq < 2^(2p)
-            carry = mpn_add_n(st.s.data(), lo.data(), hi.data(),
+            carry = mpn_add_n(st.s.data(), st.lo.data(), st.hi.data(),
                               static_cast<mp_size_t>(n));
         }
 
@@ -590,11 +604,8 @@ struct GmpBackend {
         mp_limb_t borrow = mpn_sub_1(st.s.data(), st.s.data(), static_cast<mp_size_t>(n), 2);
 
         if (borrow) {
-            // Underflow: add back the modulus M = 2^p − 1 (all ones in p bits).
-            std::vector<mp_limb_t> mod(n, ~mp_limb_t(0));
-            if (partial != 0)
-                mod[n - 1] = (mp_limb_t(1) << partial) - 1;
-            (void)mpn_add_n(st.s.data(), st.s.data(), mod.data(), static_cast<mp_size_t>(n));
+            // Underflow: add back the pre-built Mersenne modulus M = 2^p − 1.
+            (void)mpn_add_n(st.s.data(), st.s.data(), st.mod.data(), static_cast<mp_size_t>(n));
         }
 
         // Reduce top limb mask to ensure s stays within p bits.

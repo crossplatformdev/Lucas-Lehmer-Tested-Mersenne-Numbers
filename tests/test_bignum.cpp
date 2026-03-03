@@ -50,6 +50,9 @@ int main() {
     assert(lucas_lehmer(607,  false, /*benchmark_mode=*/true));
     assert(lucas_lehmer(1279, false, /*benchmark_mode=*/true));
 
+    // --- lucas_lehmer: fast rejection for composite exponent p >= 128 ---
+    assert(!lucas_lehmer(129, false));
+
     // --- runtime ---
     const unsigned cores = runtime::detect_available_cores();
     assert(cores >= 1u);
