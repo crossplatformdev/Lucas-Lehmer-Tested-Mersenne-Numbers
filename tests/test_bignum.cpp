@@ -50,6 +50,10 @@ int main() {
     assert(lucas_lehmer(607,  false, /*benchmark_mode=*/true));
     assert(lucas_lehmer(1279, false, /*benchmark_mode=*/true));
 
+    // --- lucas_lehmer: large case via FftMersenneBackend (p >= kLimbFftCrossover = 4000) ---
+    // Ensures the updated FFT carry path is exercised in CI.
+    assert(lucas_lehmer(4253, false, /*benchmark_mode=*/true));
+
     // --- lucas_lehmer: fast rejection for composite exponent p >= 128 ---
     assert(!lucas_lehmer(129, false));
 

@@ -266,11 +266,12 @@ static void schoolbook_sq(const uint64_t* __restrict__ a,
             sq[i + j] = (uint64_t)t;
             carry      = (uint64_t)(t >> 64);
         }
-        for (int k = i + n; carry != 0; ++k) {
+        for (int k = i + n; k < 2 * n && carry != 0; ++k) {
             u128_t t = (u128_t)sq[k] + carry;
             sq[k]  = (uint64_t)t;
             carry  = (uint64_t)(t >> 64);
         }
+        assert(carry == 0);
     }
 }
 
@@ -488,13 +489,14 @@ struct LimbBackend {
                 }
                 // For non-limb-aligned p: n*64 - p = 64 - partial > 0, so the
                 // n-limb addition result fits in n*64 bits (lo+hi < 2^{p+1} < 2^{n*64}).
-                // carry here is 0 in almost all cases; guard included for safety.
+                // carry must be 0: lo+hi < 2^p + 2^p = 2^{p+1} ≤ 2^{n*64-1} < 2^{n*64}.
+                assert(carry == 0);
                 // Extract overflow bits above bit position (partial-1) from the top limb
                 // and fold back: 2^p ≡ 1 mod M_p.
                 uint64_t overflow = st.s[n - 1] >> bit_shift;
                 st.s[n - 1] &= st.top_mask;
-                if (overflow | carry) {
-                    uint64_t c2 = overflow + carry;
+                if (overflow) {
+                    uint64_t c2 = overflow;
                     for (int i = 0; c2 && i < n; ++i) {
                         u128_t t = (u128_t)st.s[i] + c2;
                         st.s[i] = (uint64_t)t;
@@ -612,8 +614,7 @@ struct FftMersenneState {
 
     // Precomputed exp2 tables for carry propagation (length n).
     std::vector<double>   mod_pow;      // 2^{digit_width[j]} per digit
-    std::vector<double>   inv_mod_pow;  // 2^{-digit_width[j]} per digit
-    std::vector<double>   half_pow;     // 2^{digit_width[j] - 1} per digit
+    // inv_mod_pow[j] == 1.0/mod_pow[j], half_pow[j] == 0.5*mod_pow[j]: derived inline.
 
     // Working buffers (length n) – reused across every iteration.
     std::vector<double>   buf_re;
@@ -702,13 +703,8 @@ static void fft_mersenne_init_tables(FftMersenneState& st) {
 
     // Precomputed exp2 tables.
     st.mod_pow.resize(n);
-    st.inv_mod_pow.resize(n);
-    st.half_pow.resize(n);
-    for (size_t j = 0; j < n; ++j) {
-        st.mod_pow[j]     = std::ldexp(1.0, st.digit_width[j]);
-        st.inv_mod_pow[j] = std::ldexp(1.0, -st.digit_width[j]);
-        st.half_pow[j]    = std::ldexp(1.0, st.digit_width[j] - 1);
-    }
+    for (size_t j = 0; j < n; ++j)
+        st.mod_pow[j] = std::ldexp(1.0, st.digit_width[j]);
 }
 
 // In-place iterative Cooley–Tukey DIT FFT of length n (must be power of 2).
@@ -800,7 +796,7 @@ static void fft_square(FftMersenneState& st) {
             st.digits[k] = std::floor(v);
             // Propagate the half-unit backward (mod n, Mersenne wrap).
             const size_t kp = (k == 0) ? (n - 1) : (k - 1);
-            st.digits[kp] += st.half_pow[kp];
+            st.digits[kp] += 0.5 * st.mod_pow[kp];
         }
     }
 
@@ -815,7 +811,7 @@ static void fft_square(FftMersenneState& st) {
         if (err > max_err) max_err = err;
 
         const double modj = st.mod_pow[j];
-        carry          = std::floor(rounded * st.inv_mod_pow[j]);
+        carry          = std::floor(rounded / modj);
         st.digits[j]   = rounded - carry * modj;
     }
 
@@ -828,7 +824,7 @@ static void fft_square(FftMersenneState& st) {
             const double err_j     = std::abs(raw_j - rounded_j);
             if (err_j > max_err) max_err = err_j;
             const double modj = st.mod_pow[j];
-            carry2         = std::floor(rounded_j * st.inv_mod_pow[j]);
+            carry2         = std::floor(rounded_j / modj);
             st.digits[j]   = rounded_j - carry2 * modj;
         }
     }
@@ -1049,7 +1045,22 @@ bool lucas_lehmer(uint32_t p, bool progress, bool benchmark_mode = false) {
     //   p=3217 (51 limbs): LimbBackend ~10ms vs FFT ~30ms → Limb wins.
     //   p=4253 (67 limbs): LimbBackend ~50ms vs FFT ~32ms → FFT wins.
     //   Crossover observed near p≈4000; tune with `make bench` on the target CPU.
-    static constexpr uint32_t kLimbFftCrossover = 4000u;
+    //   Override at runtime via the LL_LIMB_FFT_CROSSOVER environment variable.
+    // Upper bound: no known Mersenne exponent exceeds 100 million digits (p < 10^9),
+    // so 1 000 000 is a safe sanity cap for the crossover threshold.
+    static constexpr uint32_t kMaxCrossoverThreshold = 1000000u;
+    static const uint32_t kLimbFftCrossover = []() -> uint32_t {
+        const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
+        if (env && *env) {
+            char* end = nullptr;
+            const long v = std::strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v > 0 && v < static_cast<long>(kMaxCrossoverThreshold))
+                return static_cast<uint32_t>(v);
+            std::fprintf(stderr,
+                "LL_LIMB_FFT_CROSSOVER='%s' is invalid; using default 4000\n", env);
+        }
+        return 4000u;
+    }();
     if (p < kLimbFftCrossover) {
         LucasLehmerEngine<backend::LimbBackend> eng(p, /*benchmark_mode=*/true);
         return eng.run(progress);
