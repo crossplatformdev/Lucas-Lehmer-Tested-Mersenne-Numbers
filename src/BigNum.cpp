@@ -90,6 +90,16 @@ const std::vector<uint32_t>& known_mersenne_prime_exponents() {
 }  // namespace mersenne
 
 #ifndef BIGNUM_NO_MAIN
+static bool test_exponent(uint32_t p, bool progress) {
+    std::printf("Testing M_%u ...\n", p);
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool isPrime = mersenne::lucas_lehmer(p, progress);
+    const auto t1 = std::chrono::steady_clock::now();
+    const std::chrono::duration<double> elapsed = t1 - t0;
+    std::printf("M_%u is %s. Time: %.3f s\n", p, isPrime ? "prime" : "composite", elapsed.count());
+    return isPrime;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -124,15 +134,17 @@ int main(int argc, char** argv) {
 
     std::printf("Using %u worker(s) out of %u available core(s).\n", threads, maxCores);
 
-    if (stopAfterOne || threads == 1u) {
+    if (stopAfterOne) {
         const uint32_t p = exponents[startIndex];
-        std::printf("Testing M_%u ...\n", p);
-        const auto t0 = std::chrono::steady_clock::now();
-        const bool isPrime = mersenne::lucas_lehmer(p, progress);
-        const auto t1 = std::chrono::steady_clock::now();
-        const std::chrono::duration<double> elapsed = t1 - t0;
-        std::printf("M_%u is %s. Time: %.3f s\n", p, isPrime ? "prime" : "composite", elapsed.count());
+        const bool isPrime = test_exponent(p, progress);
         return isPrime ? 0 : 2;
+    }
+
+    if (threads == 1u) {
+        for (size_t idx = startIndex; idx < exponents.size(); ++idx) {
+            test_exponent(exponents[idx], progress);
+        }
+        return 0;
     }
 
     std::atomic<size_t> next{startIndex};
