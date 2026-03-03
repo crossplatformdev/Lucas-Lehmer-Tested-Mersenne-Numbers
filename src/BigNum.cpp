@@ -172,6 +172,67 @@ inline std::vector<std::vector<uint32_t>> precharge_work_matrix(
 }  // namespace mersenne
 
 // ============================================================
+// namespace sweep  (work-list generators for sweep modes n / p / m)
+// ============================================================
+namespace sweep {
+
+// mode 'n': all natural numbers in [min_exp, max_exp] inclusive.
+inline std::vector<uint32_t> generate_natural(uint32_t min_exp, uint32_t max_exp) {
+    std::vector<uint32_t> v;
+    if (max_exp >= min_exp) {
+        v.reserve(static_cast<size_t>(max_exp - min_exp) + 1u);
+        for (uint32_t i = min_exp; i <= max_exp; ++i)
+            v.push_back(i);
+    }
+    return v;
+}
+
+// mode 'p': all prime numbers in [min_exp, max_exp] inclusive.
+inline std::vector<uint32_t> generate_prime(uint32_t min_exp, uint32_t max_exp) {
+    std::vector<uint32_t> v;
+    const uint32_t start = (min_exp < 2u) ? 2u : min_exp;
+    for (uint32_t i = start; i <= max_exp; ++i)
+        if (mersenne::is_prime_exponent(i))
+            v.push_back(i);
+    return v;
+}
+
+// mode 'm': known Mersenne-prime exponents in [min_exp, max_exp] first
+//           (in their natural order), then all remaining prime exponents in
+//           [min_exp, max_exp] that were not already listed.
+inline std::vector<uint32_t> generate_mersenne_first(uint32_t min_exp, uint32_t max_exp) {
+    const auto& known = mersenne::known_mersenne_prime_exponents();
+    std::vector<uint32_t> v;
+
+    // Phase 1: known Mersenne primes in range (list is already sorted).
+    for (uint32_t p : known)
+        if (p >= min_exp && p <= max_exp)
+            v.push_back(p);
+
+    // Phase 2: remaining primes in range not already in the known list.
+    const uint32_t start = (min_exp < 2u) ? 2u : min_exp;
+    for (uint32_t i = start; i <= max_exp; ++i)
+        if (mersenne::is_prime_exponent(i) &&
+            !std::binary_search(known.begin(), known.end(), i))
+            v.push_back(i);
+
+    return v;
+}
+
+// Apply shard selection: keep items where (position % shard_count == shard_index).
+inline std::vector<uint32_t> apply_shard(const std::vector<uint32_t>& items,
+                                          size_t shard_index, size_t shard_count) {
+    if (shard_count <= 1u) return items;
+    std::vector<uint32_t> v;
+    for (size_t i = 0; i < items.size(); ++i)
+        if (i % shard_count == shard_index)
+            v.push_back(items[i]);
+    return v;
+}
+
+}  // namespace sweep
+
+// ============================================================
 // namespace backend
 // ============================================================
 namespace backend {
@@ -1035,10 +1096,10 @@ int main(int argc, char** argv) {
 
     const unsigned maxCores = runtime::detect_available_cores();
 
-    size_t   startIndex    = 0u;
-    unsigned threads       = maxCores;
-    bool     progress      = false;
-    bool     benchmark_mode = true;  // known-prime list → skip primality check
+    // --- Parse legacy positional arguments (backward-compatible) ---
+    size_t   startIndex = 0u;
+    unsigned threads    = maxCores;
+    bool     progress   = false;
 
     if (argc >= 2 && argv[1] && argv[1][0] != '\0')
         startIndex = static_cast<size_t>(std::strtoull(argv[1], nullptr, 10));
@@ -1049,94 +1110,228 @@ int main(int argc, char** argv) {
     }
     if (argc >= 4) progress = true;
 
-    const bool stopAfterOne = [] {
-        const char* s = std::getenv("LL_STOP_AFTER_ONE");
-        return s && *s != '\0' && std::strtoull(s, nullptr, 10) != 0ull;
-    }();
+    // --- Environment-variable helpers ---
+    auto read_env_ul = [](const char* name, unsigned long def) -> unsigned long {
+        const char* s = std::getenv(name);
+        if (!s || !*s) return def;
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(s, &end, 10);
+        if (end == s || *end != '\0') return def;
+        return v;
+    };
+    auto read_env_bool = [](const char* name, bool def) -> bool {
+        const char* s = std::getenv(name);
+        if (!s || !*s) return def;
+        return std::strtoull(s, nullptr, 10) != 0ull;
+    };
 
-    const auto& exponents = mersenne::known_mersenne_prime_exponents();
-    if (startIndex >= exponents.size()) {
-        std::fprintf(stderr, "Invalid start index: %zu (max %zu)\n",
-                     startIndex, exponents.size() - 1u);
-        return 1;
+    // --- New environment variables ---
+    const char* sweep_mode_env = std::getenv("LL_SWEEP_MODE");
+    const char  sweep_mode     = (sweep_mode_env && *sweep_mode_env)
+                                 ? sweep_mode_env[0] : '\0';  // 'n', 'p', 'm', or 0
+
+    // LL_MIN_EXPONENT / LL_MAX_EXPONENT: value bounds for sweep modes.
+    const uint32_t min_exp = static_cast<uint32_t>(read_env_ul("LL_MIN_EXPONENT", 2ul));
+    // Default max_exp: when sweep mode is active but LL_MAX_EXPONENT is not set,
+    // cap at the largest known Mersenne prime exponent to avoid accidental giant sweeps.
+    const auto& kmp_list = mersenne::known_mersenne_prime_exponents();
+    const unsigned long default_max_exp =
+        (sweep_mode != '\0' && !kmp_list.empty())
+        ? static_cast<unsigned long>(kmp_list.back())
+        : static_cast<unsigned long>(UINT32_MAX);
+    const uint32_t max_exp = static_cast<uint32_t>(
+        read_env_ul("LL_MAX_EXPONENT", default_max_exp));
+
+    // LL_MAX_CASES: hard cap on number of exponents to process.
+    const size_t max_cases = static_cast<size_t>(
+        read_env_ul("LL_MAX_CASES", static_cast<unsigned long>(SIZE_MAX)));
+
+    // LL_SHARD_INDEX / LL_SHARD_COUNT: divide work across parallel jobs.
+    const size_t shard_index = static_cast<size_t>(read_env_ul("LL_SHARD_INDEX", 0ul));
+    const size_t shard_count = static_cast<size_t>(read_env_ul("LL_SHARD_COUNT", 1ul));
+
+    // LL_REVERSE_ORDER: reverse the work list before executing.
+    const bool reverse_order = read_env_bool("LL_REVERSE_ORDER", false);
+
+    // LL_LARGEST_FIRST: sort work list largest-p-first for better load balance.
+    const bool largest_first = read_env_bool("LL_LARGEST_FIRST", false);
+
+    // LL_THREADS: override thread count (if not already set via argv[2]).
+    if (argc < 3) {
+        const unsigned long t = read_env_ul("LL_THREADS", 0ul);
+        if (t > 0ul)
+            threads = std::min(static_cast<unsigned>(t), maxCores);
     }
 
-    // LL_MAX_EXPONENT_INDEX caps the exclusive upper bound of the exponent
-    // range to run.  Useful for CI to avoid timing out on very large exponents.
-    // Example: LL_MAX_EXPONENT_INDEX=31 limits the run to exponents[0..30].
-    const size_t maxExponentIndex = [&exponents] {
-        const char* s = std::getenv("LL_MAX_EXPONENT_INDEX");
-        if (s && *s != '\0') {
-            char* end = nullptr;
-            const unsigned long v = std::strtoul(s, &end, 10);
-            // Require a pure non-negative integer string and a value within range.
-            if (end == s || *end != '\0' || v > exponents.size()) {
-                std::fprintf(stderr,
-                             "Ignoring invalid LL_MAX_EXPONENT_INDEX=\"%s\"; "
-                             "must be an integer in [0, %zu]. Using no limit.\n",
-                             s, exponents.size());
-                return exponents.size();  // no limit
-            }
-            return static_cast<size_t>(v);
+    // LL_STOP_AFTER_ONE: run exactly one exponent (existing behaviour).
+    const bool stopAfterOne = read_env_bool("LL_STOP_AFTER_ONE", false);
+
+    // LL_BENCHMARK_MODE: skip is_prime_exponent() check inside lucas_lehmer().
+    // Default: true for Mersenne list / 'p' / 'm' (all known prime); false for 'n'.
+    const bool bm_default = (sweep_mode == 'n') ? false : true;
+    const bool benchmark_mode = read_env_bool("LL_BENCHMARK_MODE", bm_default);
+
+    // --- Build the work list ---
+    std::vector<uint32_t> work;
+
+    if (sweep_mode == 'n') {
+        work = sweep::generate_natural(min_exp, max_exp);
+    } else if (sweep_mode == 'p') {
+        work = sweep::generate_prime(min_exp, max_exp);
+    } else if (sweep_mode == 'm') {
+        work = sweep::generate_mersenne_first(min_exp, max_exp);
+    } else {
+        // Default: use the known Mersenne-prime exponent list with index bounds.
+        const auto& exponents = mersenne::known_mersenne_prime_exponents();
+        if (startIndex >= exponents.size()) {
+            std::fprintf(stderr, "Invalid start index: %zu (max %zu)\n",
+                         startIndex, exponents.size() - 1u);
+            return 1;
         }
-        // Environment variable not set or empty: no limit.
-        return exponents.size();
-    }();
 
-    const size_t endIndex = std::min(exponents.size(), maxExponentIndex);
+        // LL_MAX_EXPONENT_INDEX: backward-compat exclusive upper bound on the list index.
+        const size_t maxExponentIndex = [&exponents] {
+            const char* s = std::getenv("LL_MAX_EXPONENT_INDEX");
+            if (s && *s != '\0') {
+                char* end = nullptr;
+                const unsigned long v = std::strtoul(s, &end, 10);
+                if (end == s || *end != '\0' || v > exponents.size()) {
+                    std::fprintf(stderr,
+                                 "Ignoring invalid LL_MAX_EXPONENT_INDEX=\"%s\"; "
+                                 "must be an integer in [0, %zu].\n",
+                                 s, exponents.size());
+                    return exponents.size();
+                }
+                return static_cast<size_t>(v);
+            }
+            return exponents.size();
+        }();
 
-    // If the effective range is empty (misconfigured index cap), bail out so
-    // the problem is visible rather than silently succeeding with zero work.
-    // LL_STOP_AFTER_ONE always runs exactly one exponent so it is exempt.
-    if (!stopAfterOne && startIndex >= endIndex) {
-        std::fprintf(stderr,
-                     "No exponents to test: startIndex=%zu >= endIndex=%zu. "
-                     "Check LL_MAX_EXPONENT_INDEX.\n",
-                     startIndex, endIndex);
+        const size_t endIndex = std::min(exponents.size(), maxExponentIndex);
+        if (!stopAfterOne && startIndex >= endIndex) {
+            std::fprintf(stderr,
+                         "No exponents to test: startIndex=%zu >= endIndex=%zu. "
+                         "Check LL_MAX_EXPONENT_INDEX.\n",
+                         startIndex, endIndex);
+            return 1;
+        }
+        for (size_t i = startIndex; i < endIndex; ++i)
+            work.push_back(exponents[i]);
+    }
+
+    // --- Apply shard selection ---
+    if (shard_count > 1u) {
+        if (shard_index >= shard_count) {
+            std::fprintf(stderr,
+                         "Invalid shard configuration: LL_SHARD_INDEX=%zu >= "
+                         "LL_SHARD_COUNT=%zu\n",
+                         shard_index, shard_count);
+            return 1;
+        }
+        work = sweep::apply_shard(work, shard_index, shard_count);
+    }
+
+    // --- Apply max_cases cap ---
+    if (max_cases < work.size())
+        work.resize(max_cases);
+
+    // --- Ordering: largest-first or reverse ---
+    if (largest_first)
+        std::sort(work.begin(), work.end(), std::greater<uint32_t>());
+    else if (reverse_order)
+        std::reverse(work.begin(), work.end());
+
+    if (work.empty() && !stopAfterOne) {
+        std::fprintf(stderr, "Work list is empty after filtering.\n");
         return 1;
     }
 
     std::printf("Using %u worker(s) out of %u available core(s).\n",
                 threads, maxCores);
 
+    // --- Optional machine-readable CSV output ---
+    const char* bench_output_path = std::getenv("LL_BENCH_OUTPUT");
+    FILE* bench_fp = nullptr;
+    if (bench_output_path && *bench_output_path) {
+        bench_fp = std::fopen(bench_output_path, "w");
+        if (bench_fp)
+            std::fprintf(bench_fp, "p,is_prime,time_sec\n");
+        else
+            std::fprintf(stderr, "Warning: cannot open LL_BENCH_OUTPUT='%s'\n",
+                         bench_output_path);
+    }
+    std::mutex bench_mu;
+    auto record_result = [&](uint32_t p, bool isPrime, double elapsed) {
+        if (!bench_fp) return;
+        std::lock_guard<std::mutex> lk(bench_mu);
+        std::fprintf(bench_fp, "%u,%s,%.6f\n",
+                     p, isPrime ? "true" : "false", elapsed);
+        std::fflush(bench_fp);
+    };
+
+    // --- StopAfterOne: run exactly one exponent ---
     if (stopAfterOne) {
-        const uint32_t p = exponents[startIndex];
-        return test_exponent(p, progress, benchmark_mode) ? 0 : 2;
+        if (work.empty()) {
+            // Fall back to startIndex in the known list (existing behavior).
+            const auto& exponents = mersenne::known_mersenne_prime_exponents();
+            if (startIndex >= exponents.size()) {
+                std::fprintf(stderr, "No exponents available.\n");
+                if (bench_fp) std::fclose(bench_fp);
+                return 1;
+            }
+            work.push_back(exponents[startIndex]);
+        }
+        const uint32_t p = work[0];
+        const bool isPrime = test_exponent(p, progress, benchmark_mode);
+        record_result(p, isPrime, 0.0);  // timing already printed by test_exponent
+        if (bench_fp) std::fclose(bench_fp);
+        return isPrime ? 0 : 2;
     }
 
+    // --- Sequential execution ---
     if (threads == 1u) {
-        for (size_t idx = startIndex; idx < endIndex; ++idx)
-            test_exponent(exponents[idx], progress, benchmark_mode);
+        for (uint32_t p : work) {
+            const auto t0     = std::chrono::steady_clock::now();
+            const bool isPrime = test_exponent(p, progress, benchmark_mode);
+            const auto t1     = std::chrono::steady_clock::now();
+            record_result(p, isPrime,
+                          std::chrono::duration<double>(t1 - t0).count());
+        }
+        if (bench_fp) std::fclose(bench_fp);
         return 0;
     }
 
-    // Thread-pool throughput mode: distribute exponents across workers.
-    std::atomic<size_t> next{startIndex};
+    // --- Thread-pool throughput mode ---
+    // Workers pull from the pre-built work list via an atomic index counter.
+    std::atomic<size_t> next{0u};
     std::mutex          printMu;
-
     runtime::ThreadPool pool(threads);
 
     for (unsigned t = 0; t < threads; ++t) {
         pool.submit([&] {
             for (;;) {
-                const size_t idx =
-                    next.fetch_add(1u, std::memory_order_relaxed);
-                if (idx >= endIndex) break;
-                const uint32_t p       = exponents[idx];
-                const auto     t0      = std::chrono::steady_clock::now();
-                const bool     isPrime =
+                const size_t idx = next.fetch_add(1u, std::memory_order_relaxed);
+                if (idx >= work.size()) break;
+                const uint32_t p = work[idx];
+                const auto t0    = std::chrono::steady_clock::now();
+                const bool isPrime =
                     mersenne::lucas_lehmer(p, progress, benchmark_mode);
                 const auto t1 = std::chrono::steady_clock::now();
-                const std::chrono::duration<double> elapsed = t1 - t0;
-                std::lock_guard<std::mutex> lk(printMu);
-                std::printf("Testing M_%u ...\n", p);
-                std::printf("M_%u is %s. Time: %.3f s\n",
-                            p, isPrime ? "prime" : "composite", elapsed.count());
+                const double elapsed =
+                    std::chrono::duration<double>(t1 - t0).count();
+                {
+                    std::lock_guard<std::mutex> lk(printMu);
+                    std::printf("Testing M_%u ...\n", p);
+                    std::printf("M_%u is %s. Time: %.3f s\n",
+                                p, isPrime ? "prime" : "composite", elapsed);
+                }
+                record_result(p, isPrime, elapsed);
             }
         });
     }
 
     pool.wait_all();
+    if (bench_fp) std::fclose(bench_fp);
     return 0;
 }
 #endif
