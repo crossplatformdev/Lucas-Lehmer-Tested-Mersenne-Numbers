@@ -100,7 +100,6 @@ jobs:
   # ──────────────────────────────────────────────────────────
   plan:
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
-    timeout-minutes: 5
     outputs:
       batch_matrix: ${{ steps.build-matrix.outputs.batch_matrix }}
       batch_count:  ${{ steps.build-matrix.outputs.batch_count }}
