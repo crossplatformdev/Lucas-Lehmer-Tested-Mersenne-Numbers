@@ -2,15 +2,19 @@
 //
 // Backend hierarchy (auto-selected by exponent size):
 //   p < 128      : GenericBackend  (boost::multiprecision::cpp_int – reference)
-//   p >= 128     : FftMersenneBackend (Crandall–Bailey DWT/FFT with adaptive
+//   128 <= p < kLimbFftCrossover :
+//                  LimbBackend (true Comba squaring + Mersenne fold)
+//   p >= kLimbFftCrossover :
+//                  FftMersenneBackend (Crandall–Bailey DWT/FFT with adaptive
 //                  digit width; covers all known Mersenne-prime exponents)
-//   HAVE_GMP set : GmpBackend available as alternative for medium/large p
 //
 // Key design points:
 //  • Fused hot op: square_sub2_mod_mersenne()  (one FFT pair per LL iteration)
 //  • Precomputed and reused: twiddle table, DWT weights, bit-reversal table,
 //    digit-width table – all allocated once per engine lifetime.
 //  • No heap allocation inside the hot loop; scratch buffers are pre-allocated.
+//  • LimbBackend uses true Comba squaring: n*(n+1)/2 multiplications vs n^2.
+//  • limb_shift precomputed in LimbState to avoid hot-loop division.
 //  • Worker threads now respect the caller-supplied progress flag (bug fix).
 //  • Progress reporting uses steady_clock (replaces std::time/difftime).
 //  • is_prime_exponent() is skipped in benchmark mode for the known-prime list.
@@ -39,10 +43,6 @@
 #include <vector>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <sched.h>
-
-#ifdef HAVE_GMP
-#include <gmp.h>
-#endif
 
 // ============================================================
 // namespace runtime
@@ -254,24 +254,65 @@ static constexpr int KARA_BASE_LIMBS = 12;
 // 128-bit accumulator type – GCC/Clang extension; __extension__ silences -Wpedantic.
 __extension__ typedef unsigned __int128 u128_t;
 
-// Schoolbook square: sq[0..2n-1] = a[0..n-1]^2
+// True Comba/schoolbook squaring: sq[0..2n-1] = a[0..n-1]^2.
+//
+// Uses n*(n+1)/2 multiplications (vs n^2 for generic multiply), exploiting
+// the identity  a^2 = diag + 2*cross  where:
+//   diag  = sum_{i}   a[i]^2  at position 2*i
+//   cross = sum_{i<j} a[i]*a[j]  at position i+j (doubled via a left-shift)
+//
+// Three-phase algorithm:
+//   Phase 1: accumulate cross terms a[i]*a[j] for i < j into sq.
+//   Phase 2: double sq by left-shifting one bit (2*cross fits in 2*n limbs).
+//   Phase 3: add diagonal terms a[i]^2 at position 2*i.
 static void schoolbook_sq(const uint64_t* __restrict__ a,
                            uint64_t* __restrict__ sq, int n) {
     std::fill(sq, sq + 2 * n, uint64_t(0));
+
+    // Phase 1: off-diagonal cross terms (i < j only).
     for (int i = 0; i < n; ++i) {
         uint64_t carry = 0;
-        for (int j = 0; j < n; ++j) {
-            u128_t t =
-                (u128_t)a[i] * a[j] + sq[i + j] + carry;
+        for (int j = i + 1; j < n; ++j) {
+            u128_t t = (u128_t)a[i] * a[j] + sq[i + j] + carry;
             sq[i + j] = (uint64_t)t;
             carry      = (uint64_t)(t >> 64);
         }
-        for (int k = i + n; k < 2 * n && carry != 0; ++k) {
+        for (int k = i + n; carry && k < 2 * n; ++k) {
             u128_t t = (u128_t)sq[k] + carry;
             sq[k]  = (uint64_t)t;
             carry  = (uint64_t)(t >> 64);
         }
+        // Invariant: sum of cross terms so far fits in 2*n limbs, so carry
+        // must be zero after the cleanup loop.  Catches overflow if n is
+        // ever set above KARA_BASE_LIMBS without adjusting the buffer size.
         assert(carry == 0);
+    }
+
+    // Phase 2: double the off-diagonal sum (shift left by 1 bit).
+    // Guaranteed no carry out: 2*(off-diag) < a^2 < 2^{128*n}.
+    uint64_t shl_carry = 0;
+    for (int k = 0; k < 2 * n; ++k) {
+        const uint64_t top = sq[k] >> 63;
+        sq[k] = (sq[k] << 1) | shl_carry;
+        shl_carry = top;
+    }
+    // shl_carry == 0 is guaranteed; assert in debug builds.
+    assert(shl_carry == 0);
+
+    // Phase 3: add diagonal terms a[i]^2 at position 2*i.
+    for (int i = 0; i < n; ++i) {
+        const u128_t d = (u128_t)a[i] * a[i];
+        uint64_t carry = 0;
+        {
+            const u128_t t = (u128_t)sq[2 * i] + (uint64_t)d;
+            sq[2 * i] = (uint64_t)t;
+            carry = (uint64_t)(t >> 64) + (uint64_t)(d >> 64);
+        }
+        for (int k = 2 * i + 1; carry && k < 2 * n; ++k) {
+            const u128_t t = (u128_t)sq[k] + carry;
+            sq[k] = (uint64_t)t;
+            carry  = (uint64_t)(t >> 64);
+        }
     }
 }
 
@@ -402,9 +443,10 @@ static int karatsuba_scratch_size(int n) {
 
 struct LimbState {
     uint32_t p{0};
-    int      nlimbs{0};    // ceil(p/64)
-    int      partial{0};   // p % 64; 0 means limb-aligned
-    uint64_t top_mask{0};  // mask for top limb
+    int      nlimbs{0};       // ceil(p/64)
+    int      partial{0};      // p % 64; 0 means limb-aligned
+    int      limb_shift{0};   // p / 64, precomputed for fold (avoids hot-loop division)
+    uint64_t top_mask{0};     // mask for top limb
 
     std::vector<uint64_t> s;        // nlimbs: current value
     std::vector<uint64_t> sq;       // 2*nlimbs: squaring result
@@ -418,10 +460,11 @@ struct LimbBackend {
 
     static State init(uint32_t p) {
         LimbState st;
-        st.p       = p;
-        st.nlimbs  = static_cast<int>((p + 63u) / 64u);
-        st.partial = static_cast<int>(p % 64u);
-        st.top_mask = (st.partial == 0)
+        st.p          = p;
+        st.nlimbs     = static_cast<int>((p + 63u) / 64u);
+        st.partial    = static_cast<int>(p % 64u);
+        st.limb_shift = static_cast<int>(p / 64u);   // precomputed; avoids division in step()
+        st.top_mask   = (st.partial == 0)
             ? ~uint64_t(0)
             : ((uint64_t(1) << st.partial) - 1u);
 
@@ -450,8 +493,8 @@ struct LimbBackend {
 
         // 2. Mersenne fold: s = (sq mod 2^p) + (sq >> p)
         {
-            const int    limb_shift = static_cast<int>(st.p / 64u);
-            const int    bit_shift  = st.partial;  // p % 64
+            const int    limb_shift = st.limb_shift;  // precomputed in init()
+            const int    bit_shift  = st.partial;     // p % 64
 
             if (bit_shift == 0) {
                 // p is limb-aligned
@@ -865,108 +908,6 @@ struct FftMersenneBackend {
     static double max_roundoff(const State& st) { return st.max_roundoff; }
 };
 
-// ============================================================
-// GmpBackend  (optional: compile with -DHAVE_GMP -lgmp)
-// Uses GMP's mpn_sqr for high-performance squaring + Mersenne reduction.
-// ============================================================
-#ifdef HAVE_GMP
-struct GmpState {
-    uint32_t p{0};
-    size_t nlimbs{0};           // ceil(p / GMP_NUMB_BITS)
-    std::vector<mp_limb_t> s;   // current value, nlimbs limbs, little-endian
-    std::vector<mp_limb_t> sq;  // scratch for 2*nlimbs squaring result
-    std::vector<mp_limb_t> hi;  // scratch for hi-part extraction (2*nlimbs)
-    std::vector<mp_limb_t> lo;  // scratch for lo-part masked (nlimbs)
-    std::vector<mp_limb_t> mod; // scratch for Mersenne modulus (nlimbs)
-    double max_roundoff{0.0};
-};
-
-struct GmpBackend {
-    using State = GmpState;
-
-    static State init(uint32_t p) {
-        GmpState st;
-        st.p      = p;
-        st.nlimbs = (p + GMP_NUMB_BITS - 1) / GMP_NUMB_BITS;
-        st.s.assign(st.nlimbs, 0);
-        st.sq.resize(2 * st.nlimbs, 0);
-        st.hi.resize(2 * st.nlimbs, 0);  // worst-case: shift_limbs <= 2*nlimbs
-        st.lo.resize(st.nlimbs, 0);
-        // Pre-build Mersenne modulus (2^p − 1) for borrow correction.
-        const unsigned partial = static_cast<unsigned>(p % GMP_NUMB_BITS);
-        st.mod.assign(st.nlimbs, ~mp_limb_t(0));
-        if (partial != 0)
-            st.mod[st.nlimbs - 1] = (mp_limb_t(1) << partial) - 1;
-        // s_0 = 4
-        st.s[0] = 4;
-        return st;
-    }
-
-    static void step(State& st) {
-        const size_t n = st.nlimbs;
-        // Square: sq[0..2n-1] = s[0..n-1]^2
-        mpn_sqr(st.sq.data(), st.s.data(), static_cast<mp_size_t>(n));
-
-        // Mersenne reduction: result = lo + hi  (mod 2^p − 1)
-        // lo = sq[0..n-1] & mask,  hi = sq >> p
-        // partial_p = p mod GMP_NUMB_BITS
-        const unsigned partial = p_bits_mod_numb(st.p);
-        mp_limb_t carry;
-
-        if (partial == 0) {
-            // Aligned: lo = sq[0..n-1], hi = sq[n..2n-1]
-            carry = mpn_add_n(st.s.data(), st.sq.data(), st.sq.data() + n,
-                              static_cast<mp_size_t>(n));
-        } else {
-            // Extract hi starting at bit p using pre-allocated scratch buffer.
-            //   hi = sq >> p
-            const size_t limb_offset = st.p / GMP_NUMB_BITS;
-            const size_t shift_limbs = 2 * n - limb_offset;
-            std::fill(st.hi.begin(), st.hi.begin() + static_cast<ptrdiff_t>(shift_limbs), mp_limb_t(0));
-            mpn_rshift(st.hi.data(), st.sq.data() + limb_offset,
-                       static_cast<mp_size_t>(shift_limbs),
-                       partial);
-            // lo = sq[0..n-1] masked to p bits (use pre-allocated scratch)
-            std::copy(st.sq.begin(), st.sq.begin() + static_cast<ptrdiff_t>(n), st.lo.begin());
-            st.lo[n - 1] &= (mp_limb_t(1) << partial) - 1;  // clear bits above p
-            // Only the first n limbs of hi are used; higher limbs are 0 since sq < 2^(2p)
-            carry = mpn_add_n(st.s.data(), st.lo.data(), st.hi.data(),
-                              static_cast<mp_size_t>(n));
-        }
-
-        // If there was a carry out, add 1 (since 2^p ≡ 1 mod 2^p−1).
-        if (carry) {
-            carry = mpn_add_1(st.s.data(), st.s.data(), static_cast<mp_size_t>(n), 1);
-        }
-
-        // Subtract 2 (mod 2^p − 1). Capture borrow to perform wrap-around if needed.
-        mp_limb_t borrow = mpn_sub_1(st.s.data(), st.s.data(), static_cast<mp_size_t>(n), 2);
-
-        if (borrow) {
-            // Underflow: add back the pre-built Mersenne modulus M = 2^p − 1.
-            (void)mpn_add_n(st.s.data(), st.s.data(), st.mod.data(), static_cast<mp_size_t>(n));
-        }
-
-        // Reduce top limb mask to ensure s stays within p bits.
-        if (partial != 0)
-            st.s[n - 1] &= (mp_limb_t(1) << partial) - 1;
-    }
-
-    static bool is_zero(const State& st) {
-        for (const auto v : st.s)
-            if (v != 0) return false;
-        return true;
-    }
-
-    static double max_roundoff(const State& st) { return st.max_roundoff; }
-
-private:
-    static unsigned p_bits_mod_numb(uint32_t p) {
-        return static_cast<unsigned>(p % GMP_NUMB_BITS);
-    }
-};
-#endif  // HAVE_GMP
-
 }  // namespace backend
 
 // ============================================================
@@ -1065,10 +1006,6 @@ bool lucas_lehmer(uint32_t p, bool progress, bool benchmark_mode = false) {
         LucasLehmerEngine<backend::LimbBackend> eng(p, /*benchmark_mode=*/true);
         return eng.run(progress);
     }
-
-#ifdef HAVE_GMP
-    // GMP backend available but not used as default (kept as opt-in).
-#endif
 
     // FFT/DWT backend for large exponents.
     LucasLehmerEngine<backend::FftMersenneBackend> eng(p, /*benchmark_mode=*/true);

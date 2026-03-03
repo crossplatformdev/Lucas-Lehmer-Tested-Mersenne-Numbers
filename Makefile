@@ -2,18 +2,17 @@ CXX ?= g++
 CXXFLAGS ?= -std=c++20 -O3 -march=native -mtune=native -flto -pthread -Wall -Wextra -Wpedantic
 LDFLAGS ?= -flto -pthread
 
-# Auto-detect GMP and enable the GmpBackend if available.
-GMP_AVAILABLE := $(shell pkg-config --exists gmp 2>/dev/null && echo 1 || echo 0)
-ifeq ($(GMP_AVAILABLE),1)
-  CXXFLAGS += -DHAVE_GMP
-  LDFLAGS  += -lgmp
-endif
-
 SRC := src/BigNum.cpp
 BIN := bin/bignum
 TEST_BIN := bin/test_bignum
+PROF_BIN := bin/bignum_prof
 
-.PHONY: all clean test bench bench-ci
+# Profiling build uses -O2 (keeps enough optimization to be representative
+# while preserving function call structure for gprof) and -pg.
+PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
+PROF_LDFLAGS  := -pthread -pg
+
+.PHONY: all clean test bench bench-ci prof
 
 BENCH_START_INDEX ?= 14
 
@@ -27,9 +26,23 @@ $(TEST_BIN): tests/test_bignum.cpp $(SRC)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) tests/test_bignum.cpp -o $@ $(LDFLAGS)
 
+$(PROF_BIN): $(SRC)
+	@mkdir -p bin
+	g++ $(PROF_CXXFLAGS) $< -o $@ $(PROF_LDFLAGS)
+
 test: $(TEST_BIN) $(BIN)
 	./$(TEST_BIN)
 	LL_STOP_AFTER_ONE=0 ./$(BIN) 0 0
+
+# Profiling target: build with -pg, run a representative subset (index 14 = p=9689),
+# collect gmon.out, and generate a flat+call-graph report with gprof.
+prof: $(PROF_BIN)
+	@echo "Running profiling binary (index=$(BENCH_START_INDEX), 1 thread)..."
+	LL_STOP_AFTER_ONE=1 $(PROF_BIN) $(BENCH_START_INDEX) 1
+	@echo "Generating gprof report -> prof_report.txt"
+	gprof $(PROF_BIN) gmon.out > prof_report.txt
+	@echo "--- Top 20 functions (flat profile) ---"
+	head -50 prof_report.txt
 
 bench: $(BIN)
 	@echo "Benchmark (index=$(BENCH_START_INDEX)): 1 hilo vs máximo cores"
@@ -53,4 +66,4 @@ bench-ci: $(BIN)
 	@LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 0
 
 clean:
-	rm -rf bin
+	rm -rf bin prof_report.txt gmon.out

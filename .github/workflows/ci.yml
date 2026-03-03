@@ -23,13 +23,32 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ make libboost-dev libgmp-dev pkg-config
+          sudo apt-get install -y g++ make libboost-dev pkg-config
 
       - name: Build
         run: make all
 
       - name: Run tests
         run: make test
+
+      - name: Build profiling binary
+        run: make bin/bignum_prof
+
+      - name: Run profiling (gprof) – index 14 = p=9689, 1 thread
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: build-and-test"
+          LL_STOP_AFTER_ONE=1 ./bin/bignum_prof 14 1
+          gprof bin/bignum_prof gmon.out > prof_report.txt
+          echo "--- gprof flat profile (top 30 lines) ---"
+          head -50 prof_report.txt
+
+      - name: Upload profiler report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gprof-report
+          path: prof_report.txt
+          retention-days: 14
 
   benchmark:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_benchmark == true }}
@@ -42,10 +61,13 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ make libboost-dev libgmp-dev pkg-config
+          sudo apt-get install -y g++ make libboost-dev pkg-config
 
       - name: Build
         run: make all
 
       - name: Run benchmark
-        run: make bench
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: benchmark"
+          make bench
