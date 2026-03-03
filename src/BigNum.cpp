@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -99,6 +98,21 @@ const std::vector<uint32_t>& known_mersenne_prime_exponents() {
     return exponents;
 }
 
+// Distribute exponent values starting at startIndex across `threads` lanes
+// using round-robin, so each thread gets a pre-assigned slice of work.
+inline std::vector<std::vector<uint32_t>> precharge_work_matrix(
+    const std::vector<uint32_t>& exponents, size_t startIndex, unsigned threads)
+{
+    if (threads == 0u) threads = 1u;
+    std::vector<std::vector<uint32_t>> work_matrix(threads);
+    unsigned slot = 0u;
+    for (size_t idx = startIndex; idx < exponents.size(); ++idx) {
+        work_matrix[slot].push_back(exponents[idx]);
+        if (++slot >= threads) slot = 0u;
+    }
+    return work_matrix;
+}
+
 }  // namespace mersenne
 
 #ifndef BIGNUM_NO_MAIN
@@ -159,17 +173,17 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::atomic<size_t> next{startIndex};
+    // Precharge: distribute all exponent values across threads upfront to
+    // avoid per-iteration atomic fetch_add in the hot execution path.
+    const auto work_matrix = mersenne::precharge_work_matrix(exponents, startIndex, threads);
+
     std::mutex printMutex;
     std::vector<std::thread> workers;
     workers.reserve(threads);
 
     for (unsigned t = 0; t < threads; ++t) {
-        workers.emplace_back([&]() {
-            for (;;) {
-                const size_t idx = next.fetch_add(1u, std::memory_order_relaxed);
-                if (idx >= exponents.size()) break;
-                const uint32_t p = exponents[idx];
+        workers.emplace_back([&, t]() {
+            for (const uint32_t p : work_matrix[t]) {
                 const auto t0 = std::chrono::steady_clock::now();
                 const bool isPrime = mersenne::lucas_lehmer(p, true);
                 const auto t1 = std::chrono::steady_clock::now();
