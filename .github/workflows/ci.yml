@@ -15,13 +15,46 @@ on:
 permissions:
   contents: read
 
+# Each job checks out the source, installs the toolchain, compiles its own
+# binary with -march=native (targeting the runner it actually runs on), and
+# immediately executes.  No pre-built artifact is shared between runners, so
+# there is no risk of SIGILL from mismatched CPU feature sets.  All jobs run
+# in parallel with no inter-job dependency.
+
 jobs:
   # ──────────────────────────────────────────────────────────
-  # Job 1: build
+  # Job 1: unit + smoke tests
   # ──────────────────────────────────────────────────────────
-  build:
+  unit-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Build test binary
+        run: make bin/test_bignum
+
+      - name: Build release binary
+        run: make all
+
+      - name: Run unit tests
+        run: make unit
+
+      - name: Run smoke test
+        run: make smoke
+
+  # ──────────────────────────────────────────────────────────
+  # Job 2: bounded regression (exponents[0..26], p ≤ 44497)
+  # ──────────────────────────────────────────────────────────
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,83 +67,13 @@ jobs:
       - name: Build release binary
         run: make all
 
-      - name: Build test binary
-        run: make bin/test_bignum
-
-      - name: Build profiling binary
-        run: make bin/bignum_prof
-
-      - name: Cache binaries for downstream jobs
-        uses: actions/upload-artifact@v4
-        with:
-          name: binaries
-          path: bin/
-          retention-days: 1
-
-  # ──────────────────────────────────────────────────────────
-  # Job 2: unit + smoke tests
-  # ──────────────────────────────────────────────────────────
-  unit-smoke:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++ make libboost-dev pkg-config
-
-      - name: Download binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: binaries
-          path: bin/
-
-      - name: Make binaries executable
-        run: chmod +x bin/bignum bin/test_bignum
-
-      - name: Run unit tests
-        run: make unit
-
-      - name: Run smoke test
-        run: make smoke
-
-  # ──────────────────────────────────────────────────────────
-  # Job 3: bounded regression (exponents[0..26], p ≤ 44497)
-  # ──────────────────────────────────────────────────────────
-  regression:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++ make libboost-dev pkg-config
-
-      - name: Download binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: binaries
-          path: bin/
-
-      - name: Make binaries executable
-        run: chmod +x bin/bignum
-
       - name: Run bounded regression
         run: make regression
 
   # ──────────────────────────────────────────────────────────
-  # Job 4: profiling (gprof, p=9689, 1 thread)
+  # Job 3: profiling (gprof, p=9689, 1 thread)
   # ──────────────────────────────────────────────────────────
   profile:
-    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -120,16 +83,10 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ make libboost-dev pkg-config
+          sudo apt-get install -y g++ make libboost-dev pkg-config gprof
 
-      - name: Download binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: binaries
-          path: bin/
-
-      - name: Make profiling binary executable
-        run: chmod +x bin/bignum_prof
+      - name: Build profiling binary
+        run: make bin/bignum_prof
 
       - name: Run profiling (gprof) – index 14 = p=9689, 1 thread
         run: |
@@ -148,11 +105,10 @@ jobs:
           retention-days: 14
 
   # ──────────────────────────────────────────────────────────
-  # Job 5: bounded benchmark (optional, workflow_dispatch only)
+  # Job 4: bounded benchmark (optional, workflow_dispatch only)
   # ──────────────────────────────────────────────────────────
   bench-ci:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_benchmark == true }}
-    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -164,14 +120,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++ make libboost-dev pkg-config
 
-      - name: Download binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: binaries
-          path: bin/
-
-      - name: Make binary executable
-        run: chmod +x bin/bignum
+      - name: Build release binary
+        run: make all
 
       - name: Run bounded CI benchmark
         run: |
