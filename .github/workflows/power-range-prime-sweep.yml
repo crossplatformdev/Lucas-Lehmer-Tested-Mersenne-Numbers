@@ -91,7 +91,7 @@ on:
         description: "Type 'yes' to confirm this large multi-job sweep"
         required: true
         type: string
-        default: "no"
+        default: "yes"
       bucket_start:
         description: "First bucket to run (1-64)"
         required: false
