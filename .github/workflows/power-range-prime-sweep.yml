@@ -1,0 +1,339 @@
+name: Power-Range Prime Sweep (64 Buckets)
+
+# Manual-only workflow: tests all prime exponents across 64 power-of-two
+# exponent ranges (one GitHub Actions job per bucket).
+#
+# Bucket definition (1-indexed):
+#   B_1  = [2, 2]               (normalized)
+#   B_n  = [2^(n-1), 2^n - 1]  for n in [2, 64]
+#   B_64 = [2^63, 2^64 - 1]
+#
+# Workflow stages:
+#   1. plan    – builds the bucket matrix JSON
+#   2. worker  – 64 parallel jobs, one per bucket
+#   3. merge   – downloads all artifacts and produces a combined summary
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_run:
+        description: "Type 'yes' to confirm this large multi-job sweep"
+        required: true
+        type: string
+        default: "no"
+      bucket_start:
+        description: "First bucket to run (1-64)"
+        required: false
+        type: string
+        default: "1"
+      bucket_end:
+        description: "Last bucket to run (1-64)"
+        required: false
+        type: string
+        default: "64"
+      threads:
+        description: "Worker threads per job (0 = all cores)"
+        required: false
+        type: string
+        default: "0"
+      reverse_order:
+        description: "Test largest exponent first within each bucket"
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: "Print exponent plan only – do not run Lucas-Lehmer tests"
+        required: false
+        type: boolean
+        default: false
+      max_exponents_per_job:
+        description: "Safety cap: maximum exponents to test per bucket job (0 = no cap)"
+        required: false
+        type: string
+        default: "0"
+      stop_after_first_prime_result:
+        description: "Stop each bucket after the first new Mersenne prime candidate"
+        required: false
+        type: boolean
+        default: false
+      resume_from_exponent:
+        description: "Skip exponents below this value (0 = no skip)"
+        required: false
+        type: string
+        default: "0"
+      benchmark_mode:
+        description: "Skip is_prime_exponent() check (safe only for known-prime lists)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # Stage 1: Plan – validate inputs and build bucket matrix
+  # ──────────────────────────────────────────────────────────
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      bucket_matrix: ${{ steps.build-matrix.outputs.bucket_matrix }}
+      bucket_count:  ${{ steps.build-matrix.outputs.bucket_count }}
+    steps:
+      - name: Validate confirm_run
+        run: |
+          if [[ "${{ inputs.confirm_run }}" != "yes" ]]; then
+            echo "::error title=Confirmation required::Set confirm_run='yes' to run this workflow."
+            echo "This workflow launches up to 64 parallel GitHub Actions jobs."
+            echo "Provided value: '${{ inputs.confirm_run }}'"
+            exit 1
+          fi
+
+      - name: Validate bucket range
+        run: |
+          START="${{ inputs.bucket_start }}"
+          END="${{ inputs.bucket_end }}"
+          if ! [[ "$START" =~ ^[0-9]+$ ]] || ! [[ "$END" =~ ^[0-9]+$ ]]; then
+            echo "::error::bucket_start and bucket_end must be integers."
+            exit 1
+          fi
+          if (( START < 1 || START > 64 || END < 1 || END > 64 || START > END )); then
+            echo "::error::bucket_start ($START) and bucket_end ($END) must both be in [1,64] with start <= end."
+            exit 1
+          fi
+          echo "Bucket range validated: ${START}..${END}"
+
+      - name: Build bucket matrix JSON
+        id: build-matrix
+        run: |
+          START="${{ inputs.bucket_start }}"
+          END="${{ inputs.bucket_end }}"
+          BUCKETS="["
+          first=true
+          for (( n=START; n<=END; n++ )); do
+            if [[ "$first" == "true" ]]; then
+              BUCKETS+="$n"
+              first=false
+            else
+              BUCKETS+=",$n"
+            fi
+          done
+          BUCKETS+="]"
+          COUNT=$(( END - START + 1 ))
+          echo "bucket_matrix=${BUCKETS}" >> "$GITHUB_OUTPUT"
+          echo "bucket_count=${COUNT}"    >> "$GITHUB_OUTPUT"
+          echo "Matrix: ${BUCKETS}"
+          echo "Total buckets: ${COUNT}"
+
+      - name: Print plan summary
+        run: |
+          python3 - << 'PYEOF'
+          import sys
+
+          def bucket_range(n):
+              if n == 1: return (2, 2)
+              lo = 1 << (n - 1)
+              hi = (1 << n) - 1 if n < 64 else (2**64 - 1)
+              return (lo, hi)
+
+          start = int("${{ inputs.bucket_start }}")
+          end   = int("${{ inputs.bucket_end }}")
+          dry   = "${{ inputs.dry_run }}" == "true"
+
+          print(f"{'Bucket':>8}  {'Lo':>22}  {'Hi':>22}  Note")
+          print("-" * 70)
+          for n in range(start, end + 1):
+              lo, hi = bucket_range(n)
+              note = "(normalized)" if n == 1 else "(UINT64_MAX)" if n == 64 else ""
+              print(f"{n:>8}  {lo:>22}  {hi:>22}  {note}")
+          print(f"\nTotal buckets: {end - start + 1}")
+          print(f"Dry-run: {dry}")
+          PYEOF
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 2: Build – compile the binary once and cache it
+  # ──────────────────────────────────────────────────────────
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute cache key
+        id: cache-key
+        run: |
+          echo "key=bignum-bucket-${{ hashFiles('src/BigNum.cpp', 'Makefile') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached binary
+        id: cache-restore
+        uses: actions/cache@v4
+        with:
+          path: bin/bignum
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Install toolchain
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Build release binary
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: make all
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bignum-binary
+          path: bin/bignum
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 3: Workers – 64 parallel jobs, one per bucket
+  # ──────────────────────────────────────────────────────────
+  worker:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    # No timeout-minutes: Mersenne prime search must not be artificially stopped.
+    # Note: GitHub-hosted runners enforce a hard 6-hour cap regardless.
+    # For unbounded runs (e.g., large buckets), use a self-hosted runner.
+    strategy:
+      fail-fast: false
+      max-parallel: 64
+      matrix:
+        bucket_n: ${{ fromJson(needs.plan.outputs.bucket_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bignum-binary
+          path: bin/
+
+      - name: Make binary executable
+        run: chmod +x bin/bignum
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
+
+      - name: Run bucket ${{ matrix.bucket_n }}
+        id: run
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: worker – bucket ${{ matrix.bucket_n }}"
+          mkdir -p bucket_out/bucket_${{ matrix.bucket_n }}
+
+          LL_SWEEP_MODE=power_bucket_primes \
+          LL_BUCKET_N=${{ matrix.bucket_n }} \
+          LL_THREADS=${{ inputs.threads }} \
+          LL_DRY_RUN=${{ inputs.dry_run && '1' || '0' }} \
+          LL_REVERSE_ORDER=${{ inputs.reverse_order && '1' || '0' }} \
+          LL_MAX_EXPONENTS_PER_JOB=${{ inputs.max_exponents_per_job }} \
+          LL_RESUME_FROM_EXPONENT=${{ inputs.resume_from_exponent }} \
+          LL_STOP_AFTER_FIRST_PRIME_RESULT=${{ inputs.stop_after_first_prime_result && '1' || '0' }} \
+          LL_BENCHMARK_MODE=${{ inputs.benchmark_mode && '1' || '0' }} \
+          LL_OUTPUT_DIR=bucket_out/ \
+          GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY}" \
+          ./bin/bignum 0 ${{ inputs.threads }}
+
+          if [ -f "bucket_out/bucket_${{ matrix.bucket_n }}/discovery_event.json" ]; then
+            echo "new_discovery=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=NEW MERSENNE PRIME FOUND::Bucket ${{ matrix.bucket_n }} found a new prime!"
+          else
+            echo "new_discovery=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload bucket artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-${{ matrix.bucket_n }}-results
+          path: bucket_out/bucket_${{ matrix.bucket_n }}/
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 4: Merge – aggregate all bucket results
+  # ──────────────────────────────────────────────────────────
+  merge:
+    needs: worker
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all bucket artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bucket-*-results
+          path: bucket_out/
+          merge-multiple: false
+
+      - name: Reorganize artifacts into bucket subdirectories
+        run: |
+          # Actions download-artifact places each artifact in its own dir;
+          # reorganize to match the expected bucket_out/bucket_N/ layout.
+          for dir in bucket_out/bucket-*-results; do
+            [ -d "$dir" ] || continue
+            n=$(echo "$dir" | grep -oP '(?<=bucket-)\d+(?=-results)')
+            target="bucket_out/bucket_${n}"
+            mkdir -p "$target"
+            cp -r "$dir"/. "$target/"
+          done
+
+      - name: Install Python (for merge script)
+        run: python3 --version  # already available on ubuntu-latest
+
+      - name: Merge bucket results
+        id: merge
+        run: |
+          python3 scripts/merge_bucket_results.py \
+            --dir bucket_out \
+            --out bucket_out/merged
+          if [ -f bucket_out/merged_new_discoveries.json ]; then
+            echo "new_discovery=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "new_discovery=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write workflow step summary
+        if: always()
+        run: |
+          echo "## Power Bucket Prime Sweep – Final Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f bucket_out/merged_summary.md ]; then
+            cat bucket_out/merged_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_(no merged summary produced)_" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Emit discovery notice
+        if: steps.merge.outputs.new_discovery == 'true'
+        run: |
+          echo "::notice title=NEW MERSENNE PRIME FOUND::See merged_new_discoveries.json artifact!"
+
+      - name: Upload merged results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bucket-sweep-merged-results
+          path: |
+            bucket_out/merged_all_results.csv
+            bucket_out/merged_all_results.json
+            bucket_out/merged_summary.md
+            bucket_out/merged_new_discoveries.json
+          retention-days: 90
+          if-no-files-found: warn

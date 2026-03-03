@@ -30,6 +30,146 @@ static void test_precharge_distribution() {
     assert(collected == expected);
 }
 
+// ---- discover-mode tests ----
+
+static void test_is_known_mersenne_prime() {
+    // Known entries must return true.
+    assert(mersenne::is_known_mersenne_prime(2u));
+    assert(mersenne::is_known_mersenne_prime(3u));
+    assert(mersenne::is_known_mersenne_prime(136279841u));
+    // Primes not in the list must return false.
+    assert(!mersenne::is_known_mersenne_prime(11u));       // M_11 is composite
+    assert(!mersenne::is_known_mersenne_prime(136279843u)); // > last known, not in list
+    assert(!mersenne::is_known_mersenne_prime(0u));
+    assert(!mersenne::is_known_mersenne_prime(1u));
+    // Values above uint32 max can never be known.
+    assert(!mersenne::is_known_mersenne_prime(UINT64_C(5000000000)));
+}
+
+static void test_generate_post_known_exponents() {
+    // Use small range for speed: primes in (10, 30] are 11, 13, 17, 19, 23, 29.
+    const auto v = mersenne::generate_post_known_exponents(UINT64_C(10), UINT64_C(30));
+    const std::vector<uint64_t> expected = {11, 13, 17, 19, 23, 29};
+    assert(v == expected);
+
+    // Empty range.
+    assert(mersenne::generate_post_known_exponents(UINT64_C(30), UINT64_C(30)).empty());
+    assert(mersenne::generate_post_known_exponents(UINT64_C(30), UINT64_C(10)).empty());
+
+    // Single element: primes in (28, 30] = {29}.
+    const auto w = mersenne::generate_post_known_exponents(UINT64_C(28), UINT64_C(30));
+    assert(w.size() == 1u && w[0] == 29u);
+}
+
+static void test_generate_post_known_exponents_u64_range() {
+    // Verify generation works for values well above uint32 max.
+    // Primes in (4294967311, 4294967331]: 4294967357 is outside, let's find actual primes.
+    // We use a small range just above UINT32_MAX: (UINT32_MAX, UINT32_MAX+100].
+    const uint64_t base = static_cast<uint64_t>(UINT32_MAX);
+    const auto v = mersenne::generate_post_known_exponents(base, base + 100u);
+    // All returned values must be > UINT32_MAX and prime.
+    for (uint64_t p : v) {
+        assert(p > base);
+        assert(p <= base + 100u);
+        assert(mersenne::is_prime_exponent(p));
+    }
+    // is_prime_exponent itself must handle uint64_t inputs.
+    assert(mersenne::is_prime_exponent(UINT64_C(4294967311)));  // known prime > UINT32_MAX
+    assert(!mersenne::is_prime_exponent(UINT64_C(4294967312))); // even
+}
+
+static void test_discover_exponent_list_ordering() {
+    // single_exp=13 first, then range (10,30] minus 13.
+    // Range primes in (10,30]: 11,13,17,19,23,29  → minus 13 → 11,17,19,23,29
+    const auto v = mersenne::discover_exponent_list(UINT64_C(13), UINT64_C(10), UINT64_C(30));
+    assert(!v.empty() && v[0] == 13u);
+    // 13 must appear exactly once.
+    assert(std::count(v.begin(), v.end(), UINT64_C(13)) == 1u);
+    // Range part (all but first) must be ascending.
+    for (size_t i = 2; i < v.size(); ++i)
+        assert(v[i] > v[i - 1]);
+}
+
+static void test_discover_exponent_list_dedup() {
+    // single_exp falls in the range: must appear only once and be first.
+    const auto v = mersenne::discover_exponent_list(UINT64_C(17), UINT64_C(10), UINT64_C(30));
+    assert(std::count(v.begin(), v.end(), UINT64_C(17)) == 1u);
+    assert(v[0] == 17u);
+}
+
+static void test_discover_exponent_list_range_limiting() {
+    // max_incl = 20: range primes in (10,20] = 11,13,17,19.
+    const auto v = mersenne::discover_exponent_list(UINT64_C(0), UINT64_C(10), UINT64_C(20));
+    for (uint64_t p : v) {
+        assert(p > 10u && p <= 20u);
+        assert(mersenne::is_prime_exponent(p));
+    }
+    // Ensure 23 and 29 are absent.
+    assert(std::find(v.begin(), v.end(), UINT64_C(23)) == v.end());
+    assert(std::find(v.begin(), v.end(), UINT64_C(29)) == v.end());
+}
+
+static void test_discover_exponent_list_sharding() {
+    // Sharding partitions the range part (not single_exp) deterministically.
+    // Range primes in (10,30]: 11,13,17,19,23,29 (6 items)
+    std::vector<uint64_t> all_range_items;
+    for (uint32_t si = 0; si < 3u; ++si) {
+        const auto s = mersenne::discover_exponent_list(UINT64_C(0), UINT64_C(10), UINT64_C(30),
+                                                        /*reverse=*/false,
+                                                        /*shard_count=*/3u,
+                                                        /*shard_index=*/si);
+        all_range_items.insert(all_range_items.end(), s.begin(), s.end());
+    }
+    // Total items across all shards == full range size.
+    const auto full = mersenne::generate_post_known_exponents(UINT64_C(10), UINT64_C(30));
+    assert(all_range_items.size() == full.size());
+    // Every item appears exactly once.
+    std::sort(all_range_items.begin(), all_range_items.end());
+    assert(all_range_items == full);
+}
+
+static void test_discover_exponent_list_reverse_order() {
+    // Range part must be in descending order when reverse_order=true.
+    const auto v = mersenne::discover_exponent_list(UINT64_C(0), UINT64_C(10), UINT64_C(30),
+                                                    /*reverse=*/true,
+                                                    /*shard_count=*/1u,
+                                                    /*shard_index=*/0u);
+    // v should be descending.
+    for (size_t i = 1; i < v.size(); ++i)
+        assert(v[i] < v[i - 1]);
+}
+
+static void test_discover_exponent_list_non_prime_single_exp() {
+    // single_exp that is not prime must be excluded from the list.
+    const auto v = mersenne::discover_exponent_list(UINT64_C(15), UINT64_C(10), UINT64_C(30)); // 15 = 3*5
+    assert(std::find(v.begin(), v.end(), UINT64_C(15)) == v.end());
+}
+
+static void test_discover_exponent_list_post_known_defaults() {
+    // Verify that a small range above 136279841 yields only primes > 136279841
+    // and <= max_incl.
+    const uint64_t min_excl = 136279841u;
+    const uint64_t max_incl = 136279950u;
+    const auto v = mersenne::discover_exponent_list(UINT64_C(0), min_excl, max_incl);
+    for (uint64_t p : v) {
+        assert(p > min_excl);
+        assert(p <= max_incl);
+        assert(mersenne::is_prime_exponent(p));
+    }
+    // None of the candidates should be in the known list (they're all > last known).
+    for (uint64_t p : v)
+        assert(!mersenne::is_known_mersenne_prime(p));
+}
+
+static void test_discovery_classification() {
+    // Known exponent: is_known_mersenne_prime → true, treated as known.
+    assert(mersenne::is_known_mersenne_prime(136279841u));
+    // Exponent above the known list: not in list → new-discovery candidate.
+    // (136279879 is prime and > 136279841, so it's not in the known list.)
+    assert(mersenne::is_prime_exponent(UINT64_C(136279879)));
+    assert(!mersenne::is_known_mersenne_prime(136279879u));
+}
+
 // ---- sweep::generate_natural tests ----
 static void test_sweep_natural() {
     // Basic range
@@ -185,6 +325,131 @@ int main() {
     test_sweep_apply_shard();
     test_sweep_mersenne_first_determinism();
     test_precharge_distribution();
+
+    // --- discover-mode tests ---
+    test_is_known_mersenne_prime();
+    test_generate_post_known_exponents();
+    test_generate_post_known_exponents_u64_range();
+    test_discover_exponent_list_ordering();
+    test_discover_exponent_list_dedup();
+    test_discover_exponent_list_range_limiting();
+    test_discover_exponent_list_sharding();
+    test_discover_exponent_list_reverse_order();
+    test_discover_exponent_list_non_prime_single_exp();
+    test_discover_exponent_list_post_known_defaults();
+    test_discovery_classification();
+
+    // --- power_bucket tests ---
+    // 1. bucket_range boundary generation
+    {
+        // n=1 normalized to [2, 2]
+        const auto r1 = power_bucket::bucket_range(1u);
+        assert(r1.lo == 2u && r1.hi == 2u);
+        // n=2: [2, 3]
+        const auto r2 = power_bucket::bucket_range(2u);
+        assert(r2.lo == 2u && r2.hi == 3u);
+        // n=3: [4, 7]
+        const auto r3 = power_bucket::bucket_range(3u);
+        assert(r3.lo == 4u && r3.hi == 7u);
+        // n=4: [8, 15]
+        const auto r4 = power_bucket::bucket_range(4u);
+        assert(r4.lo == 8u && r4.hi == 15u);
+        // n=64: [2^63, UINT64_MAX]
+        const auto r64 = power_bucket::bucket_range(64u);
+        assert(r64.lo == (UINT64_C(1) << 63) && r64.hi == UINT64_MAX);
+        // Invalid n=0 and n=65 return {0,0}
+        assert(power_bucket::bucket_range(0u).lo == 0u);
+        assert(power_bucket::bucket_range(65u).lo == 0u);
+    }
+
+    // 2. bucket normalization for n=1
+    {
+        const auto r = power_bucket::bucket_range(1u);
+        assert(r.lo == 2u && r.hi == 2u);
+        const auto v = power_bucket::enumerate_bucket_primes(1u);
+        assert(v.size() == 1u && v[0] == 2u);
+    }
+
+    // 3. no overlap between non-trivial adjacent buckets (n >= 3)
+    {
+        for (uint32_t n = 3u; n < 32u; ++n) {
+            const auto rn  = power_bucket::bucket_range(n);
+            const auto rn1 = power_bucket::bucket_range(n + 1u);
+            assert(rn.hi + 1u == rn1.lo);  // ranges are contiguous and non-overlapping
+        }
+    }
+
+    // 4. full coverage: union of all 64 buckets covers [2, UINT64_MAX]
+    {
+        // B_1=[2,2], B_2=[2,3], B_3=[4,7], ..., B_64=[2^63,UINT64_MAX]
+        // Verify B_2..B_64 partition [2, UINT64_MAX] with no gaps or overlaps.
+        uint64_t expected_lo = 2u;
+        for (uint32_t n = 2u; n <= 64u; ++n) {
+            const auto r = power_bucket::bucket_range(n);
+            assert(r.lo == expected_lo);
+            if (n < 64u)
+                expected_lo = r.hi + 1u;
+            else
+                assert(r.hi == UINT64_MAX);
+        }
+    }
+
+    // 5. prime exponent enumeration inside each bucket (small buckets only)
+    {
+        // Bucket 2: [2, 3] → primes 2, 3
+        const auto v2 = power_bucket::enumerate_bucket_primes(2u);
+        assert((v2 == std::vector<uint64_t>{2, 3}));
+
+        // Bucket 3: [4, 7] → primes 5, 7
+        const auto v3 = power_bucket::enumerate_bucket_primes(3u);
+        assert((v3 == std::vector<uint64_t>{5, 7}));
+
+        // Bucket 4: [8, 15] → primes 11, 13
+        const auto v4 = power_bucket::enumerate_bucket_primes(4u);
+        assert((v4 == std::vector<uint64_t>{11, 13}));
+
+        // All returned values must be prime
+        for (uint64_t p : v2) assert(mersenne::is_prime_exponent(p));
+        for (uint64_t p : v3) assert(mersenne::is_prime_exponent(p));
+        for (uint64_t p : v4) assert(mersenne::is_prime_exponent(p));
+
+        // Bucket 1 (normalized [2,2]): only prime is 2
+        const auto v1 = power_bucket::enumerate_bucket_primes(1u);
+        assert(v1.size() == 1u && v1[0] == 2u);
+    }
+
+    // 6. reverse ordering (verify via sorted comparison)
+    {
+        auto forward = power_bucket::enumerate_bucket_primes(5u);  // [16, 31]
+        auto reversed = forward;
+        std::reverse(reversed.begin(), reversed.end());
+        // All elements equal, just different order
+        auto fwd_sorted = forward;
+        auto rev_sorted = reversed;
+        std::sort(fwd_sorted.begin(), fwd_sorted.end());
+        std::sort(rev_sorted.begin(), rev_sorted.end());
+        assert(fwd_sorted == rev_sorted);
+        // forward is ascending, reversed is descending
+        for (size_t i = 1; i < forward.size(); ++i)
+            assert(forward[i] > forward[i - 1]);
+        for (size_t i = 1; i < reversed.size(); ++i)
+            assert(reversed[i] < reversed[i - 1]);
+    }
+
+    // 7. dry-run: bucket_range and enumerate_bucket_primes are deterministic
+    {
+        // Two calls with same n must return identical results.
+        const auto a = power_bucket::enumerate_bucket_primes(6u);
+        const auto b = power_bucket::enumerate_bucket_primes(6u);
+        assert(a == b);
+        assert(!a.empty());
+    }
+
+    // 8. invalid bucket returns empty prime list
+    {
+        assert(power_bucket::enumerate_bucket_primes(0u).empty());
+        assert(power_bucket::enumerate_bucket_primes(65u).empty());
+    }
 
     std::cout << "All tests passed\n";
     return 0;

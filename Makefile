@@ -12,7 +12,7 @@ PROF_BIN := bin/bignum_prof
 PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
 PROF_LDFLAGS  := -pthread -pg
 
-.PHONY: all clean unit smoke regression test bench bench-ci prof manual-sweep
+.PHONY: all clean  unit smoke regression test bench bench-ci prof discover discover-dry-run manual-sweep bucket bucket-dry-run
 
 BENCH_START_INDEX ?= 14
 
@@ -111,5 +111,59 @@ prof: $(PROF_BIN)
 	head -50 prof_report.txt
 
 clean:
-	rm -rf bin prof_report.txt gmon.out
+	rm -rf bin prof_report.txt gmon.out discover_out
 
+# discover: run full discover mode (set env vars to control behaviour).
+# Example: LL_MAX_EXPONENT=136279950 LL_STOP_AFTER_N_CASES=1 make discover
+discover: $(BIN)
+	LL_SWEEP_MODE=discover \
+	LL_SINGLE_EXPONENT=$${LL_SINGLE_EXPONENT:-0} \
+	LL_MAX_EXPONENT=$${LL_MAX_EXPONENT:-200000000} \
+	LL_SHARD_COUNT=$${LL_SHARD_COUNT:-1} \
+	LL_SHARD_INDEX=$${LL_SHARD_INDEX:-0} \
+	LL_REVERSE_ORDER=$${LL_REVERSE_ORDER:-0} \
+	LL_STOP_AFTER_N_CASES=$${LL_STOP_AFTER_N_CASES:-0} \
+	LL_DRY_RUN=0 \
+	LL_OUTPUT_DIR=discover_out/ \
+	./$(BIN) 0 $${LL_THREADS:-0}
+
+# discover-dry-run: print the exponent plan without running LL tests.
+discover-dry-run: $(BIN)
+	LL_SWEEP_MODE=discover \
+	LL_SINGLE_EXPONENT=$${LL_SINGLE_EXPONENT:-0} \
+	LL_MAX_EXPONENT=$${LL_MAX_EXPONENT:-200000000} \
+	LL_SHARD_COUNT=$${LL_SHARD_COUNT:-1} \
+	LL_SHARD_INDEX=$${LL_SHARD_INDEX:-0} \
+	LL_REVERSE_ORDER=$${LL_REVERSE_ORDER:-0} \
+	LL_STOP_AFTER_N_CASES=$${LL_STOP_AFTER_N_CASES:-0} \
+	LL_DRY_RUN=1 \
+	./$(BIN) 0 1
+
+# ---------------------------------------------------------------------------
+# bucket: run power-bucket prime sweep.
+# Example: LL_BUCKET_N=5 make bucket
+#          LL_BUCKET_START=1 LL_BUCKET_END=10 make bucket
+# ---------------------------------------------------------------------------
+bucket: $(BIN)
+	LL_SWEEP_MODE=power_bucket_primes \
+	LL_BUCKET_N=$${LL_BUCKET_N:-0} \
+	LL_BUCKET_START=$${LL_BUCKET_START:-1} \
+	LL_BUCKET_END=$${LL_BUCKET_END:-64} \
+	LL_REVERSE_ORDER=$${LL_REVERSE_ORDER:-0} \
+	LL_MAX_EXPONENTS_PER_JOB=$${LL_MAX_EXPONENTS_PER_JOB:-0} \
+	LL_STOP_AFTER_FIRST_PRIME_RESULT=$${LL_STOP_AFTER_FIRST_PRIME_RESULT:-0} \
+	LL_DRY_RUN=0 \
+	LL_OUTPUT_DIR=$${LL_OUTPUT_DIR:-bucket_out/} \
+	./$(BIN) 0 $${LL_THREADS:-0}
+
+# bucket-dry-run: print the exponent plan for a bucket without running LL tests.
+# Example: LL_BUCKET_N=3 make bucket-dry-run
+bucket-dry-run: $(BIN)
+	LL_SWEEP_MODE=power_bucket_primes \
+	LL_BUCKET_N=$${LL_BUCKET_N:-0} \
+	LL_BUCKET_START=$${LL_BUCKET_START:-1} \
+	LL_BUCKET_END=$${LL_BUCKET_END:-64} \
+	LL_REVERSE_ORDER=$${LL_REVERSE_ORDER:-0} \
+	LL_MAX_EXPONENTS_PER_JOB=$${LL_MAX_EXPONENTS_PER_JOB:-0} \
+	LL_DRY_RUN=1 \
+	./$(BIN) 0 1

@@ -1,0 +1,229 @@
+name: Discover Primes (manual / post-known-range exploration)
+
+# This workflow is MANUAL ONLY and must never be triggered by push/PR.
+# It runs the discover mode, which tests prime exponents above 136279841.
+# WARNING: large exponents take hours/days; use stop_after_n_cases and sharding.
+on:
+  workflow_dispatch:
+    inputs:
+      single_exponent:
+        description: "Explicit exponent to test first (0 = skip)"
+        required: false
+        default: "0"
+        type: string
+      max_exponent:
+        description: "Upper bound for exploration (default: 200000000)"
+        required: false
+        default: "200000000"
+        type: string
+      threads:
+        description: "Worker threads (0 = all available cores)"
+        required: false
+        default: "0"
+        type: string
+      reverse_order:
+        description: "Test largest exponents first"
+        required: false
+        default: false
+        type: boolean
+      shard_count:
+        description: "Total number of shards (for parallel jobs)"
+        required: false
+        default: "1"
+        type: string
+      run_all_shards:
+        description: "Run all shards as a matrix (overrides shard_count per job)"
+        required: false
+        default: false
+        type: boolean
+      stop_after_n_cases:
+        description: "Stop after N exponents (0 = no limit; safety control)"
+        required: false
+        default: "1"
+        type: string
+      dry_run:
+        description: "Print the exponent plan without executing LL tests"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute cache key
+        id: cache-key
+        run: echo "key=bignum-${{ runner.os }}-${{ hashFiles('src/BigNum.cpp', 'Makefile') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache binary
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: bin/bignum
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Install toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: make all
+
+  # Single-job path (shard_count=1 or run_all_shards=false).
+  discover-single:
+    name: Discover (shard 0/${{ inputs.shard_count }})
+    needs: build
+    if: ${{ inputs.run_all_shards == false }}
+    runs-on: ubuntu-latest
+    # No timeout-minutes: the Mersenne prime search must not be artificially stopped.
+    # Note: GitHub-hosted runners enforce a hard 6-hour cap regardless.
+    # For unbounded long-running scans use a self-hosted runner.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore binary
+        uses: actions/cache@v4
+        with:
+          path: bin/bignum
+          key: ${{ needs.build.outputs.cache-key }}
+
+      - name: Install toolchain (if cache missed)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+          if [ ! -f bin/bignum ]; then make all; fi
+
+      - name: Run discover mode (shard 0)
+        id: discover
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: discover-single (shard 0/${{ inputs.shard_count }})"
+          mkdir -p discover_out
+          LL_SWEEP_MODE=discover \
+          LL_SINGLE_EXPONENT=${{ inputs.single_exponent }} \
+          LL_MAX_EXPONENT=${{ inputs.max_exponent }} \
+          LL_SHARD_COUNT=${{ inputs.shard_count }} \
+          LL_SHARD_INDEX=0 \
+          LL_REVERSE_ORDER=${{ inputs.reverse_order && '1' || '0' }} \
+          LL_STOP_AFTER_N_CASES=${{ inputs.stop_after_n_cases }} \
+          LL_DRY_RUN=${{ inputs.dry_run && '1' || '0' }} \
+          LL_OUTPUT_DIR=discover_out/ \
+          GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+          ./bin/bignum 0 ${{ inputs.threads }}
+
+          # Check for discovery event.
+          if [ -f discover_out/discovery_event.json ]; then
+            echo "new_discovery=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=NEW MERSENNE PRIME FOUND::See discover_out/discovery_event.json"
+          else
+            echo "new_discovery=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload discover artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: discover-results-shard-0
+          path: discover_out/
+          retention-days: 90
+
+      - name: Annotate discovery (if found)
+        if: steps.discover.outputs.new_discovery == 'true'
+        run: |
+          echo "::error title=NEW MERSENNE PRIME FOUND::A new Mersenne prime was discovered! See artifacts."
+          echo "## 🚨 NEW MERSENNE PRIME FOUND" >> "$GITHUB_STEP_SUMMARY"
+          cat discover_out/discovery_event.json >> "$GITHUB_STEP_SUMMARY"
+
+  # Matrix path: run_all_shards=true, one job per shard.
+  discover-matrix:
+    name: Discover shard ${{ matrix.shard_index }}/${{ inputs.shard_count }}
+    needs: build
+    if: ${{ inputs.run_all_shards == true }}
+    runs-on: ubuntu-latest
+    # No timeout-minutes: the Mersenne prime search must not be artificially stopped.
+    # Note: GitHub-hosted runners enforce a hard 6-hour cap regardless.
+    # For unbounded long-running scans use a self-hosted runner.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: ${{ fromJson(inputs.shard_count == '1' && '[0]' || inputs.shard_count == '2' && '[0,1]' || inputs.shard_count == '3' && '[0,1,2]' || inputs.shard_count == '4' && '[0,1,2,3]' || '["__INVALID_SHARD_COUNT__"]') }}
+    steps:
+      - name: Validate shard_count for run_all_shards
+        if: ${{ matrix.shard_index == '__INVALID_SHARD_COUNT__' }}
+        run: |
+          echo "::error title=Invalid shard_count::run_all_shards currently supports shard_count values 1-4 only in this workflow."
+          echo "You provided shard_count='${{ inputs.shard_count }}', which is not supported for matrix sharding."
+          echo "Please rerun the workflow with shard_count set to 1, 2, 3, or 4 when run_all_shards=true."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore binary
+        uses: actions/cache@v4
+        with:
+          path: bin/bignum
+          key: ${{ needs.build.outputs.cache-key }}
+
+      - name: Install toolchain (if cache missed)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+          if [ ! -f bin/bignum ]; then make all; fi
+
+      - name: Run discover mode (shard ${{ matrix.shard_index }})
+        id: discover
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: discover-matrix shard ${{ matrix.shard_index }}/${{ inputs.shard_count }}"
+          mkdir -p discover_out
+          LL_SWEEP_MODE=discover \
+          LL_SINGLE_EXPONENT=${{ matrix.shard_index == 0 && inputs.single_exponent || '0' }} \
+          LL_MAX_EXPONENT=${{ inputs.max_exponent }} \
+          LL_SHARD_COUNT=${{ inputs.shard_count }} \
+          LL_SHARD_INDEX=${{ matrix.shard_index }} \
+          LL_REVERSE_ORDER=${{ inputs.reverse_order && '1' || '0' }} \
+          LL_STOP_AFTER_N_CASES=${{ inputs.stop_after_n_cases }} \
+          LL_DRY_RUN=${{ inputs.dry_run && '1' || '0' }} \
+          LL_OUTPUT_DIR=discover_out/ \
+          GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+          ./bin/bignum 0 ${{ inputs.threads }}
+
+          if [ -f discover_out/discovery_event.json ]; then
+            echo "new_discovery=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=NEW MERSENNE PRIME FOUND::Shard ${{ matrix.shard_index }} found a new prime!"
+          else
+            echo "new_discovery=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload discover artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: discover-results-shard-${{ matrix.shard_index }}
+          path: discover_out/
+          retention-days: 90
+
+      - name: Annotate discovery (if found)
+        if: steps.discover.outputs.new_discovery == 'true'
+        run: |
+          echo "::error title=NEW MERSENNE PRIME FOUND::Shard ${{ matrix.shard_index }} found a new Mersenne prime!"
+          echo "## 🚨 NEW MERSENNE PRIME FOUND (shard ${{ matrix.shard_index }})" >> "$GITHUB_STEP_SUMMARY"
+          cat discover_out/discovery_event.json >> "$GITHUB_STEP_SUMMARY"
