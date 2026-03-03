@@ -182,27 +182,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Compile plan tool
+        run: |
+          mkdir -p bin
+          gcc -std=c11 -O2 -o bin/split_bucket_batches src/split_bucket_batches.c
+
       - name: Build batch matrix JSON
         id: build-matrix
         run: |
           START="${{ inputs.bucket_start }}"
           END="${{ inputs.bucket_end }}"
-          DRY="${{ inputs.dry_run }}"
 
           # Print human-readable plan (always useful for audit).
-          python3 scripts/split_bucket_batches.py \
+          bin/split_bucket_batches \
             --bucket-start "${START}" \
             --bucket-end   "${END}" \
             --batch-size   1000 \
             --dry-run
 
           # Generate the JSON matrix (errors if > 256 batches).
-          BATCH_MATRIX=$(python3 scripts/split_bucket_batches.py \
+          BATCH_MATRIX=$(bin/split_bucket_batches \
             --bucket-start "${START}" \
             --bucket-end   "${END}" \
             --batch-size   1000)
 
-          BATCH_COUNT=$(echo "${BATCH_MATRIX}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d))")
+          BATCH_COUNT=$(bin/split_bucket_batches \
+            --bucket-start "${START}" \
+            --bucket-end   "${END}" \
+            --batch-size   1000 \
+            --count-only)
 
           echo "batch_matrix=${BATCH_MATRIX}" >> "$GITHUB_OUTPUT"
           echo "batch_count=${BATCH_COUNT}"   >> "$GITHUB_OUTPUT"

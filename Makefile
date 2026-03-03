@@ -2,17 +2,22 @@ CXX ?= g++
 CXXFLAGS ?= -std=c++20 -O3 -march=native -mtune=native -flto -pthread -Wall -Wextra -Wpedantic
 LDFLAGS ?= -flto -pthread
 
+CC ?= gcc
+CFLAGS_PLAN ?= -std=c11 -O2 -Wall -Wextra
+
 SRC := src/BigNum.cpp
 BIN := bin/bignum
 TEST_BIN := bin/test_bignum
 PROF_BIN := bin/bignum_prof
+PLAN_BIN := bin/split_bucket_batches
+PLAN_SRC := src/split_bucket_batches.c
 
 # Profiling build uses -O2 (keeps enough optimization to be representative
 # while preserving function call structure for gprof) and -pg.
 PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
 PROF_LDFLAGS  := -pthread -pg
 
-.PHONY: all clean  unit smoke regression test bench bench-ci prof discover discover-dry-run manual-sweep bucket bucket-dry-run
+.PHONY: all clean  unit smoke regression test bench bench-ci prof discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool
 
 BENCH_START_INDEX ?= 14
 
@@ -21,6 +26,13 @@ all: $(BIN)
 $(BIN): $(SRC)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+
+$(PLAN_BIN): $(PLAN_SRC)
+	@mkdir -p bin
+	$(CC) $(CFLAGS_PLAN) $< -o $@
+
+# plan-tool: build the C plan tool (replaces scripts/split_bucket_batches.py).
+plan-tool: $(PLAN_BIN)
 
 $(TEST_BIN): tests/test_bignum.cpp $(SRC)
 	@mkdir -p bin
