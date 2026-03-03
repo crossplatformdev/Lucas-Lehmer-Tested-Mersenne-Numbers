@@ -83,7 +83,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ make libboost-dev pkg-config gprof
+          sudo apt-get install -y g++ make libboost-dev pkg-config binutils
 
       - name: Build profiling binary
         run: make bin/bignum_prof
