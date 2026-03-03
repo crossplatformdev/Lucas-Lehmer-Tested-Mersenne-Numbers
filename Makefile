@@ -2,6 +2,13 @@ CXX ?= g++
 CXXFLAGS ?= -std=c++20 -O3 -march=native -mtune=native -flto -pthread -Wall -Wextra -Wpedantic
 LDFLAGS ?= -flto -pthread
 
+# Auto-detect GMP and enable the GmpBackend if available.
+GMP_AVAILABLE := $(shell pkg-config --exists gmp 2>/dev/null && echo 1 || echo 0)
+ifeq ($(GMP_AVAILABLE),1)
+  CXXFLAGS += -DHAVE_GMP
+  LDFLAGS  += -lgmp
+endif
+
 SRC := src/BigNum.cpp
 BIN := bin/bignum
 TEST_BIN := bin/test_bignum
