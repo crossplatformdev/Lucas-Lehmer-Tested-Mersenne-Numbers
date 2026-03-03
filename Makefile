@@ -28,7 +28,7 @@ $(TEST_BIN): tests/test_bignum.cpp $(SRC)
 
 $(PROF_BIN): $(SRC)
 	@mkdir -p bin
-	g++ $(PROF_CXXFLAGS) $< -o $@ $(PROF_LDFLAGS)
+	$(CXX) $(PROF_CXXFLAGS) $< -o $@ $(PROF_LDFLAGS)
 
 test: $(TEST_BIN) $(BIN)
 	./$(TEST_BIN)
