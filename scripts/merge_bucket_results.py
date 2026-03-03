@@ -55,6 +55,23 @@ def merge_json(json_files: list[str]) -> list[dict]:
     return all_results
 
 
+def _is_true(v) -> bool:
+    """Normalize booleans that may be stored as bool or string '1'/'true'."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() in ("1", "true", "yes")
+    return bool(v)
+
+
+def _elapsed(r) -> float:
+    """Return elapsed_sec as float, 0.0 if missing."""
+    try:
+        return float(r.get("elapsed_sec", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def write_merged_csv(rows: list[dict], out_path: str) -> None:
     if not rows:
         print(f"No rows to write to {out_path}", file=sys.stderr)
@@ -75,46 +92,132 @@ def write_merged_json(results: list[dict], out_path: str) -> None:
     print(f"Wrote merged JSON: {out_path} ({len(results)} results)")
 
 
-def write_summary_md(rows: list[dict], out_path: str, new_discoveries: list[dict]) -> None:
-    total = len(rows)
-    primes = sum(1 for r in rows if r.get("result") == "prime")
-    composites = sum(1 for r in rows if r.get("result") == "composite")
-    skipped = sum(1 for r in rows if r.get("result") not in ("prime", "composite"))
-
-    # Count per bucket
-    bucket_counts: dict[int, int] = {}
-    for r in rows:
-        n = int(r.get("bucket_n", 0))
-        bucket_counts[n] = bucket_counts.get(n, 0) + 1
+def write_summary_md(
+    results: list[dict],
+    out_path: str,
+    known_verified: list[dict],
+    new_discoveries: list[dict],
+) -> None:
+    total = len(results)
+    primes = sum(1 for r in results if r.get("result") == "prime")
+    composites = sum(1 for r in results if r.get("result") == "composite")
+    skipped = total - primes - composites
 
     lines = [
         "# Power Bucket Prime Sweep – Merged Summary\n",
         f"- **Total exponents tested**: {total}",
         f"- **Prime (Mersenne candidate)**: {primes}",
+        f"  - Known verified: {len(known_verified)}",
+        f"  - New discoveries: {len(new_discoveries)}",
         f"- **Composite**: {composites}",
         f"- **Skipped**: {skipped}",
-        f"- **New discoveries**: {'**YES – see below**' if new_discoveries else 'none'}",
         "",
-        "## Exponents per bucket",
-        "",
-        "| Bucket n | Exponents tested |",
-        "|----------|-----------------|",
     ]
-    for n in sorted(bucket_counts):
-        lines.append(f"| {n} | {bucket_counts[n]} |")
 
-    if new_discoveries:
+    # -------------------------------------------------------------------
+    # Bucket timing summary
+    # -------------------------------------------------------------------
+    bucket_data: dict[int, dict] = {}
+    for r in results:
+        n = int(r.get("bucket_n", 0))
+        if n not in bucket_data:
+            bucket_data[n] = {"count": 0, "total_sec": 0.0, "max_sec": 0.0}
+        bucket_data[n]["count"] += 1
+        t = _elapsed(r)
+        bucket_data[n]["total_sec"] += t
+        if t > bucket_data[n]["max_sec"]:
+            bucket_data[n]["max_sec"] = t
+
+    if bucket_data:
         lines += [
+            "## Bucket Timing Summary",
             "",
-            "## 🚨 New Mersenne Prime Discoveries",
-            "",
-            "| Exponent | Elapsed (s) | Backend |",
-            "|----------|------------|---------|",
+            "| Bucket n | Exponents tested | Total time (s)"
+            " | Avg time (s) | Longest (s) |",
+            "|----------|-----------------|---------------|"
+            "-------------|------------|",
+        ]
+        for n in sorted(bucket_data):
+            d = bucket_data[n]
+            avg = d["total_sec"] / d["count"] if d["count"] else 0.0
+            lines.append(
+                f"| {n} | {d['count']}"
+                f" | {d['total_sec']:.3f}"
+                f" | {avg:.3f}"
+                f" | {d['max_sec']:.3f} |"
+            )
+        lines.append("")
+
+    # -------------------------------------------------------------------
+    # Verified known Mersenne primes
+    # -------------------------------------------------------------------
+    lines += [
+        f"## Verified Known Mersenne Primes ({len(known_verified)})",
+        "",
+    ]
+    if not known_verified:
+        lines.append("_None found in this sweep._")
+        lines.append("")
+    else:
+        lines += [
+            "| Exponent | Bucket n | Backend | Elapsed (s) | Residue |",
+            "|----------|----------|---------|-------------|--------|",
+        ]
+        for r in known_verified:
+            lines.append(
+                f"| {r['exponent']}"
+                f" | {r.get('bucket_n', '')}"
+                f" | {r.get('backend', '')}"
+                f" | {_elapsed(r):.3f}"
+                f" | `{r.get('final_residue_hex', '0000000000000000')}` |"
+            )
+        lines.append("")
+
+    # -------------------------------------------------------------------
+    # New discoveries
+    # -------------------------------------------------------------------
+    lines += [
+        f"## 🚨 New Mersenne Prime Discoveries ({len(new_discoveries)})",
+        "",
+    ]
+    if not new_discoveries:
+        lines.append("_No new discoveries in this sweep._")
+        lines.append("")
+    else:
+        lines += [
+            "| Exponent | Bucket n | Backend | Elapsed (s) | Residue |",
+            "|----------|----------|---------|-------------|--------|",
         ]
         for d in new_discoveries:
             lines.append(
-                f"| {d['exponent']} | {d.get('elapsed_sec', 'N/A')} | {d.get('backend', 'N/A')} |"
+                f"| **{d['exponent']}**"
+                f" | {d.get('bucket_n', '')}"
+                f" | {d.get('backend', '')}"
+                f" | {_elapsed(d):.3f}"
+                f" | `{d.get('final_residue_hex', '')}` |"
             )
+        lines.append("")
+
+    # -------------------------------------------------------------------
+    # Composite exponents with residues
+    # -------------------------------------------------------------------
+    composite_results = [r for r in results if r.get("result") == "composite"]
+    if composite_results:
+        lines += [
+            f"## Composite Exponents Tested ({len(composite_results)})",
+            "",
+            "| Exponent | Bucket n | Backend | Elapsed (s) | Residue |",
+            "|----------|----------|---------|-------------|--------|",
+        ]
+        for r in composite_results:
+            lines.append(
+                f"| {r['exponent']}"
+                f" | {r.get('bucket_n', '')}"
+                f" | {r.get('backend', '')}"
+                f" | {_elapsed(r):.3f}"
+                f" | `{r.get('final_residue_hex', '')}` |"
+            )
+        lines.append("")
 
     with open(out_path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -151,22 +254,35 @@ def main() -> None:
     rows    = merge_csv(csv_files)  if csv_files  else []
     results = merge_json(json_files) if json_files else []
 
-    # Identify new discoveries (prime AND not known Mersenne prime).
-    new_discoveries = [r for r in results if r.get("is_new_discovery") is True]
+    # Normalise: prefer JSON results if available; fall back to CSV rows.
+    merged = results or [
+        {
+            "exponent":            r["exponent"],
+            "bucket_n":            r.get("bucket_n", ""),
+            "result":              r.get("result", ""),
+            "backend":             r.get("backend", ""),
+            "elapsed_sec":         r.get("elapsed_sec", ""),
+            "is_known_mersenne_prime": _is_true(r.get("is_known_mersenne", "0")),
+            "is_new_discovery":    _is_true(r.get("is_new_discovery", "0")),
+            "final_residue_hex":   r.get("final_residue_hex", "0000000000000000"),
+        }
+        for r in rows
+    ]
+
+    # Classify results.
+    known_verified  = [r for r in merged
+                       if r.get("result") == "prime"
+                       and _is_true(r.get("is_known_mersenne_prime", False))]
+    new_discoveries = [r for r in merged
+                       if _is_true(r.get("is_new_discovery", False))]
 
     if rows:
         write_merged_csv(rows, out_prefix + "_all_results.csv")
     if results:
         write_merged_json(results, out_prefix + "_all_results.json")
 
-    write_summary_md(rows or [{"exponent": r["exponent"],
-                                "bucket_n": r.get("bucket_n", ""),
-                                "result": r.get("result", ""),
-                                "backend": r.get("backend", ""),
-                                "elapsed_sec": r.get("elapsed_sec", "")}
-                               for r in results],
-                    out_prefix + "_summary.md",
-                    new_discoveries)
+    write_summary_md(merged, out_prefix + "_summary.md",
+                     known_verified, new_discoveries)
 
     if new_discoveries:
         write_new_discoveries_json(new_discoveries, out_prefix + "_new_discoveries.json")

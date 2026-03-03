@@ -357,6 +357,25 @@ inline std::vector<uint64_t> enumerate_bucket_primes(uint32_t n) {
 }  // namespace power_bucket
 
 // ============================================================
+// ProgressContext: per-exponent progress config for lucas_lehmer_ex().
+// LLResult:        result returned by lucas_lehmer_ex().
+// ============================================================
+struct ProgressContext {
+    uint32_t bucket_n{0};         // 0 = no bucket context
+    uint64_t bucket_lo{0};
+    uint64_t bucket_hi{0};
+    size_t   exp_index{0};        // 1-based index within current bucket
+    size_t   exp_total{0};        // total exponents in current bucket
+    uint32_t interval_iters{10000}; // checkpoint every N iterations
+    double   interval_secs{0.0};  // also checkpoint every N seconds (0 = off)
+};
+
+struct LLResult {
+    bool        is_prime{false};
+    std::string final_residue_hex{"0000000000000000"}; // 16-char lowercase hex
+};
+
+// ============================================================
 // namespace backend
 // ============================================================
 namespace backend {
@@ -421,6 +440,15 @@ struct GenericBackend {
 
     static bool is_zero(const State& st) { return st.s == 0; }
     static double max_roundoff(const State& st) { return st.max_roundoff; }
+    static std::string residue_hex(const State& st) {
+        if (is_zero(st)) return "0000000000000000";
+        using boost::multiprecision::cpp_int;
+        const cpp_int mask64 = (cpp_int(1) << 64) - 1;
+        const uint64_t low64 = static_cast<uint64_t>(st.s & mask64);
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016" PRIx64, low64);
+        return std::string(buf);
+    }
 };
 
 // ============================================================
@@ -796,6 +824,13 @@ struct LimbBackend {
     }
 
     static double max_roundoff(const State& st) { return st.max_roundoff; }
+    static std::string residue_hex(const State& st) {
+        if (is_zero(st)) return "0000000000000000";
+        const uint64_t low64 = st.s.empty() ? 0u : st.s[0];
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016" PRIx64, low64);
+        return std::string(buf);
+    }
 };
 
 // ============================================================
@@ -1091,6 +1126,21 @@ struct FftMersenneBackend {
 
     static bool is_zero(const State& st) { return fft_is_zero(st); }
     static double max_roundoff(const State& st) { return st.max_roundoff; }
+    static std::string residue_hex(const State& st) {
+        if (is_zero(st)) return "0000000000000000";
+        // Reconstruct the low 64 bits from the DWT digit representation.
+        // bit_pos[j] = floor(j*p/n) is non-decreasing; stop once it reaches 64.
+        uint64_t low64 = 0u;
+        for (size_t j = 0u; j < st.n; ++j) {
+            const uint64_t bp = st.bit_pos[j];
+            if (bp >= 64u) break;
+            const int64_t d = static_cast<int64_t>(std::round(st.digits[j]));
+            low64 += static_cast<uint64_t>(d) << static_cast<unsigned>(bp);
+        }
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016" PRIx64, low64);
+        return std::string(buf);
+    }
 };
 
 }  // namespace backend
@@ -1136,6 +1186,68 @@ public:
             }
         }
         return Backend::is_zero(state_);
+    }
+
+    // run_ex: like run() but returns LLResult{is_prime, final_residue_hex}
+    // and prints richer per-exponent progress using the supplied ProgressContext.
+    LLResult run_ex(bool progress, const ProgressContext& ctx) {
+        if (p_ < 2u) return {false, "0000000000000000"};
+        if (p_ == 2u) return {true,  "0000000000000000"};
+        if ((p_ & 1u) == 0u) return {false, "0000000000000000"};
+        if (!benchmark_mode_ && !mersenne::is_prime_exponent(p_))
+            return {false, "0000000000000000"};
+
+        const uint32_t iters    = p_ - 2u;
+        const auto     t_start  = std::chrono::steady_clock::now();
+        const uint32_t chk_base = (ctx.interval_iters > 0u) ? ctx.interval_iters : 10000u;
+        uint32_t       countdown = chk_base;
+        double         ema_avg   = 0.0;  // EMA seconds/iteration for stable ETA
+
+        for (uint32_t i = 0u; i < iters; ++i) {
+            Backend::step(state_);
+
+            if (progress && --countdown == 0u) {
+                const auto   now     = std::chrono::steady_clock::now();
+                const double elapsed = std::chrono::duration<double>(now - t_start).count();
+                const double avg_i   = elapsed / static_cast<double>(i + 1u);
+                const double rem     = static_cast<double>(iters - (i + 1u));
+                // Exponential moving average for stable ETA.
+                ema_avg = (ema_avg == 0.0) ? avg_i : (0.3 * avg_i + 0.7 * ema_avg);
+                const double eta     = ema_avg * rem;
+                const double pct     = 100.0 * static_cast<double>(i + 1u) /
+                                               static_cast<double>(iters);
+                const double max_err = Backend::max_roundoff(state_);
+                if (ctx.bucket_n > 0u) {
+                    std::printf("  [B%" PRIu32 " exp %zu/%zu]"
+                                " p=%" PRIu32 "  iter %u/%u (%.1f%%)"
+                                "  elapsed %.1fs  ETA %.1fs"
+                                "  avg %.3fus/iter  max_err %.4f\n",
+                                ctx.bucket_n, ctx.exp_index, ctx.exp_total, p_,
+                                i + 1u, iters, pct, elapsed, eta,
+                                avg_i * 1e6, max_err);
+                } else {
+                    std::printf("  iter %u/%u (%.1f%%)"
+                                "  elapsed %.1fs  ETA %.1fs"
+                                "  avg %.3fus/iter  max_err %.4f\n",
+                                i + 1u, iters, pct, elapsed, eta,
+                                avg_i * 1e6, max_err);
+                }
+                std::fflush(stdout);
+                // Adjust countdown for time-based interval (approximate via EMA).
+                if (ctx.interval_secs > 0.0 && ema_avg > 0.0) {
+                    const uint32_t est = static_cast<uint32_t>(ctx.interval_secs / ema_avg);
+                    countdown = (est < 100u)           ? 100u
+                              : (est > chk_base * 10u) ? chk_base * 10u
+                              : est;
+                } else {
+                    countdown = chk_base;
+                }
+            }
+        }
+        const bool  is_prime = Backend::is_zero(state_);
+        std::string residue  = is_prime ? "0000000000000000"
+                                        : Backend::residue_hex(state_);
+        return LLResult{is_prime, std::move(residue)};
     }
 
     double max_roundoff() const { return Backend::max_roundoff(state_); }
@@ -1195,6 +1307,38 @@ bool lucas_lehmer(uint32_t p, bool progress, bool benchmark_mode = false) {
     // FFT/DWT backend for large exponents.
     LucasLehmerEngine<backend::FftMersenneBackend> eng(p, /*benchmark_mode=*/true);
     return eng.run(progress);
+}
+
+// lucas_lehmer_ex: like lucas_lehmer() but returns LLResult{is_prime, residue_hex}
+// and prints richer per-exponent progress using the supplied ProgressContext.
+LLResult lucas_lehmer_ex(uint32_t p, bool progress, bool benchmark_mode,
+                          const ProgressContext& ctx) {
+    if (p < 2u) return {false, "0000000000000000"};
+    if (p == 2u) return {true,  "0000000000000000"};
+    if ((p & 1u) == 0u) return {false, "0000000000000000"};
+    if (!benchmark_mode && !is_prime_exponent(p)) return {false, "0000000000000000"};
+
+    if (p < 128u) {
+        LucasLehmerEngine<backend::GenericBackend> eng(p, /*benchmark_mode=*/true);
+        return eng.run_ex(progress, ctx);
+    }
+    // Reuse the same crossover threshold logic as lucas_lehmer().
+    static const uint32_t kCrossoverEx = []() -> uint32_t {
+        const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
+        if (env && *env) {
+            char* end = nullptr;
+            const long v = std::strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v > 0 && v < 1000000L)
+                return static_cast<uint32_t>(v);
+        }
+        return 4000u;
+    }();
+    if (p < kCrossoverEx) {
+        LucasLehmerEngine<backend::LimbBackend> eng(p, /*benchmark_mode=*/true);
+        return eng.run_ex(progress, ctx);
+    }
+    LucasLehmerEngine<backend::FftMersenneBackend> eng(p, /*benchmark_mode=*/true);
+    return eng.run_ex(progress, ctx);
 }
 
 }  // namespace mersenne
@@ -1710,12 +1854,17 @@ struct BucketResult {
     uint32_t    bucket_n{0};
     uint64_t    bucket_lo{0};
     uint64_t    bucket_hi{0};
+    size_t      exponent_index{0};           // 1-based index within bucket
+    size_t      bucket_total_exponents{0};   // total exponents in bucket
     bool        is_prime{false};
     bool        is_known{false};
     bool        is_new_discovery{false};
     double      elapsed_sec{0.0};
+    uint32_t    iterations_total{0};         // p - 2
+    double      avg_iter_seconds{0.0};       // elapsed_sec / iterations_total
     unsigned    threads{1};
     std::string backend_name;
+    std::string final_residue_hex{"0000000000000000"};
 };
 
 static void write_bucket_csv(
@@ -1724,21 +1873,28 @@ static void write_bucket_csv(
 {
     std::ofstream f(path);
     if (!f) { std::fprintf(stderr, "Cannot write CSV: %s\n", path.c_str()); return; }
-    f << "exponent,bucket_n,bucket_lo,bucket_hi,result,backend,"
-         "elapsed_sec,threads,is_known_mersenne,is_new_discovery\n";
+    f << "exponent,bucket_n,bucket_lo,bucket_hi,exponent_index,bucket_total,"
+         "result,backend,elapsed_sec,iterations_total,avg_iter_seconds,"
+         "threads,is_known_mersenne,is_new_discovery,final_residue_hex\n";
     for (const auto& r : results) {
-        char ebuf[32];
+        char ebuf[32], abuf[32];
         std::snprintf(ebuf, sizeof(ebuf), "%.6f", r.elapsed_sec);
+        std::snprintf(abuf, sizeof(abuf), "%.9f", r.avg_iter_seconds);
         f << r.exponent << ","
           << r.bucket_n << ","
           << r.bucket_lo << ","
           << r.bucket_hi << ","
+          << r.exponent_index << ","
+          << r.bucket_total_exponents << ","
           << (r.is_prime ? "prime" : "composite") << ","
           << r.backend_name << ","
           << ebuf << ","
+          << r.iterations_total << ","
+          << abuf << ","
           << r.threads << ","
           << (r.is_known ? "1" : "0") << ","
-          << (r.is_new_discovery ? "1" : "0") << "\n";
+          << (r.is_new_discovery ? "1" : "0") << ","
+          << r.final_residue_hex << "\n";
     }
 }
 
@@ -1767,17 +1923,25 @@ static void write_bucket_json(
 
     for (size_t i = 0; i < results.size(); ++i) {
         const auto& r = results[i];
-        char ebuf[32];
+        char ebuf[32], abuf[32];
         std::snprintf(ebuf, sizeof(ebuf), "%.6f", r.elapsed_sec);
+        std::snprintf(abuf, sizeof(abuf), "%.9f", r.avg_iter_seconds);
         f << "    {\n"
           << "      \"exponent\": " << r.exponent << ",\n"
           << "      \"bucket_n\": " << r.bucket_n << ",\n"
+          << "      \"bucket_min_exponent\": " << r.bucket_lo << ",\n"
+          << "      \"bucket_max_exponent\": " << r.bucket_hi << ",\n"
+          << "      \"bucket_exponent_index\": " << r.exponent_index << ",\n"
+          << "      \"bucket_total_exponents\": " << r.bucket_total_exponents << ",\n"
           << "      \"result\": \"" << (r.is_prime ? "prime" : "composite") << "\",\n"
           << "      \"backend\": \"" << json_escape(r.backend_name) << "\",\n"
           << "      \"elapsed_sec\": " << ebuf << ",\n"
+          << "      \"iterations_total\": " << r.iterations_total << ",\n"
+          << "      \"avg_iter_seconds\": " << abuf << ",\n"
           << "      \"threads\": " << r.threads << ",\n"
           << "      \"is_known_mersenne_prime\": " << (r.is_known ? "true" : "false") << ",\n"
-          << "      \"is_new_discovery\": " << (r.is_new_discovery ? "true" : "false") << "\n"
+          << "      \"is_new_discovery\": " << (r.is_new_discovery ? "true" : "false") << ",\n"
+          << "      \"final_residue_hex\": \"" << r.final_residue_hex << "\"\n"
           << "    }" << (i + 1 < results.size() ? "," : "") << "\n";
     }
     f << "  ]\n}\n";
@@ -1797,6 +1961,16 @@ static int run_power_bucket_mode(int argc, char** argv) {
     const bool progress          = env_bool("LL_PROGRESS");
     const bool benchmark_mode    = env_bool("LL_BENCHMARK_MODE", false);
     const bool stop_first_prime  = env_bool("LL_STOP_AFTER_FIRST_PRIME_RESULT");
+
+    // Configurable checkpoint intervals for per-exponent progress output.
+    const uint32_t prog_interval_iters = env_uint32("LL_PROGRESS_INTERVAL_ITERS", 10000u);
+    const double prog_interval_secs = [&]() -> double {
+        const char* s = std::getenv("LL_PROGRESS_INTERVAL_SECONDS");
+        if (!s || !*s) return 0.0;
+        char* end = nullptr;
+        const double v = std::strtod(s, &end);
+        return (end != s && *end == '\0' && v > 0.0) ? v : 0.0;
+    }();
 
     unsigned threads = maxCores;
     if (argc >= 3 && argv[2] && argv[2][0] != '\0') {
@@ -1901,31 +2075,77 @@ static int run_power_bucket_mode(int argc, char** argv) {
         std::vector<BucketResult> results;
         results.reserve(exps.size());
 
-        for (const uint64_t p : exps) {
+        // Bucket-level progress tracking.
+        const auto bucket_t0 = std::chrono::steady_clock::now();
+        size_t bucket_composites     = 0u;
+        size_t bucket_known_primes   = 0u;
+        size_t bucket_new_disc       = 0u;
+        double bucket_elapsed_total  = 0.0;
+
+        for (size_t exp_idx = 0u; exp_idx < exps.size(); ++exp_idx) {
+            const uint64_t p = exps[exp_idx];
             if (stop_first_prime && any_new_discovery) break;
 
-            std::printf("  Testing M_%" PRIu64 " ...\n", p);
+            const std::string bname = (p <= UINT32_MAX)
+                                      ? discover_backend_name(p)
+                                      : "skipped_exceeds_uint32";
+            const uint32_t iters_total = (p > 1u && p <= UINT32_MAX)
+                                         ? static_cast<uint32_t>(p) - 2u : 0u;
+
+            std::printf("  [B%u exp %zu/%zu] Testing M_%" PRIu64
+                        " (%u iters, backend=%s) ...\n",
+                        n, exp_idx + 1u, exps.size(), p,
+                        iters_total, bname.c_str());
+            std::fflush(stdout);
+
             BucketResult res;
-            res.exponent   = p;
-            res.bucket_n   = n;
-            res.bucket_lo  = br.lo;
-            res.bucket_hi  = br.hi;
-            res.threads    = threads;
-            res.is_known   = mersenne::is_known_mersenne_prime(p);
+            res.exponent                = p;
+            res.bucket_n                = n;
+            res.bucket_lo               = br.lo;
+            res.bucket_hi               = br.hi;
+            res.exponent_index          = exp_idx + 1u;
+            res.bucket_total_exponents  = exps.size();
+            res.iterations_total        = iters_total;
+            res.threads                 = threads;
+            res.is_known                = mersenne::is_known_mersenne_prime(p);
 
             if (p > UINT32_MAX) {
                 res.backend_name = "skipped_exceeds_uint32";
                 res.is_prime     = false;
                 std::printf("  M_%" PRIu64 ": skipped (exceeds uint32_t limit)\n", p);
             } else {
+                ProgressContext ctx;
+                ctx.bucket_n       = n;
+                ctx.bucket_lo      = br.lo;
+                ctx.bucket_hi      = br.hi;
+                ctx.exp_index      = exp_idx + 1u;
+                ctx.exp_total      = exps.size();
+                ctx.interval_iters = prog_interval_iters;
+                ctx.interval_secs  = prog_interval_secs;
+
                 const auto t0 = std::chrono::steady_clock::now();
-                res.is_prime = mersenne::lucas_lehmer(
-                    static_cast<uint32_t>(p), progress, benchmark_mode);
+                const LLResult llr = mersenne::lucas_lehmer_ex(
+                    static_cast<uint32_t>(p), progress, benchmark_mode, ctx);
                 const auto t1 = std::chrono::steady_clock::now();
-                res.elapsed_sec  = std::chrono::duration<double>(t1 - t0).count();
-                res.backend_name = discover_backend_name(p);
-                std::printf("  M_%" PRIu64 " is %s. Time: %.3f s\n",
-                            p, res.is_prime ? "prime" : "composite", res.elapsed_sec);
+                res.elapsed_sec      = std::chrono::duration<double>(t1 - t0).count();
+                res.is_prime         = llr.is_prime;
+                res.final_residue_hex = llr.final_residue_hex;
+                res.backend_name     = bname;
+                if (iters_total > 0u && res.elapsed_sec > 0.0)
+                    res.avg_iter_seconds = res.elapsed_sec /
+                                          static_cast<double>(iters_total);
+                std::printf("  M_%" PRIu64 " is %s. Time: %.3f s"
+                            "  residue: %s\n",
+                            p, res.is_prime ? "prime" : "composite",
+                            res.elapsed_sec, res.final_residue_hex.c_str());
+            }
+
+            bucket_elapsed_total += res.elapsed_sec;
+            if (res.is_prime) {
+                if (res.is_known) ++bucket_known_primes;
+                else              ++bucket_new_disc;
+            } else {
+                ++bucket_composites;
             }
 
             res.is_new_discovery = res.is_prime && !res.is_known;
@@ -1937,6 +2157,32 @@ static int run_power_bucket_mode(int argc, char** argv) {
                         bdir + "discovery_event.json",
                         p, res.elapsed_sec, 0u, 1u, run_url);
             }
+
+            // Bucket-level progress line after each exponent.
+            {
+                const auto now_b = std::chrono::steady_clock::now();
+                const double b_elapsed =
+                    std::chrono::duration<double>(now_b - bucket_t0).count();
+                const size_t done = exp_idx + 1u;
+                const size_t remaining = exps.size() - done;
+                const double avg_exp = (done > 0u)
+                    ? bucket_elapsed_total / static_cast<double>(done) : 0.0;
+                const double eta_bucket = avg_exp * static_cast<double>(remaining);
+                const double pct_bucket =
+                    100.0 * static_cast<double>(done) /
+                            static_cast<double>(exps.size());
+                std::printf("  [Bucket %u progress] %zu/%zu done (%.1f%%)"
+                            "  elapsed %.1fs  ETA %.1fs"
+                            "  primes=%zu (known=%zu new=%zu)"
+                            "  composites=%zu\n",
+                            n, done, exps.size(), pct_bucket,
+                            b_elapsed, eta_bucket,
+                            bucket_known_primes + bucket_new_disc,
+                            bucket_known_primes, bucket_new_disc,
+                            bucket_composites);
+                std::fflush(stdout);
+            }
+
             results.push_back(std::move(res));
         }
 
@@ -1948,10 +2194,72 @@ static int run_power_bucket_mode(int argc, char** argv) {
 
             std::ofstream sf(pfx + "_summary.md");
             if (sf) {
+                // Aggregate stats.
+                size_t n_prime = 0u, n_composite = 0u, n_known = 0u, n_new = 0u;
+                double total_time = 0.0;
+                for (const auto& r : results) {
+                    if (r.is_prime) ++n_prime; else ++n_composite;
+                    if (r.is_known) ++n_known;
+                    if (r.is_new_discovery) ++n_new;
+                    total_time += r.elapsed_sec;
+                }
+                const double avg_time = results.empty() ? 0.0
+                    : total_time / static_cast<double>(results.size());
+                char ttbuf[32], atbuf[32];
+                std::snprintf(ttbuf, sizeof(ttbuf), "%.3f", total_time);
+                std::snprintf(atbuf, sizeof(atbuf), "%.3f", avg_time);
+
                 sf << "# Bucket " << n << " Summary\n\n"
-                   << "Range: [" << br.lo << ", " << br.hi << "]\n\n"
-                   << "| Exponent | Result | Backend | Elapsed (s) | New? |\n"
-                   << "|----------|--------|---------|-------------|------|\n";
+                   << "- **Range**: [" << br.lo << ", " << br.hi << "]\n"
+                   << "- **Total tested**: " << results.size() << "\n"
+                   << "- **Primes**: " << n_prime
+                   << " (known: " << n_known << ", new: " << n_new << ")\n"
+                   << "- **Composites**: " << n_composite << "\n"
+                   << "- **Total time**: " << ttbuf << " s\n"
+                   << "- **Avg time**: " << atbuf << " s/exponent\n\n";
+
+                // Verified known Mersenne primes.
+                sf << "## Verified Known Mersenne Primes (" << n_known << ")\n\n";
+                if (n_known == 0u) {
+                    sf << "_None in this bucket._\n\n";
+                } else {
+                    sf << "| Exponent | Backend | Elapsed (s) | Residue |\n"
+                       << "|----------|---------|-------------|--------|\n";
+                    for (const auto& r : results) {
+                        if (!r.is_known) continue;
+                        char ebuf[32];
+                        std::snprintf(ebuf, sizeof(ebuf), "%.3f", r.elapsed_sec);
+                        sf << "| " << r.exponent << " | " << r.backend_name
+                           << " | " << ebuf
+                           << " | `" << r.final_residue_hex << "` |\n";
+                    }
+                    sf << "\n";
+                }
+
+                // New discoveries.
+                sf << "## New Mersenne Prime Discoveries (" << n_new << ")\n\n";
+                if (n_new == 0u) {
+                    sf << "_None in this bucket._\n\n";
+                } else {
+                    sf << "| Exponent | Backend | Elapsed (s) | Residue |\n"
+                       << "|----------|---------|-------------|--------|\n";
+                    for (const auto& r : results) {
+                        if (!r.is_new_discovery) continue;
+                        char ebuf[32];
+                        std::snprintf(ebuf, sizeof(ebuf), "%.3f", r.elapsed_sec);
+                        sf << "| **" << r.exponent << "** | " << r.backend_name
+                           << " | " << ebuf
+                           << " | `" << r.final_residue_hex << "` |\n";
+                    }
+                    sf << "\n";
+                }
+
+                // All tested exponents.
+                sf << "## All Tested Exponents\n\n"
+                   << "| Exponent | Result | Backend | Elapsed (s)"
+                      " | Residue | Known | New |\n"
+                   << "|----------|--------|---------|-------------|"
+                      "---------|-------|-----|\n";
                 for (const auto& r : results) {
                     char ebuf[32];
                     std::snprintf(ebuf, sizeof(ebuf), "%.3f", r.elapsed_sec);
@@ -1959,9 +2267,14 @@ static int run_power_bucket_mode(int argc, char** argv) {
                        << " | " << (r.is_prime ? "prime" : "composite")
                        << " | " << r.backend_name
                        << " | " << ebuf
-                       << " | " << (r.is_new_discovery ? "**YES**" : "no") << " |\n";
+                       << " | `" << r.final_residue_hex << "`"
+                       << " | " << (r.is_known ? "yes" : "no")
+                       << " | " << (r.is_new_discovery ? "**YES**" : "no")
+                       << " |\n";
                 }
-                if (!run_url.empty()) sf << "\n**Workflow run:** " << run_url << "\n";
+
+                if (!run_url.empty())
+                    sf << "\n**Workflow run:** " << run_url << "\n";
             }
         }
     }

@@ -451,6 +451,143 @@ int main() {
         assert(power_bucket::enumerate_bucket_primes(65u).empty());
     }
 
+    // --- ProgressContext and LLResult tests ---
+
+    // 9. ProgressContext default construction.
+    {
+        ProgressContext ctx;
+        assert(ctx.bucket_n == 0u);
+        assert(ctx.exp_index == 0u);
+        assert(ctx.exp_total == 0u);
+        assert(ctx.interval_iters == 10000u);
+        assert(ctx.interval_secs == 0.0);
+    }
+
+    // 10. LLResult default construction.
+    {
+        LLResult r;
+        assert(!r.is_prime);
+        assert(r.final_residue_hex == "0000000000000000");
+    }
+
+    // 11. residue_hex format: always 16 lowercase hex characters.
+    auto check_residue_fmt = [](const std::string& hex) {
+        assert(hex.size() == 16u);
+        for (char c : hex)
+            assert((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'));
+    };
+
+    // 12. GenericBackend residue: prime → zeros, composite → non-zero.
+    {
+        // p=3 is a known Mersenne prime (benchmark_mode=true to skip primality check).
+        {
+            LucasLehmerEngine<backend::GenericBackend> eng(3u, true);
+            const LLResult res = eng.run_ex(false, ProgressContext{});
+            assert(res.is_prime);
+            assert(res.final_residue_hex == "0000000000000000");
+            check_residue_fmt(res.final_residue_hex);
+        }
+        // p=11 is composite.
+        {
+            LucasLehmerEngine<backend::GenericBackend> eng(11u, true);
+            const LLResult res = eng.run_ex(false, ProgressContext{});
+            assert(!res.is_prime);
+            assert(res.final_residue_hex != "0000000000000000");
+            check_residue_fmt(res.final_residue_hex);
+        }
+    }
+
+    // 13. LimbBackend residue: prime → zeros, composite → non-zero.
+    {
+        // p=607 is a known Mersenne prime; use LimbBackend (p < kLimbFftCrossover).
+        {
+            LucasLehmerEngine<backend::LimbBackend> eng(607u, true);
+            const LLResult res = eng.run_ex(false, ProgressContext{});
+            assert(res.is_prime);
+            assert(res.final_residue_hex == "0000000000000000");
+            check_residue_fmt(res.final_residue_hex);
+        }
+        // p=601 is a prime exponent but M_601 is composite.
+        {
+            LucasLehmerEngine<backend::LimbBackend> eng(601u, true);
+            const LLResult res = eng.run_ex(false, ProgressContext{});
+            assert(!res.is_prime);
+            assert(res.final_residue_hex != "0000000000000000");
+            check_residue_fmt(res.final_residue_hex);
+        }
+    }
+
+    // 14. lucas_lehmer_ex: results match lucas_lehmer for known primes and composites.
+    {
+        const ProgressContext ctx{};
+        // p=2 (special case): prime, zero residue.
+        {
+            const LLResult r = mersenne::lucas_lehmer_ex(2u, false, true, ctx);
+            assert(r.is_prime);
+            assert(r.final_residue_hex == "0000000000000000");
+        }
+        // p=5: known Mersenne prime.
+        {
+            const LLResult r = mersenne::lucas_lehmer_ex(5u, false, true, ctx);
+            assert(r.is_prime);
+            assert(r.final_residue_hex == "0000000000000000");
+            check_residue_fmt(r.final_residue_hex);
+        }
+        // p=11: composite.
+        {
+            const bool b_old = mersenne::lucas_lehmer(11u, false, true);
+            const LLResult r = mersenne::lucas_lehmer_ex(11u, false, true, ctx);
+            assert(r.is_prime == b_old);
+            assert(!r.is_prime);
+            assert(r.final_residue_hex != "0000000000000000");
+            check_residue_fmt(r.final_residue_hex);
+        }
+        // p=13: known prime; result must agree with lucas_lehmer.
+        {
+            const bool b_old = mersenne::lucas_lehmer(13u, false, true);
+            const LLResult r = mersenne::lucas_lehmer_ex(13u, false, true, ctx);
+            assert(r.is_prime == b_old);
+            assert(r.is_prime);
+        }
+    }
+
+    // 15. ProgressContext with bucket context fields set.
+    {
+        ProgressContext ctx;
+        ctx.bucket_n       = 5u;
+        ctx.bucket_lo      = 16u;
+        ctx.bucket_hi      = 31u;
+        ctx.exp_index      = 3u;
+        ctx.exp_total      = 8u;
+        ctx.interval_iters = 500u;
+        ctx.interval_secs  = 30.0;
+        assert(ctx.bucket_n == 5u);
+        assert(ctx.exp_index == 3u);
+        assert(ctx.exp_total == 8u);
+        assert(ctx.interval_iters == 500u);
+        assert(ctx.interval_secs == 30.0);
+        // Run a small exponent with context set (no output since progress=false).
+        const LLResult r = mersenne::lucas_lehmer_ex(7u, false, true, ctx);
+        assert(r.is_prime);
+        assert(r.final_residue_hex == "0000000000000000");
+    }
+
+    // 16. Residue consistency: lucas_lehmer_ex agrees with lucas_lehmer on primality.
+    {
+        const ProgressContext ctx{};
+        const std::vector<uint32_t> test_exps = {3, 5, 7, 11, 13, 17, 19, 23, 29, 31};
+        for (uint32_t p : test_exps) {
+            const bool b_old = mersenne::lucas_lehmer(p, false, true);
+            const LLResult r = mersenne::lucas_lehmer_ex(p, false, true, ctx);
+            assert(r.is_prime == b_old);
+            if (r.is_prime)
+                assert(r.final_residue_hex == "0000000000000000");
+            else
+                assert(r.final_residue_hex != "0000000000000000");
+            check_residue_fmt(r.final_residue_hex);
+        }
+    }
+
     std::cout << "All tests passed\n";
     return 0;
 }

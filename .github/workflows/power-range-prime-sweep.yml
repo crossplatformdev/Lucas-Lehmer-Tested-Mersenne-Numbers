@@ -66,6 +66,21 @@ on:
         required: false
         type: boolean
         default: false
+      progress:
+        description: "Enable per-exponent iteration progress output"
+        required: false
+        type: boolean
+        default: false
+      progress_interval_iters:
+        description: "Print progress every N iterations (default: 10000)"
+        required: false
+        type: string
+        default: "10000"
+      progress_interval_seconds:
+        description: "Also print progress every N seconds, 0 = off (default: 0)"
+        required: false
+        type: string
+        default: "0"
 
 permissions:
   contents: read
@@ -241,6 +256,9 @@ jobs:
           LL_RESUME_FROM_EXPONENT=${{ inputs.resume_from_exponent }} \
           LL_STOP_AFTER_FIRST_PRIME_RESULT=${{ inputs.stop_after_first_prime_result && '1' || '0' }} \
           LL_BENCHMARK_MODE=${{ inputs.benchmark_mode && '1' || '0' }} \
+          LL_PROGRESS=${{ inputs.progress && '1' || '0' }} \
+          LL_PROGRESS_INTERVAL_ITERS=${{ inputs.progress_interval_iters }} \
+          LL_PROGRESS_INTERVAL_SECONDS=${{ inputs.progress_interval_seconds }} \
           LL_OUTPUT_DIR=bucket_out/ \
           GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY}" \
           ./bin/bignum 0 ${{ inputs.threads }}
