@@ -29,7 +29,7 @@ $(TEST_BIN): tests/test_bignum.cpp $(SRC)
 
 test: $(TEST_BIN) $(BIN)
 	./$(TEST_BIN)
-	LL_STOP_AFTER_ONE=0 ./$(BIN) 0 1
+	LL_STOP_AFTER_ONE=0 ./$(BIN) 0 0
 
 bench: $(BIN)
 	@echo "Benchmark (index=$(BENCH_START_INDEX)): 1 hilo vs máximo cores"
