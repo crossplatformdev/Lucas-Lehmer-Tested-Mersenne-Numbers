@@ -7,15 +7,21 @@ on:
   workflow_dispatch:
     inputs:
       run_benchmark:
-        description: "Run optional benchmark job"
+        description: "Run optional bounded benchmark job"
         required: false
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-test:
+  # ──────────────────────────────────────────────────────────
+  # Job 1: build
+  # ──────────────────────────────────────────────────────────
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,19 +31,110 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++ make libboost-dev pkg-config
 
-      - name: Build
+      - name: Build release binary
         run: make all
 
-      - name: Run tests
-        run: make test
+      - name: Build test binary
+        run: make bin/test_bignum
 
       - name: Build profiling binary
         run: make bin/bignum_prof
 
+      - name: Cache binaries for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────
+  # Job 2: unit + smoke tests
+  # ──────────────────────────────────────────────────────────
+  unit-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+
+      - name: Make binaries executable
+        run: chmod +x bin/bignum bin/test_bignum
+
+      - name: Run unit tests
+        run: make unit
+
+      - name: Run smoke test
+        run: make smoke
+
+  # ──────────────────────────────────────────────────────────
+  # Job 3: bounded regression (exponents[0..26], p ≤ 44497)
+  # ──────────────────────────────────────────────────────────
+  regression:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+
+      - name: Make binaries executable
+        run: chmod +x bin/bignum
+
+      - name: Run bounded regression
+        run: make regression
+
+  # ──────────────────────────────────────────────────────────
+  # Job 4: profiling (gprof, p=9689, 1 thread)
+  # ──────────────────────────────────────────────────────────
+  profile:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+
+      - name: Make profiling binary executable
+        run: chmod +x bin/bignum_prof
+
       - name: Run profiling (gprof) – index 14 = p=9689, 1 thread
         run: |
           echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
-          echo "Job: build-and-test"
+          echo "Job: profile"
           LL_STOP_AFTER_ONE=1 ./bin/bignum_prof 14 1
           gprof bin/bignum_prof gmon.out > prof_report.txt
           echo "--- gprof flat profile (top 30 lines) ---"
@@ -50,10 +147,14 @@ jobs:
           path: prof_report.txt
           retention-days: 14
 
-  benchmark:
+  # ──────────────────────────────────────────────────────────
+  # Job 5: bounded benchmark (optional, workflow_dispatch only)
+  # ──────────────────────────────────────────────────────────
+  bench-ci:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_benchmark == true }}
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,11 +164,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++ make libboost-dev pkg-config
 
-      - name: Build
-        run: make all
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: bin/
 
-      - name: Run benchmark
+      - name: Make binary executable
+        run: chmod +x bin/bignum
+
+      - name: Run bounded CI benchmark
         run: |
           echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
-          echo "Job: benchmark"
-          make bench
+          echo "Job: bench-ci"
+          make bench-ci
+
+      - name: Upload benchmark CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bin/bench_ci_*.csv
+          retention-days: 30
+

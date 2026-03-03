@@ -1,0 +1,186 @@
+name: Manual Sweep
+
+# Triggered only by explicit workflow_dispatch – never runs on push/PR.
+on:
+  workflow_dispatch:
+    inputs:
+      sweep_mode:
+        description: |
+          Sweep mode:
+            n = all natural numbers in [min_exponent, max_exponent]
+            p = all prime exponents in range
+            m = Mersenne-first (known Mersenne primes first, then remaining primes)
+        required: true
+        type: choice
+        options:
+          - m
+          - p
+          - n
+        default: m
+
+      min_exponent:
+        description: "Minimum exponent value (inclusive, default: 2)"
+        required: false
+        default: "2"
+
+      max_exponent:
+        description: "Maximum exponent value (inclusive, default: 44497)"
+        required: false
+        default: "44497"
+
+      shard_count:
+        description: "Number of shards (1 = no sharding)"
+        required: false
+        default: "1"
+
+      threads:
+        description: "Worker threads per shard job (0 = max cores)"
+        required: false
+        default: "0"
+
+      reverse_order:
+        description: "Process exponents in reverse order (1 = yes)"
+        required: false
+        default: "0"
+
+      largest_first:
+        description: "Sort work list largest-p-first for better load balance (1 = yes)"
+        required: false
+        default: "1"
+
+      max_cases:
+        description: "Maximum number of exponents to test (0 = no limit)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  # Build once, reuse across all shard jobs.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Build
+        run: make all
+
+      - name: Cache binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-binary
+          path: bin/bignum
+          retention-days: 1
+
+  # Dynamic matrix: one job per shard.
+  # If shard_count == 1, only shard 0 runs; otherwise shard_count jobs run in parallel.
+  sweep:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: ${{ fromJson(
+          inputs.shard_count == '1'  && '[0]' ||
+          inputs.shard_count == '2'  && '[0,1]' ||
+          inputs.shard_count == '3'  && '[0,1,2]' ||
+          inputs.shard_count == '4'  && '[0,1,2,3]' ||
+          inputs.shard_count == '8'  && '[0,1,2,3,4,5,6,7]' ||
+          inputs.shard_count == '16' && '[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]' ||
+          '[0]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: sweep-binary
+          path: bin/
+
+      - name: Make binary executable
+        run: chmod +x bin/bignum
+
+      - name: Print configuration
+        run: |
+          echo "=== Manual Sweep Configuration ==="
+          echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "Job: sweep / shard ${{ matrix.shard_index }} of ${{ inputs.shard_count }}"
+          echo "sweep_mode   = ${{ inputs.sweep_mode }}"
+          echo "min_exponent = ${{ inputs.min_exponent }}"
+          echo "max_exponent = ${{ inputs.max_exponent }}"
+          echo "shard        = ${{ matrix.shard_index }} / ${{ inputs.shard_count }}"
+          echo "threads      = ${{ inputs.threads }}"
+          echo "reverse      = ${{ inputs.reverse_order }}"
+          echo "largest_first= ${{ inputs.largest_first }}"
+          echo "max_cases    = ${{ inputs.max_cases }}"
+
+      - name: Run sweep
+        env:
+          LL_SWEEP_MODE:    "${{ inputs.sweep_mode }}"
+          LL_MIN_EXPONENT:  "${{ inputs.min_exponent }}"
+          LL_MAX_EXPONENT:  "${{ inputs.max_exponent }}"
+          LL_SHARD_INDEX:   "${{ matrix.shard_index }}"
+          LL_SHARD_COUNT:   "${{ inputs.shard_count }}"
+          LL_REVERSE_ORDER: "${{ inputs.reverse_order }}"
+          LL_LARGEST_FIRST: "${{ inputs.largest_first }}"
+          LL_BENCH_OUTPUT:  "sweep_results_shard${{ matrix.shard_index }}.csv"
+        run: |
+          THREADS="${{ inputs.threads }}"
+          MAX_CASES="${{ inputs.max_cases }}"
+          [ "${MAX_CASES}" != "0" ] && export LL_MAX_CASES="${MAX_CASES}"
+          ./bin/bignum 0 "${THREADS}"
+
+      - name: Upload sweep results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-results-shard-${{ matrix.shard_index }}
+          path: sweep_results_shard${{ matrix.shard_index }}.csv
+          retention-days: 30
+
+  # Merge all shard CSVs into one summary artifact.
+  merge-results:
+    needs: sweep
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download all shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sweep-results-shard-*
+          merge-multiple: true
+          path: shard_results/
+
+      - name: Merge CSVs
+        run: |
+          echo "p,is_prime,time_sec" > sweep_summary.csv
+          for f in shard_results/*.csv; do
+            [ -f "$f" ] && tail -n +2 "$f" >> sweep_summary.csv || true
+          done
+          echo "=== Sweep summary (first 40 lines) ==="
+          head -40 sweep_summary.csv
+          echo "Total rows: $(( $(wc -l < sweep_summary.csv) - 1 ))"
+
+      - name: Upload merged summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweep-summary
+          path: sweep_summary.csv
+          retention-days: 30
