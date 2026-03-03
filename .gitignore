@@ -2,3 +2,5 @@ bin/
 _codeql_detected_source_root
 gmon.out
 scripts/__pycache__
+tests/__pycache__
+__pycache__
