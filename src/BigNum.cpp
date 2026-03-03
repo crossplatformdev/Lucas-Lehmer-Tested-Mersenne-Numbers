@@ -1235,10 +1235,18 @@ public:
                 std::fflush(stdout);
                 // Adjust countdown for time-based interval (approximate via EMA).
                 if (ctx.interval_secs > 0.0 && ema_avg > 0.0) {
-                    const uint32_t est = static_cast<uint32_t>(ctx.interval_secs / ema_avg);
-                    countdown = (est < 100u)           ? 100u
-                              : (est > chk_base * 10u) ? chk_base * 10u
-                              : est;
+                    double est_d = ctx.interval_secs / ema_avg;
+                    if (est_d <= 0.0) {
+                        countdown = chk_base;
+                    } else {
+                        // Clamp to uint32_t range before casting to avoid UB.
+                        static constexpr double kMaxU32 = 4294967295.0;
+                        if (est_d > kMaxU32) est_d = kMaxU32;
+                        const uint32_t est = static_cast<uint32_t>(est_d);
+                        countdown = (est < 100u)           ? 100u
+                                  : (est > chk_base * 10u) ? chk_base * 10u
+                                  : est;
+                    }
                 } else {
                     countdown = chk_base;
                 }
