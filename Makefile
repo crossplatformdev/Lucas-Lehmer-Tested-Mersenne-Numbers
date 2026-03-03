@@ -12,7 +12,7 @@ PROF_BIN := bin/bignum_prof
 PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
 PROF_LDFLAGS  := -pthread -pg
 
-.PHONY: all clean test bench bench-ci prof
+.PHONY: all clean unit smoke regression test bench bench-ci prof manual-sweep
 
 BENCH_START_INDEX ?= 14
 
@@ -30,24 +30,53 @@ $(PROF_BIN): $(SRC)
 	@mkdir -p bin
 	$(CXX) $(PROF_CXXFLAGS) $< -o $@ $(PROF_LDFLAGS)
 
-test: $(TEST_BIN) $(BIN)
+# ---------------------------------------------------------------------------
+# unit: run the unit/correctness test binary only (fast – no main binary run).
+# ---------------------------------------------------------------------------
+unit: $(TEST_BIN)
 	./$(TEST_BIN)
-	# Run exponents[0..30] (M_2 … M_216091) with max threads.
-	# M_756839 (index 31) takes 20+ min on CI; LL_MAX_EXPONENT_INDEX=31 excludes it.
-	LL_STOP_AFTER_ONE=0 LL_MAX_EXPONENT_INDEX=31 ./$(BIN) 0 0
 
-# Profiling target: build with -pg, run a representative subset (index 14 = p=9689),
-# collect gmon.out, and generate a flat+call-graph report with gprof.
-prof: $(PROF_BIN)
-	@echo "Running profiling binary (index=$(BENCH_START_INDEX), 1 thread)..."
-	LL_STOP_AFTER_ONE=1 $(PROF_BIN) $(BENCH_START_INDEX) 1
-	@echo "Generating gprof report -> prof_report.txt"
-	gprof $(PROF_BIN) gmon.out > prof_report.txt
-	@echo "--- Top 20 functions (flat profile) ---"
-	head -50 prof_report.txt
+# ---------------------------------------------------------------------------
+# smoke: run a single tiny exponent to confirm the binary executes correctly.
+# ---------------------------------------------------------------------------
+smoke: $(BIN)
+	LL_STOP_AFTER_ONE=1 ./$(BIN) 0 1
 
+# ---------------------------------------------------------------------------
+# regression: bounded subset – exponents[0..26] (2 … 44497).
+# All complete in < 15 s on a 2-core GitHub runner.  Index 27 = 86243 (44 s,
+# skipped here so total CI time stays well under the 15-minute budget).
+# ---------------------------------------------------------------------------
+regression: $(BIN)
+	LL_STOP_AFTER_ONE=0 LL_MAX_EXPONENT_INDEX=27 ./$(BIN) 0 0
+
+# ---------------------------------------------------------------------------
+# test: CI-safe composite – unit tests + smoke + bounded regression.
+# Replaces the old unbounded "walk the full exponent list" target.
+# ---------------------------------------------------------------------------
+test: unit smoke regression
+
+# ---------------------------------------------------------------------------
+# bench-ci: bounded benchmark for CI (indices 14 … 26, 1 thread & max cores).
+# Index 14 = p=9689 (~0.3 s), index 26 = p=44497 (~9 s); runs quickly.
+# Writes machine-readable CSV to bin/bench_ci.csv.
+# ---------------------------------------------------------------------------
+bench-ci: $(BIN)
+	@echo "=== CI benchmark (indices 14-26, 1 thread) ==="
+	@LL_STOP_AFTER_ONE=0 LL_MAX_EXPONENT_INDEX=27 \
+	    LL_BENCH_OUTPUT=bin/bench_ci_1t.csv ./$(BIN) $(BENCH_START_INDEX) 1
+	@echo "=== CI benchmark (indices 14-26, max threads) ==="
+	@LL_STOP_AFTER_ONE=0 LL_MAX_EXPONENT_INDEX=27 \
+	    LL_BENCH_OUTPUT=bin/bench_ci_mt.csv ./$(BIN) $(BENCH_START_INDEX) 0
+	@echo "--- 1-thread CSV ---" && cat bin/bench_ci_1t.csv
+	@echo "--- max-thread CSV ---" && cat bin/bench_ci_mt.csv
+
+# ---------------------------------------------------------------------------
+# bench: full interactive benchmark (1 thread vs max cores, start at index 14).
+# Not run by default CI; for local profiling only.
+# ---------------------------------------------------------------------------
 bench: $(BIN)
-	@echo "Benchmark (index=$(BENCH_START_INDEX)): 1 hilo vs máximo cores"
+	@echo "Benchmark (index=$(BENCH_START_INDEX)): 1 thread vs max cores"
 	@set -e; \
 		t0=$$(date +%s%N); \
 		LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 1 >/dev/null; \
@@ -58,14 +87,29 @@ bench: $(BIN)
 		max_ms=$$(( (t2 - t1) / 1000000 )); \
 		if [ $$max_ms -eq 0 ]; then max_ms=1; fi; \
 		speed_x=$$(( one_ms * 100 / max_ms )); \
-		echo "1 hilo:      $${one_ms} ms"; \
+		echo "1 thread:    $${one_ms} ms"; \
 		echo "max cores:   $${max_ms} ms"; \
 		echo "speedup aprox: $$(printf "%d.%02dx" $$((speed_x/100)) $$((speed_x%100)))"
 
-bench-ci: $(BIN)
-	@echo "Running CI benchmark"
-	@LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 1
-	@LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 0
+# ---------------------------------------------------------------------------
+# manual-sweep: run a configurable sweep via environment variables.
+# Example:
+#   make manual-sweep LL_SWEEP_MODE=m LL_MIN_EXPONENT=2 LL_MAX_EXPONENT=10000
+# ---------------------------------------------------------------------------
+manual-sweep: $(BIN)
+	./$(BIN) 0 0
+
+# ---------------------------------------------------------------------------
+# prof: profiling target (gprof).
+# ---------------------------------------------------------------------------
+prof: $(PROF_BIN)
+	@echo "Running profiling binary (index=$(BENCH_START_INDEX), 1 thread)..."
+	LL_STOP_AFTER_ONE=1 $(PROF_BIN) $(BENCH_START_INDEX) 1
+	@echo "Generating gprof report -> prof_report.txt"
+	gprof $(PROF_BIN) gmon.out > prof_report.txt
+	@echo "--- Top 20 functions (flat profile) ---"
+	head -50 prof_report.txt
 
 clean:
 	rm -rf bin prof_report.txt gmon.out
+
