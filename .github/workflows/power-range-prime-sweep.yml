@@ -19,6 +19,68 @@ name: Power-Range Prime Sweep (64 Buckets)
 #   4. merge   – downloads all artifacts and produces a combined summary
 
 on:
+  workflow_call:
+    inputs:
+      bucket_start:
+        description: "First bucket to run (1-64)"
+        required: false
+        type: string
+        default: "1"
+      bucket_end:
+        description: "Last bucket to run (1-64)"
+        required: false
+        type: string
+        default: "64"
+      threads:
+        description: "Worker threads per job (0 = all cores)"
+        required: false
+        type: string
+        default: "0"
+      reverse_order:
+        description: "Test largest exponent first within each bucket"
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: "Print exponent plan only – do not run Lucas-Lehmer tests"
+        required: false
+        type: boolean
+        default: false
+      max_exponents_per_job:
+        description: "Safety cap: maximum exponents to test per bucket job (0 = no cap)"
+        required: false
+        type: string
+        default: "0"
+      stop_after_first_prime_result:
+        description: "Stop each bucket after the first new Mersenne prime candidate"
+        required: false
+        type: boolean
+        default: false
+      resume_from_exponent:
+        description: "Skip exponents below this value (0 = no skip)"
+        required: false
+        type: string
+        default: "0"
+      benchmark_mode:
+        description: "Skip is_prime_exponent() check (safe only for known-prime lists)"
+        required: false
+        type: boolean
+        default: false
+      progress:
+        description: "Enable per-exponent iteration progress output"
+        required: false
+        type: boolean
+        default: false
+      progress_interval_iters:
+        description: "Print progress every N iterations (default: 10000)"
+        required: false
+        type: string
+        default: "10000"
+      progress_interval_seconds:
+        description: "Also print progress every N seconds, 0 = off (default: 0)"
+        required: false
+        type: string
+        default: "0"
   workflow_dispatch:
     inputs:
       confirm_run:
