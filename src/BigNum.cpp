@@ -200,8 +200,13 @@ inline std::vector<uint64_t> generate_post_known_exponents(
     uint64_t start = min_excl + 1u;
     // Skip even numbers > 2.
     if (start > 2u && (start & 1u) == 0u) ++start;
-    for (uint64_t p = start; p <= max_incl; p += (p == 2u ? 1u : 2u)) {
+    for (uint64_t p = start; p <= max_incl; ) {
         if (is_prime_exponent(p)) result.push_back(p);
+        const uint64_t step = (p == 2u ? 1u : 2u);
+        const uint64_t next = p + step;
+        // Stop if the next increment would overflow or exceed max_incl.
+        if (next <= p || next > max_incl) break;
+        p = next;
     }
     return result;
 }
@@ -1234,6 +1239,30 @@ static void write_discover_csv(
     }
 }
 
+// Minimal JSON string escaper: handles characters that would break JSON.
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[7];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
 static void write_discover_json(
     const std::string& path,
     const std::vector<DiscoverResult>& results,
@@ -1257,9 +1286,9 @@ static void write_discover_json(
       << "  \"max_incl\": " << max_incl << ",\n"
       << "  \"shard_index\": " << shard_index << ",\n"
       << "  \"shard_count\": " << shard_count << ",\n"
-      << "  \"timestamp\": \"" << tbuf << "\",\n"
-      << "  \"commit_sha\": \"" << sha << "\",\n"
-      << "  \"workflow_run_url\": \"" << run_url << "\",\n"
+      << "  \"timestamp\": \"" << json_escape(tbuf) << "\",\n"
+      << "  \"commit_sha\": \"" << json_escape(sha) << "\",\n"
+      << "  \"workflow_run_url\": \"" << json_escape(run_url) << "\",\n"
       << "  \"results\": [\n";
 
     for (size_t i = 0; i < results.size(); ++i) {
@@ -1269,7 +1298,7 @@ static void write_discover_json(
         f << "    {\n"
           << "      \"exponent\": " << r.exponent << ",\n"
           << "      \"result\": \"" << (r.is_prime ? "prime" : "composite") << "\",\n"
-          << "      \"backend\": \"" << r.backend_name << "\",\n"
+          << "      \"backend\": \"" << json_escape(r.backend_name) << "\",\n"
           << "      \"elapsed_sec\": " << ebuf << ",\n"
           << "      \"threads\": " << r.threads << ",\n"
           << "      \"shard_index\": " << r.shard_index << ",\n"
@@ -1305,9 +1334,9 @@ static void write_discovery_event_json(
     f << "{\n"
       << "  \"event\": \"NEW_MERSENNE_PRIME_FOUND\",\n"
       << "  \"exponent\": " << exponent << ",\n"
-      << "  \"timestamp\": \"" << tbuf << "\",\n"
-      << "  \"commit_sha\": \"" << sha << "\",\n"
-      << "  \"workflow_run_url\": \"" << run_url << "\",\n"
+      << "  \"timestamp\": \"" << json_escape(tbuf) << "\",\n"
+      << "  \"commit_sha\": \"" << json_escape(sha) << "\",\n"
+      << "  \"workflow_run_url\": \"" << json_escape(run_url) << "\",\n"
       << "  \"elapsed_sec\": " << ebuf << ",\n"
       << "  \"shard_index\": " << shard_index << ",\n"
       << "  \"shard_count\": " << shard_count << "\n"
@@ -1353,13 +1382,18 @@ static void emit_discovery_notification(uint64_t p, const std::string& run_url) 
 }
 
 // Parse an unsigned integer from an environment variable.
-// Returns def if the variable is unset/empty/invalid.
+// Returns def if the variable is unset/empty/invalid/out-of-range.
 static uint32_t env_uint32(const char* name, uint32_t def) {
     const char* s = std::getenv(name);
     if (!s || !*s) return def;
+    if (s[0] == '-') {
+        std::fprintf(stderr, "Invalid %s='%s' (negative); using default %u\n", name, s, def);
+        return def;
+    }
     char* end = nullptr;
+    errno = 0;
     const unsigned long v = std::strtoul(s, &end, 10);
-    if (end == s || *end != '\0') {
+    if (errno != 0 || end == s || *end != '\0' || v > static_cast<unsigned long>(UINT32_MAX)) {
         std::fprintf(stderr, "Invalid %s='%s'; using default %u\n", name, s, def);
         return def;
     }
@@ -1367,13 +1401,18 @@ static uint32_t env_uint32(const char* name, uint32_t def) {
 }
 
 // Parse a 64-bit unsigned integer from an environment variable.
-// Returns def if the variable is unset/empty/invalid.
+// Returns def if the variable is unset/empty/invalid/out-of-range.
 static uint64_t env_uint64(const char* name, uint64_t def) {
     const char* s = std::getenv(name);
     if (!s || !*s) return def;
+    if (s[0] == '-') {
+        std::fprintf(stderr, "Invalid %s='%s' (negative); using default %" PRIu64 "\n", name, s, def);
+        return def;
+    }
     char* end = nullptr;
+    errno = 0;
     const unsigned long long v = std::strtoull(s, &end, 10);
-    if (end == s || *end != '\0') {
+    if (errno != 0 || end == s || *end != '\0') {
         std::fprintf(stderr, "Invalid %s='%s'; using default %" PRIu64 "\n", name, s, def);
         return def;
     }
@@ -1404,8 +1443,18 @@ static int run_discover_mode(int argc, char** argv) {
 
     unsigned threads = maxCores;
     if (argc >= 3 && argv[2] && argv[2][0] != '\0') {
-        const unsigned req = static_cast<unsigned>(std::strtoull(argv[2], nullptr, 10));
-        threads = (req == 0u) ? maxCores : std::min(req, maxCores);
+        const char* arg = argv[2];
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long raw = std::strtoull(arg, &end, 10);
+        if (errno != 0 || end == arg || *end != '\0' || arg[0] == '-') {
+            std::fprintf(stderr, "Invalid thread count '%s'; using all cores (%u)\n", arg, maxCores);
+        } else {
+            const unsigned req = (raw > static_cast<unsigned long long>(maxCores))
+                                     ? maxCores
+                                     : static_cast<unsigned>(raw);
+            threads = (req == 0u) ? maxCores : req;
+        }
     } else {
         const uint32_t req = env_uint32("LL_THREADS", 0u);
         threads = (req == 0u) ? maxCores : std::min(static_cast<unsigned>(req), maxCores);

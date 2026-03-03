@@ -163,8 +163,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard_index: ${{ fromJson(inputs.shard_count == '1' && '[0]' || inputs.shard_count == '2' && '[0,1]' || inputs.shard_count == '3' && '[0,1,2]' || inputs.shard_count == '4' && '[0,1,2,3]' || '[0]') }}
+        shard_index: ${{ fromJson(inputs.shard_count == '1' && '[0]' || inputs.shard_count == '2' && '[0,1]' || inputs.shard_count == '3' && '[0,1,2]' || inputs.shard_count == '4' && '[0,1,2,3]' || '["__INVALID_SHARD_COUNT__"]') }}
     steps:
+      - name: Validate shard_count for run_all_shards
+        if: ${{ matrix.shard_index == '__INVALID_SHARD_COUNT__' }}
+        run: |
+          echo "::error title=Invalid shard_count::run_all_shards currently supports shard_count values 1-4 only in this workflow."
+          echo "You provided shard_count='${{ inputs.shard_count }}', which is not supported for matrix sharding."
+          echo "Please rerun the workflow with shard_count set to 1, 2, 3, or 4 when run_all_shards=true."
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v4
 

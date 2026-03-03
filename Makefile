@@ -114,7 +114,7 @@ clean:
 	rm -rf bin prof_report.txt gmon.out discover_out
 
 # discover: run full discover mode (set env vars to control behaviour).
-# Example: make discover LL_MAX_EXPONENT=136279950 LL_STOP_AFTER_N_CASES=1
+# Example: LL_MAX_EXPONENT=136279950 LL_STOP_AFTER_N_CASES=1 make discover
 discover: $(BIN)
 	LL_SWEEP_MODE=discover \
 	LL_SINGLE_EXPONENT=$${LL_SINGLE_EXPONENT:-0} \
