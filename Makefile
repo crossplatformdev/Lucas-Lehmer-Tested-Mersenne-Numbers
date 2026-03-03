@@ -1,5 +1,11 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++20 -O3 -march=native -mtune=native -flto -pthread -Wall -Wextra -Wpedantic
+# -march=native/-mtune=native are intentionally omitted from the default so
+# the pre-built binary can be safely distributed across CI runner machines that
+# may have different CPU capabilities (using -march=native on one runner and
+# executing on another produces SIGILL / "Illegal instruction" crashes).
+# For local builds that won't be shared, pass them explicitly:
+#   CXXFLAGS="-std=c++20 -O3 -march=native -mtune=native -flto -pthread -Wall -Wextra -Wpedantic" make all
+CXXFLAGS ?= -std=c++20 -O3 -flto -pthread -Wall -Wextra -Wpedantic
 LDFLAGS ?= -flto -pthread
 
 SRC := src/BigNum.cpp
@@ -9,7 +15,7 @@ PROF_BIN := bin/bignum_prof
 
 # Profiling build uses -O2 (keeps enough optimization to be representative
 # while preserving function call structure for gprof) and -pg.
-PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
+PROF_CXXFLAGS := -std=c++20 -O2 -pthread -pg -Wall -Wextra
 PROF_LDFLAGS  := -pthread -pg
 
 .PHONY: all clean  unit smoke regression test bench bench-ci prof discover discover-dry-run manual-sweep bucket bucket-dry-run
