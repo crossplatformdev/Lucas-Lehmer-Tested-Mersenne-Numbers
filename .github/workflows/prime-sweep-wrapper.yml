@@ -1,0 +1,106 @@
+name: Prime Sweep Wrapper
+
+# Simple two-input orchestrator that calls the full Power-Range Prime Sweep
+# (64 Buckets) workflow and presents the merged results report at the end.
+#
+# Inputs:
+#   bucket_min  – first bucket to sweep  (1-64)
+#   bucket_top  – last  bucket to sweep  (bucket_min to 64)
+#
+# The called workflow enforces the GitHub Actions matrix limit of 256 jobs,
+# so this wrapper guarantees no more than 256 parallel worker tasks are ever
+# launched, regardless of the selected range.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bucket_min:
+        description: "Lower bucket start (1-64)"
+        required: true
+        type: string
+        default: "1"
+      bucket_top:
+        description: "Upper bucket end (bucket_min to 64)"
+        required: true
+        type: string
+        default: "64"
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # Stage 1: Validate – reject invalid bucket ranges early,
+  # before any compute resources are allocated.
+  # ──────────────────────────────────────────────────────────
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate bucket range
+        run: |
+          MIN="${{ inputs.bucket_min }}"
+          TOP="${{ inputs.bucket_top }}"
+          if ! [[ "$MIN" =~ ^[0-9]+$ ]] || ! [[ "$TOP" =~ ^[0-9]+$ ]]; then
+            echo "::error::bucket_min and bucket_top must be integers."
+            exit 1
+          fi
+          if (( MIN < 1 || MIN > 64 || TOP < MIN || TOP > 64 )); then
+            echo "::error::bucket_min ($MIN) must be in [1,64] and bucket_top ($TOP) must be in [bucket_min,64]."
+            exit 1
+          fi
+          echo "Input validated: buckets ${MIN}..${TOP}"
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 2: Sweep – delegate to the full Power-Range Prime
+  # Sweep workflow.  All worker concurrency, batching, and the
+  # 256-task cap are enforced there.
+  # ──────────────────────────────────────────────────────────
+  sweep:
+    needs: validate
+    uses: ./.github/workflows/power-range-prime-sweep.yml
+    with:
+      bucket_start: ${{ inputs.bucket_min }}
+      bucket_end:   ${{ inputs.bucket_top }}
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 3: Report – download the merged artifact produced by
+  # the sweep and present the full summary in this run's step
+  # summary so it is visible directly in the wrapper's UI.
+  # ──────────────────────────────────────────────────────────
+  report:
+    needs: sweep
+    if: success() || failure()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Download merged results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bucket-sweep-merged-results
+          path: merged_results/
+
+      - name: Present sweep report
+        run: |
+          {
+            echo "## Prime Sweep Wrapper – Final Report"
+            echo ""
+            echo "**Buckets swept:** ${{ inputs.bucket_min }}–${{ inputs.bucket_top }}"
+            echo "**Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo ""
+            if [ -f merged_results/merged_summary.md ]; then
+              cat merged_results/merged_summary.md
+            else
+              echo "_(merged summary not available – the sweep may have produced no results)_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Emit discovery notice
+        if: needs.sweep.outputs.new_discovery == 'true'
+        run: |
+          echo "::notice title=NEW MERSENNE PRIME FOUND::See merged_new_discoveries.json in the bucket-sweep-merged-results artifact!"
+          echo "## 🚨 NEW MERSENNE PRIME FOUND" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f merged_results/merged_new_discoveries.json ]; then
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat merged_results/merged_new_discoveries.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
