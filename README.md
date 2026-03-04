@@ -5,6 +5,40 @@ tiered backends, multi-mode operation, and a profiling/benchmark harness.
 
 ---
 
+## Mathematics
+
+### Mersenne numbers
+
+A **Mersenne number** with prime exponent $p$ is defined as:
+
+$$M_p = 2^p - 1$$
+
+$M_p$ is a **Mersenne prime** when $M_p$ itself is prime. A necessary condition is that $p$ be prime, though not all prime $p$ yield a prime $M_p$.
+
+### Lucas–Lehmer primality test
+
+Define the sequence $\{s_k\}$ by:
+
+$$s_0 = 4, \qquad s_{k+1} = s_k^2 - 2 \pmod{M_p}$$
+
+**Theorem (Lucas–Lehmer):** For an odd prime $p$,
+
+$$M_p \text{ is prime} \iff s_{p-2} \equiv 0 \pmod{M_p}$$
+
+### Hot-path iteration
+
+Each Lucas–Lehmer iteration computes the recurrence modulo $M_p = 2^p - 1$:
+
+$$s \;\leftarrow\; \bigl(s^2 - 2\bigr) \bmod \bigl(2^p - 1\bigr)$$
+
+The modular reduction exploits the Mersenne property: because $2^p \equiv 1 \pmod{M_p}$, a $2p$-bit product $q$ can be reduced by folding the upper half back onto the lower half,
+
+$$q \bmod (2^p - 1) \;=\; (q \bmod 2^p) + \lfloor q / 2^p \rfloor$$
+
+with at most one further subtraction of $M_p$. This avoids a general big-integer division and is the basis of the Crandall–Bailey DWT/FFT backend.
+
+---
+
 ## Architecture
 
 Each Lucas–Lehmer iteration computes `s = (s² − 2) mod (2^p − 1)`.

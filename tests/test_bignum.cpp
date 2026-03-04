@@ -330,6 +330,25 @@ int main() {
     assert(!is_prime_exponent(6));
     assert(!is_prime_exponent(15)); // 3·5
     assert(!is_prime_exponent(21)); // 3·7
+    // --- j-branch fix: when i is a multiple of 5, j = i+4 must still be tested.
+    // For i=25 (5·5, skipped), j=29 is a prime trial divisor.
+    // For i=55 (5·11, skipped), j=59 is a prime trial divisor.
+    // For i=85 (5·17, skipped), j=89 is a prime trial divisor.
+    // For i=115 (5·23, skipped), j=119=7·17 is composite but i=115 itself is composite too;
+    //   the next relevant prime in this sub-sequence is 149 (i=145=5·29 skipped, j=149).
+    // Verify the primes in the j-branch are accepted:
+    assert(is_prime_exponent(29));  // j when i=25
+    assert(is_prime_exponent(59));  // j when i=55
+    assert(is_prime_exponent(89));  // j when i=85
+    assert(is_prime_exponent(149)); // j when i=145 (=5·29)
+    assert(is_prime_exponent(179)); // j when i=175 (=5·35)
+    // Composites whose smallest prime factor is exactly one of these j-branch primes.
+    // Without the fix (if j were also skipped when i%5==0), these would falsely pass.
+    assert(!is_prime_exponent(841));   // 29·29  (i=25 skipped, j=29 must catch it)
+    assert(!is_prime_exponent(3481));  // 59·59  (i=55 skipped, j=59 must catch it)
+    assert(!is_prime_exponent(7921));  // 89·89  (i=85 skipped, j=89 must catch it)
+    assert(!is_prime_exponent(22201)); // 149·149 (i=145 skipped, j=149 must catch it)
+    assert(!is_prime_exponent(32041)); // 179·179 (i=175 skipped, j=179 must catch it)
 
     // --- lucas_lehmer: small cases via GenericBackend (p < 128) ---
     assert(lucas_lehmer(2, false));

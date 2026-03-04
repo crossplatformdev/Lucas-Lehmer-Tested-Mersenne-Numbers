@@ -178,14 +178,16 @@ bool is_prime_exponent(uint64_t n) {
     // 6k±1 pattern: all primes > 3 are of the form 6k-1 or 6k+1.
     // We already handled divisibility by 2, 3, and 5 above.  Starting from
     // 7 (= 6·1+1), each pair (i, i+4) covers (6k+1, 6(k+1)-1) for k=1,2,…
-    // Within this 6k±1 sequence we additionally skip candidates that are
-    // multiples of 5, avoiding divisions by values that are known composite
-    // after the earlier n % 5 filter, while still halving the number of trial
-    // divisions compared to the previous i+=2 loop.
+    // Within this 6k±1 sequence we additionally skip testing i when it is a
+    // multiple of 5 (i = 25, 55, 85, …), since those are composite and any
+    // factor they represent was already caught by the n % 5 check at the top.
+    // We must NOT skip j = i+4 in that case: j can be prime (e.g., 29, 59,
+    // 89, …) and is a necessary trial divisor independent of i.
     for (uint64_t i = 7u; i <= isqrt; i += 6u) {
-        // Skip 6k+1 values that are multiples of 5 (e.g., 25, 55, …).
-        if (i % 5u == 0u) continue;
-        if (n % i == 0u) return false;
+        // i = 6k+1; skip if it is a multiple of 5 (composite, already covered
+        // by the n % 5 check above), but do NOT skip j = i+4 = 6(k+1)-1 which
+        // may be prime (e.g., i=25 → j=29, i=55 → j=59, i=85 → j=89, …).
+        if ((i % 5u) != 0u && n % i == 0u) return false;
         const uint64_t j = i + 4u; // j = 6(k+1)-1
         // Only test j when it is within the sqrt bound and not a multiple of 5.
         if (j <= isqrt && (j % 5u) != 0u && n % j == 0u) return false;
