@@ -324,21 +324,12 @@ jobs:
         run: |
           echo "key=bignum-bucket-${{ hashFiles('src/BigNum.cpp', 'Makefile') }}" >> "$GITHUB_OUTPUT"
 
-      - name: Restore cached binary
-        id: cache-restore
-        uses: actions/cache@v4
-        with:
-          path: bin/bignum
-          key: ${{ steps.cache-key.outputs.key }}
-
       - name: Install toolchain
-        if: steps.cache-restore.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ make libboost-dev pkg-config
 
       - name: Build release binary
-        if: steps.cache-restore.outputs.cache-hit != 'true'
         run: make all
 
       - name: Upload binary artifact
