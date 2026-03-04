@@ -9,6 +9,8 @@ SRC := src/BigNum.cpp
 BIN := bin/bignum
 TEST_BIN := bin/test_bignum
 PROF_BIN := bin/bignum_prof
+PERF_BIN := bin/bignum_perf
+CALLGRIND_BIN := bin/bignum_callgrind
 PLAN_BIN := bin/split_bucket_batches
 PLAN_SRC := src/split_bucket_batches.c
 
@@ -27,7 +29,15 @@ MICROBENCH_LDFLAGS  := -pthread
 # Override at the make command line: make microbench MICROBENCH_ITERS=500
 MICROBENCH_ITERS ?= 0
 
-.PHONY: all clean  unit smoke regression test bench bench-ci prof discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool microbench
+# perf build: -O3 with frame pointers for Linux perf, no LTO.
+PERF_CXXFLAGS := -std=c++20 -O3 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
+PERF_LDFLAGS  := -pthread
+
+# callgrind build: -O2 with frame pointers for Valgrind/Callgrind, no LTO.
+CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
+CALLGRIND_LDFLAGS  := -pthread
+
+.PHONY: all clean unit smoke regression test bench bench-ci prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool
 
 BENCH_START_INDEX ?= 14
 
@@ -51,6 +61,14 @@ $(TEST_BIN): tests/test_bignum.cpp $(SRC)
 $(PROF_BIN): $(SRC)
 	@mkdir -p bin
 	$(CXX) $(PROF_CXXFLAGS) $< -o $@ $(PROF_LDFLAGS)
+
+$(PERF_BIN): $(SRC)
+	@mkdir -p bin
+	$(CXX) $(PERF_CXXFLAGS) $< -o $@ $(PERF_LDFLAGS)
+
+$(CALLGRIND_BIN): $(SRC)
+	@mkdir -p bin
+	$(CXX) $(CALLGRIND_CXXFLAGS) $< -o $@ $(CALLGRIND_LDFLAGS)
 
 # ---------------------------------------------------------------------------
 # unit: run the unit/correctness test binary only (fast – no main binary run).
@@ -132,8 +150,32 @@ prof: $(PROF_BIN)
 	@echo "--- Top 20 functions (flat profile) ---"
 	head -50 prof_report.txt
 
+# ---------------------------------------------------------------------------
+# perf-build: build with -O3 -g -fno-omit-frame-pointer, no LTO (for perf).
+# ---------------------------------------------------------------------------
+perf-build: $(PERF_BIN)
+
+# ---------------------------------------------------------------------------
+# callgrind-build: build with -O2 -g -fno-omit-frame-pointer, no LTO
+#                  (for Valgrind/Callgrind).
+# ---------------------------------------------------------------------------
+callgrind-build: $(CALLGRIND_BIN)
+
+# ---------------------------------------------------------------------------
+# perf-run: record a perf profile into perf.data (requires perf).
+# ---------------------------------------------------------------------------
+perf-run: $(PERF_BIN)
+	LL_STOP_AFTER_ONE=1 perf record -g -o perf.data -- ./$(PERF_BIN) $(BENCH_START_INDEX) 1
+
+# ---------------------------------------------------------------------------
+# callgrind-run: profile with Valgrind/Callgrind into callgrind.out.
+# ---------------------------------------------------------------------------
+callgrind-run: $(CALLGRIND_BIN)
+	LL_STOP_AFTER_ONE=1 valgrind --tool=callgrind --callgrind-out-file=callgrind.out \
+	    ./$(CALLGRIND_BIN) $(BENCH_START_INDEX) 1
+
 clean:
-	rm -rf bin prof_report.txt gmon.out discover_out
+	rm -rf bin prof_report.txt gmon.out perf.data callgrind.out discover_out
 
 # ---------------------------------------------------------------------------
 # microbench: FFT Lucas–Lehmer microbenchmark for a single large exponent.
