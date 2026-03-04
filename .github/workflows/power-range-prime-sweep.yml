@@ -451,6 +451,40 @@ jobs:
             cp -r batch_artifacts/. bucket_out/
           fi
 
+      - name: Extract committed artifacts for already-tested buckets
+        run: |
+          # When auto_resume skips all exponents in the requested range (all
+          # primes already committed in bucket_artifacts/), no worker jobs ran
+          # and no fresh artifacts were downloaded.  Extract the committed zip
+          # archives for the requested bucket range so the merge script finds
+          # real result data rather than an empty set.
+          FRESH=$([ -d batch_artifacts/ ] && find batch_artifacts/ -mindepth 1 -maxdepth 1 -type d | wc -l || echo 0)
+          if [ "${FRESH}" -gt 0 ]; then
+            echo "Fresh batch artifacts present (${FRESH}), skipping committed extraction."
+            exit 0
+          fi
+          START="${{ inputs.bucket_start }}"
+          END="${{ inputs.bucket_end }}"
+          if [ "${START}" -gt "${END}" ]; then
+            echo "No bucket range to extract (start=${START} > end=${END})."
+            exit 0
+          fi
+          mkdir -p bucket_out/
+          EXTRACTED=0
+          for n in $(seq "${START}" "${END}"); do
+            BUCKET_N=$(printf "%02d" "${n}")
+            for zipfile in bucket_artifacts/bucket-${BUCKET_N}-batch-*-results.zip; do
+              [ -f "${zipfile}" ] || continue
+              ARTIFACT_NAME=$(basename "${zipfile}" .zip)
+              DEST="bucket_out/${ARTIFACT_NAME}"
+              mkdir -p "${DEST}"
+              python3 -m zipfile -e "${zipfile}" "${DEST}"
+              echo "Extracted committed artifact: ${zipfile} -> ${DEST}/"
+              EXTRACTED=$(( EXTRACTED + 1 ))
+            done
+          done
+          echo "Extracted ${EXTRACTED} committed artifact(s) for buckets ${START}..${END}."
+
       - name: Install Python (for merge script)
         run: python3 --version  # already available on ubuntu-latest
 
