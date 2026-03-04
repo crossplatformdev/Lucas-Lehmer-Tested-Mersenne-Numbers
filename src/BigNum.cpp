@@ -175,8 +175,14 @@ bool is_prime_exponent(uint64_t n) {
     uint64_t isqrt = static_cast<uint64_t>(std::sqrt(static_cast<double>(n)));
     // Adjust upward until isqrt == floor(sqrt(n)).  At most one increment.
     while ((u128_isqrt)isqrt * (u128_isqrt)isqrt < (u128_isqrt)n) ++isqrt;
-    for (uint64_t i = 7u; i <= isqrt; i += 2u) {
+    // 6k±1 pattern: all primes > 3 are of the form 6k-1 or 6k+1.
+    // We already handled divisibility by 2, 3, and 5 above.  Starting from
+    // 7 (= 6·1+1), each pair (i, i+4) covers (6k+1, 6(k+1)-1) for k=1,2,…
+    // This tests only the candidates that can actually be prime, halving the
+    // number of trial divisions compared to the previous i+=2 loop.
+    for (uint64_t i = 7u; i <= isqrt; i += 6u) {
         if (n % i == 0u) return false;
+        if (n % (i + 4u) == 0u) return false;
     }
     return true;
 }

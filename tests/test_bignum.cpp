@@ -275,6 +275,36 @@ int main() {
     assert(is_prime_exponent(3));
     assert(!is_prime_exponent(1));
     assert(!is_prime_exponent(9));
+    // Extra cases to validate the 6k±1 iteration pattern.
+    // Primes at 6k-1 positions (should return true):
+    assert(is_prime_exponent(5));   // 6·1-1
+    assert(is_prime_exponent(11));  // 6·2-1
+    assert(is_prime_exponent(17));  // 6·3-1
+    assert(is_prime_exponent(23));  // 6·4-1
+    assert(is_prime_exponent(29));  // 6·5-1
+    assert(is_prime_exponent(41));  // 6·7-1
+    // Primes at 6k+1 positions (should return true):
+    assert(is_prime_exponent(7));   // 6·1+1
+    assert(is_prime_exponent(13));  // 6·2+1
+    assert(is_prime_exponent(19));  // 6·3+1
+    assert(is_prime_exponent(31));  // 6·5+1
+    assert(is_prime_exponent(37));  // 6·6+1
+    assert(is_prime_exponent(43));  // 6·7+1
+    // Composites at 6k±1 positions (loop must catch these, return false):
+    assert(!is_prime_exponent(25));  // 5·5, caught by n%5==0 early check
+    assert(!is_prime_exponent(35));  // 5·7, caught by n%5==0 early check
+    assert(!is_prime_exponent(49));  // 7·7, detected by i=7 in 6k±1 loop
+    assert(!is_prime_exponent(77));  // 7·11, detected by i=7 in loop
+    assert(!is_prime_exponent(91));  // 7·13
+    assert(!is_prime_exponent(121)); // 11·11, detected by i+4=11 (i=7)
+    assert(!is_prime_exponent(143)); // 11·13
+    assert(!is_prime_exponent(169)); // 13·13, detected by i=13 in loop
+    // Other composites:
+    assert(!is_prime_exponent(0));
+    assert(!is_prime_exponent(4));
+    assert(!is_prime_exponent(6));
+    assert(!is_prime_exponent(15)); // 3·5, caught by n%3==0 early check
+    assert(!is_prime_exponent(21)); // 3·7, caught by n%3==0 early check
 
     // --- lucas_lehmer: small cases via GenericBackend (p < 128) ---
     assert(lucas_lehmer(2, false));
