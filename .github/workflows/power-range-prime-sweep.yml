@@ -269,9 +269,10 @@ jobs:
   worker:
     needs: [plan, build]
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
-    # No timeout-minutes: Mersenne prime search must not be artificially stopped.
-    # Note: GitHub-hosted runners enforce a hard 6-hour cap regardless.
-    # For unbounded runs (e.g., large buckets), use a self-hosted runner.
+    # timeout-minutes is set to 355 (5h 55m) as a hard GitHub-level safety net.
+    # The binary itself is given LL_JOB_TIMEOUT_SECONDS=18000 (5h) so it stops
+    # gracefully and uploads partial results before this limit is reached.
+    timeout-minutes: 355
     strategy:
       fail-fast: false
       max-parallel: 20   # GitHub public free-tier hard limit for concurrent jobs
@@ -320,6 +321,7 @@ jobs:
           LL_PROGRESS=${{ inputs.progress && '1' || '0' }} \
           LL_PROGRESS_INTERVAL_ITERS=${{ inputs.progress_interval_iters }} \
           LL_PROGRESS_INTERVAL_SECONDS=${{ inputs.progress_interval_seconds }} \
+          LL_JOB_TIMEOUT_SECONDS=18000 \
           LL_OUTPUT_DIR=batch_out/ \
           GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY}" \
           ./bin/bignum 0 ${{ inputs.threads }}

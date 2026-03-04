@@ -2194,6 +2194,21 @@ static int run_power_bucket_mode(int argc, char** argv) {
     const bool benchmark_mode    = env_bool("LL_BENCHMARK_MODE", false);
     const bool stop_first_prime  = env_bool("LL_STOP_AFTER_FIRST_PRIME_RESULT");
 
+    // Job-level wall-clock timeout: stop after this many seconds (0 = no limit).
+    // Set to ~5 hours (18000 s) in CI to finish before GitHub's 6-hour hard cap.
+    const double job_timeout_secs = [&]() -> double {
+        const char* s = std::getenv("LL_JOB_TIMEOUT_SECONDS");
+        if (!s || !*s) return 0.0;
+        char* end = nullptr;
+        const double v = std::strtod(s, &end);
+        if (end == s || *end != '\0' || v <= 0.0) {
+            std::fprintf(stderr,
+                "Warning: invalid LL_JOB_TIMEOUT_SECONDS='%s'; no timeout applied.\n", s);
+            return 0.0;
+        }
+        return v;
+    }();
+
     // Configurable checkpoint intervals for per-exponent progress output.
     const uint32_t prog_interval_iters = env_uint32("LL_PROGRESS_INTERVAL_ITERS", 10000u);
     const double prog_interval_secs = [&]() -> double {
@@ -2257,10 +2272,14 @@ static int run_power_bucket_mode(int argc, char** argv) {
         std::printf("  max_exps_per_job : %" PRIu64 "\n", max_exps);
     if (resume_from > 0u)
         std::printf("  resume_from      : %" PRIu64 "\n", resume_from);
+    if (job_timeout_secs > 0.0)
+        std::printf("  job_timeout      : %.0f s (%.2f h)\n",
+                    job_timeout_secs, job_timeout_secs / 3600.0);
     if (!run_url.empty())
         std::printf("  workflow_run     : %s\n", run_url.c_str());
     std::printf("\n");
 
+    const auto job_t0 = std::chrono::steady_clock::now();
     bool any_new_discovery = false;
 
     for (uint32_t n = n_lo; n <= n_hi; ++n) {
@@ -2314,9 +2333,30 @@ static int run_power_bucket_mode(int argc, char** argv) {
         size_t bucket_new_disc       = 0u;
         double bucket_elapsed_total  = 0.0;
 
+        bool bucket_timed_out = false;
         for (size_t exp_idx = 0u; exp_idx < exps.size(); ++exp_idx) {
             const uint64_t p = exps[exp_idx];
             if (stop_first_prime && any_new_discovery) break;
+
+            // Stop gracefully before the job-level wall-clock deadline so the
+            // runner can upload partial results before GitHub's 6-hour hard cap.
+            // Checked once per exponent; each LL test takes seconds–minutes, so
+            // this clock call is negligible relative to the LL computation itself.
+            if (job_timeout_secs > 0.0) {
+                const double job_elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - job_t0).count();
+                if (job_elapsed >= job_timeout_secs) {
+                    std::printf("  [B%u] Job timeout reached (%.1fs / %.0fs);"
+                                " stopped before exponent %" PRIu64
+                                " (%zu/%zu tested)."
+                                " Resume with LL_RESUME_FROM_EXPONENT=%" PRIu64 ".\n",
+                                n, job_elapsed, job_timeout_secs,
+                                p, exp_idx, exps.size(), p);
+                    std::fflush(stdout);
+                    bucket_timed_out = true;
+                    break;
+                }
+            }
 
             const std::string bname = (p <= UINT32_MAX)
                                       ? discover_backend_name(p)
@@ -2509,6 +2549,7 @@ static int run_power_bucket_mode(int argc, char** argv) {
                     sf << "\n**Workflow run:** " << run_url << "\n";
             }
         }
+        if (bucket_timed_out) break;
     }
 
     if (dry_run) return 0;
