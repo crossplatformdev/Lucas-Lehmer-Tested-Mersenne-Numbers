@@ -317,7 +317,7 @@ inline std::vector<uint32_t> generate_prime(uint32_t min_exp, uint32_t max_exp) 
     if (start > max_exp) return v;
 
     // Step 1: base primes up to floor(sqrt(max_exp)).
-    // Use floating-point sqrt then adjust for exactness (same pattern as is_prime_exponent).
+    // Use floating-point sqrt to get an initial estimate, then increment until we reach the exact floor(sqrt(max_exp)).
     uint32_t sqrt_max = static_cast<uint32_t>(std::sqrt(static_cast<double>(max_exp)));
     while ((static_cast<uint64_t>(sqrt_max) + 1u) * (static_cast<uint64_t>(sqrt_max) + 1u)
            <= static_cast<uint64_t>(max_exp))
@@ -336,11 +336,14 @@ inline std::vector<uint32_t> generate_prime(uint32_t min_exp, uint32_t max_exp) 
         if (base_sieve[i]) base_primes.push_back(i);
 
     // Step 2: segmented sieve in blocks of 1M numbers.
+    // Allocate the sieve buffer once at the maximum segment size and reuse across iterations.
     constexpr uint32_t SEG_SIZE = 1000000u;
+    std::vector<bool> sieve(SEG_SIZE, true);
     uint32_t seg_lo = start;
     while (seg_lo <= max_exp) {
         const uint32_t seg_hi = (max_exp - seg_lo < SEG_SIZE) ? max_exp : seg_lo + SEG_SIZE - 1u;
-        std::vector<bool> sieve(seg_hi - seg_lo + 1u, true);
+        const uint32_t seg_len = seg_hi - seg_lo + 1u;
+        std::fill(sieve.begin(), sieve.begin() + seg_len, true);
 
         // Cross off composites using base primes.
         for (uint32_t p : base_primes) {

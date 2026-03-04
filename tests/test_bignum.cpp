@@ -203,15 +203,26 @@ static void test_sweep_prime() {
 // ---- sweep::generate_prime segmented sieve correctness ----
 static void test_generate_prime_segmented_sieve_vs_is_prime_exponent() {
     // Compare segmented sieve output with trial-division is_prime_exponent for [2, 100000].
-    constexpr uint32_t MAX_EXP = 100000u;
-    const auto sieve_primes = sweep::generate_prime(2u, MAX_EXP);
+    constexpr uint32_t MAX_EXP_SMALL = 100000u;
+    const auto sieve_primes_small = sweep::generate_prime(2u, MAX_EXP_SMALL);
 
-    // Build reference list via is_prime_exponent.
-    std::vector<uint32_t> ref_primes;
-    for (uint32_t i = 2u; i <= MAX_EXP; ++i)
-        if (mersenne::is_prime_exponent(i)) ref_primes.push_back(i);
+    // Build reference list via is_prime_exponent for the small range.
+    std::vector<uint32_t> ref_primes_small;
+    for (uint32_t i = 2u; i <= MAX_EXP_SMALL; ++i)
+        if (mersenne::is_prime_exponent(i)) ref_primes_small.push_back(i);
 
-    assert(sieve_primes == ref_primes);
+    assert(sieve_primes_small == ref_primes_small);
+
+    // Also test a range that spans multiple segments (SEG_SIZE = 1'000'000),
+    // to exercise segment transitions in the segmented sieve.
+    constexpr uint32_t MAX_EXP_LARGE = 1500000u;
+    const auto sieve_primes_large = sweep::generate_prime(2u, MAX_EXP_LARGE);
+
+    std::vector<uint32_t> ref_primes_large;
+    for (uint32_t i = 2u; i <= MAX_EXP_LARGE; ++i)
+        if (mersenne::is_prime_exponent(i)) ref_primes_large.push_back(i);
+
+    assert(sieve_primes_large == ref_primes_large);
 }
 
 // ---- sweep::generate_mersenne_first tests ----
