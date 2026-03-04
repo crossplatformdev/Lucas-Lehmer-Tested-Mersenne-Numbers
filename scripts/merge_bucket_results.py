@@ -357,9 +357,18 @@ def main() -> None:
     json_files = scan_json_files(output_dir)
 
     if not csv_files and not json_files:
-        print(f"No bucket result files found in '{output_dir}'.", file=sys.stderr)
-        print("Run 'make bucket' or individual bucket jobs first.", file=sys.stderr)
-        sys.exit(1)
+        print(f"No bucket result files found in '{output_dir}'.")
+        print("All exponents in the requested range may have already been tested, "
+              "or no batches were scheduled (e.g. auto_resume covered the full range).")
+        # Write a minimal summary so downstream workflow steps can succeed.
+        summary_path = out_prefix + "_summary.md"
+        os.makedirs(os.path.dirname(out_prefix) or ".", exist_ok=True)
+        with open(summary_path, "w") as f:
+            f.write("# Power Bucket Prime Sweep – Merged Summary\n\n")
+            f.write("_No result files found. All exponents in the requested range "
+                    "have already been tested, or no work was scheduled for this run._\n")
+        print(f"Wrote empty summary: {summary_path}")
+        sys.exit(0)
 
     print(f"Found {len(csv_files)} CSV file(s) and {len(json_files)} JSON file(s).")
 
