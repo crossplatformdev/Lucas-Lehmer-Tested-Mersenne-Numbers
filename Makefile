@@ -20,11 +20,14 @@ PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
 PROF_LDFLAGS  := -pthread -pg
 
 # Microbenchmark build: -O3 -g -fno-omit-frame-pointer for profiling with
-# frame pointers intact (perf, gprof, valgrind, etc.).
+# frame pointers intact (perf, valgrind, etc.).  Add MICROBENCH_GPROF=1 to
+# also enable gprof instrumentation (-pg on compile and link).
 MICROBENCH_BIN      := bin/microbench_fft
 MICROBENCH_SRC      := bench/microbench_fft.cpp
-MICROBENCH_CXXFLAGS := -std=c++20 -O3 -g -fno-omit-frame-pointer -pthread -Wall -Wextra
-MICROBENCH_LDFLAGS  := -pthread
+MICROBENCH_GPROF    ?= 0
+MICROBENCH_PG       := $(if $(filter 1,$(MICROBENCH_GPROF)),-pg,)
+MICROBENCH_CXXFLAGS := -std=c++20 -O3 -g -fno-omit-frame-pointer -pthread -Wall -Wextra $(MICROBENCH_PG)
+MICROBENCH_LDFLAGS  := -pthread $(MICROBENCH_PG)
 # Number of LL iterations for the microbench (0 = full p-2 run, the default).
 # Override at the make command line: make microbench MICROBENCH_ITERS=500
 MICROBENCH_ITERS ?= 0
@@ -179,9 +182,11 @@ clean:
 
 # ---------------------------------------------------------------------------
 # microbench: FFT Lucas–Lehmer microbenchmark for a single large exponent.
-# Compiled with -O3 -g -fno-omit-frame-pointer for profiling with perf/gprof.
+# Compiled with -O3 -g -fno-omit-frame-pointer for profiling with perf/valgrind.
+# Add MICROBENCH_GPROF=1 to also compile/link with -pg for gprof support.
 # Override the number of iterations:
 #   make microbench MICROBENCH_ITERS=500
+#   make microbench MICROBENCH_GPROF=1
 # ---------------------------------------------------------------------------
 $(MICROBENCH_BIN): $(MICROBENCH_SRC) $(SRC)
 	@mkdir -p bin

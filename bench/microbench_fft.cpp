@@ -4,7 +4,7 @@
 // without pulling in main() or the discover-mode infrastructure.
 //
 // Measures, for a fixed exponent p that exercises FftMersenneBackend:
-//   (a) total wall-clock time for kBenchIters LL iterations
+//   (a) total wall-clock time for MICROBENCH_ITERS (or p-2 if MICROBENCH_ITERS == 0) LL iterations
 //   (b) max_roundoff accumulated across all iterations
 //   (c) whether the final residue matches the expected result for a full run
 //
@@ -34,9 +34,11 @@
 static constexpr uint32_t kDefaultP = 44497;
 
 // Maximum supported exponent for the command-line argument.
-// No known Mersenne prime exponent exceeds this value (matches the sanity cap
-// used in BigNum.cpp for the LL_LIMB_FFT_CROSSOVER environment variable).
-static constexpr long kMaxSupportedExponent = 100000000L;
+// Keep this aligned with the library-wide LL_MAX_EXPONENT default
+// (currently 200,000,000 in BigNum.cpp). This is independent of the
+// LL_LIMB_FFT_CROSSOVER environment-variable sanity cap, which is limited
+// to 1,000,000 in BigNum.cpp.
+static constexpr long kMaxSupportedExponent = 200000000L;
 
 // Number of LL iterations to run.  Defaults to p-2 (full test).
 // Override at compile time: -DMICROBENCH_ITERS=N
@@ -75,6 +77,17 @@ int main(int argc, char** argv) {
             : static_cast<uint32_t>(MICROBENCH_ITERS);
     const bool full_run = (bench_iters == p_minus2);
 
+    // Lucas–Lehmer for p=2 has zero iterations (p-2 == 0), so a per-iteration
+    // microbenchmark is not meaningful and would lead to division by zero when
+    // computing ns/iter. Require at least one LL iteration (p >= 3).
+    if (bench_iters == 0u) {
+        std::fprintf(stderr,
+            "Error: p=%u yields zero Lucas-Lehmer iterations (p-2 == 0). "
+            "microbench_fft requires p >= 3.\n",
+            p);
+        return 2;
+    }
+
     std::printf("=== microbench_fft ===\n");
     std::printf("p                : %u\n", p);
     std::printf("iters            : %u%s\n", bench_iters, full_run ? " (full, p-2)" : " (partial)");
@@ -84,7 +97,8 @@ int main(int argc, char** argv) {
     // Ensure p is large enough to exercise the FFT backend.
     // The crossover threshold is approximately 4000 (the default value of
     // kLimbFftCrossover in BigNum.cpp; adjustable via LL_LIMB_FFT_CROSSOVER).
-    // This check is advisory: FftMersenneBackend::init() will succeed for any p >= 2.
+    // This check is advisory: FftMersenneBackend::init() may still fail for some p
+    // if no suitable FFT length/plan is available under the current configuration.
     if (p < 4000u) {
         std::fprintf(stderr,
             "Warning: p=%u may not exercise FftMersenneBackend "
