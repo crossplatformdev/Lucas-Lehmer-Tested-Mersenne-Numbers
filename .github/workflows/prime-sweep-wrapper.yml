@@ -24,6 +24,16 @@ on:
         required: true
         type: string
         default: "64"
+      auto_resume:
+        description: "Auto-detect the last tested exponent from bucket_artifacts/ and skip already-done primes (default: true)"
+        required: false
+        type: boolean
+        default: true
+      time_limit_minutes:
+        description: "Per-worker time budget in minutes; batch sizes shrink automatically for larger exponents (default: 360 = 6 h)"
+        required: false
+        type: string
+        default: "360"
 
 permissions:
   contents: read
@@ -59,8 +69,10 @@ jobs:
     needs: validate
     uses: ./.github/workflows/power-range-prime-sweep.yml
     with:
-      bucket_start: ${{ inputs.bucket_min }}
-      bucket_end:   ${{ inputs.bucket_top }}
+      bucket_start:       ${{ inputs.bucket_min }}
+      bucket_end:         ${{ inputs.bucket_top }}
+      auto_resume:        ${{ inputs.auto_resume }}
+      time_limit_minutes: ${{ inputs.time_limit_minutes }}
 
   # ──────────────────────────────────────────────────────────
   # Stage 3: Report – download the merged artifact produced by

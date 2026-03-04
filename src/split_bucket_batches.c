@@ -6,7 +6,10 @@
  *
  * Usage:
  *   split_bucket_batches [--bucket-start N] [--bucket-end N]
- *                        [--batch-size N] [--dry-run]
+ *                        [--batch-size N]
+ *                        [--time-limit-seconds S]
+ *                        [--resume-from-exponent N]
+ *                        [--dry-run]
  *                        [--output FILE] [--count-only]
  *
  * Bucket definition (1-indexed, n in [1, 64]):
@@ -14,11 +17,24 @@
  *   B_n  = [2^(n-1), 2^n - 1]  for n >= 2
  *   B_64 = [2^63, 2^64 - 1]
  *
+ * --time-limit-seconds S
+ *   Compute a per-bucket batch size using the inverse rule of three:
+ *       batch_size = floor(S / worst_case_time_per_exponent)
+ *   Timing data for buckets 9-16 is taken from benchmark measurements
+ *   (REPORT_MERSENNE_EXPONENTS-256-65536.MD); buckets 17+ are extrapolated
+ *   at ×4.5 per bucket.  The result is capped by --batch-size (default 1000).
+ *
+ * --resume-from-exponent N
+ *   Skip all prime exponents ≤ N.  Buckets whose last prime is ≤ N are
+ *   omitted entirely; the first remaining batch starts from the next
+ *   untested prime.  Batch ordinal numbers are still reported relative to
+ *   the full bucket prime list so worker names remain stable across resumes.
+ *
  * Worker name format:
  *   bucket-{N:02d}-batch-{start_ordinal:04d}-{end_ordinal:04d}-exp-{pmin}-{pmax}
  *
  * Example:
- *   bucket-17-batch-0001-1000-exp-65537-65867
+ *   bucket-17-batch-0001-0850-exp-65537-87251
  */
 
 #include <stdio.h>
@@ -26,15 +42,78 @@
 #include <string.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <math.h>
 
 #define GITHUB_MATRIX_MAX   256
 #define BATCH_SIZE_DEFAULT  1000
 #define WORKER_NAME_MAX     128
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
+ * Per-bucket worst-case single-exponent test time (seconds).
+ * Source: REPORT_MERSENNE_EXPONENTS-256-65536.MD benchmark run.
+ *   Buckets 9-16  – measured "Longest (s)" column.
+ *   Buckets 1-10  – sub-millisecond; floored at 0.001 s.
+ *   Buckets 17-21 – extrapolated at ×4.5 per bucket.
+ * ========================================================================= */
+#define BUCKET_WORST_SEC_MAX 21   /* highest index in the table below */
+static const double BUCKET_WORST_SEC[BUCKET_WORST_SEC_MAX + 1] = {
+    /* 0  */ 0.001,  /* unused – bucket indices start at 1 */
+    /* 1  */ 0.001,  /* 2  */ 0.001,  /* 3  */ 0.001,  /* 4  */ 0.001,
+    /* 5  */ 0.001,  /* 6  */ 0.001,  /* 7  */ 0.001,  /* 8  */ 0.001,
+    /* 9  */ 0.001,  /* 10 */ 0.001,  /* measured: <1 ms            */
+    /* 11 */ 0.005,  /* measured                                     */
+    /* 12 */ 0.027,  /* measured                                     */
+    /* 13 */ 0.093,  /* measured                                     */
+    /* 14 */ 0.325,  /* measured                                     */
+    /* 15 */ 1.283,  /* measured                                     */
+    /* 16 */ 5.646,  /* measured                                     */
+    /* 17 */ 25.407, /* extrapolated: 5.646 × 4.5                   */
+    /* 18 */ 114.332,/* extrapolated: 25.407 × 4.5                  */
+    /* 19 */ 514.492,/* extrapolated: 114.332 × 4.5                 */
+    /* 20 */ 2315.213,/* extrapolated: 514.492 × 4.5                */
+    /* 21 */ 10418.458,/* extrapolated: 2315.213 × 4.5              */
+};
+#define BUCKET_WORST_GROWTH 4.5   /* extrapolation factor for buckets > 21 */
+
+/* Safety margin applied to extrapolated estimates (buckets > 16) to account
+ * for the uncertainty in the growth factor (observed trend: ×3.5, ×4.0, ×4.4,
+ * still increasing).  A 20% buffer keeps workers safely inside the 6-h limit
+ * even when the true per-exponent time slightly exceeds the 4.5× assumption. */
+#define EXTRAPOLATED_SAFETY_MARGIN 1.2
+
+/* Return the estimated worst-case single-exponent time for bucket n.
+ * For buckets 1–16: measured values from the benchmark report.
+ * For buckets 17+:  extrapolated at ×4.5 per bucket, then multiplied by the
+ *                   safety margin to add a conservative buffer.                */
+static double worst_sec_for_bucket(int n)
+{
+    double w;
+    if (n <= BUCKET_WORST_SEC_MAX) {
+        w = BUCKET_WORST_SEC[n > 0 ? n : 0];
+    } else {
+        /* Extrapolate beyond the table */
+        w = BUCKET_WORST_SEC[BUCKET_WORST_SEC_MAX];
+        for (int i = BUCKET_WORST_SEC_MAX; i < n; i++)
+            w *= BUCKET_WORST_GROWTH;
+    }
+    /* Apply safety margin to all extrapolated buckets (> 16). */
+    if (n > 16)
+        w *= EXTRAPOLATED_SAFETY_MARGIN;
+    return w;
+}
+
+/* Inverse rule of three: how many primes fit in time_limit_sec? */
+static size_t batch_size_for_bucket(int n, double time_limit_sec)
+{
+    double worst = worst_sec_for_bucket(n);
+    if (worst <= 0.0) return BATCH_SIZE_DEFAULT;
+    size_t sz = (size_t)(time_limit_sec / worst);
+    return sz < 1 ? 1 : sz;
+}
+
+/* =========================================================================
  * Primality test (trial division).
- * Uses i <= n/i to avoid overflow when i*i might wrap for large n.
- * ------------------------------------------------------------------------- */
+ * ========================================================================= */
 static int is_prime(uint64_t n)
 {
     if (n < 2)  return 0;
@@ -48,9 +127,9 @@ static int is_prime(uint64_t n)
     return 1;
 }
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * Bucket range: bucket n (1-indexed) covers [lo, hi].
- * ------------------------------------------------------------------------- */
+ * ========================================================================= */
 static void bucket_range(int n, uint64_t *lo, uint64_t *hi)
 {
     if (n == 1) { *lo = 2; *hi = 2; return; }
@@ -58,9 +137,9 @@ static void bucket_range(int n, uint64_t *lo, uint64_t *hi)
     *hi = (n < 64) ? (((uint64_t)1 << n) - 1) : UINT64_MAX;
 }
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * Dynamic array of uint64_t.
- * ------------------------------------------------------------------------- */
+ * ========================================================================= */
 typedef struct { uint64_t *data; size_t size; size_t cap; } U64Vec;
 
 static void u64vec_push(U64Vec *v, uint64_t x)
@@ -75,10 +154,9 @@ static void u64vec_push(U64Vec *v, uint64_t x)
     v->data[v->size++] = x;
 }
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * Enumerate all prime exponents in bucket n, ascending.
- * Mirrors enumerate_bucket_primes() from generate_bucket_primes.py.
- * ------------------------------------------------------------------------- */
+ * ========================================================================= */
 static U64Vec enumerate_bucket_primes(int n)
 {
     uint64_t lo, hi;
@@ -86,7 +164,6 @@ static U64Vec enumerate_bucket_primes(int n)
 
     U64Vec v = {NULL, 0, 0};
 
-    /* Start candidate at lo (or 2), skip even numbers above 2. */
     uint64_t p = (lo >= 2) ? lo : 2;
     if (p > 2 && (p & 1) == 0) p++;
 
@@ -95,7 +172,6 @@ static U64Vec enumerate_bucket_primes(int n)
         if (p == 2) {
             p = 3;
         } else {
-            /* Guard against overflow and against stepping past hi. */
             if (hi - p < 2) break;
             p += 2;
         }
@@ -103,9 +179,9 @@ static U64Vec enumerate_bucket_primes(int n)
     return v;
 }
 
-/* -------------------------------------------------------------------------
+/* =========================================================================
  * Batch descriptor.
- * ------------------------------------------------------------------------- */
+ * ========================================================================= */
 typedef struct {
     int      bucket_n;
     uint64_t bucket_min;
@@ -134,11 +210,17 @@ static void batch_push(BatchVec *v, const Batch *b)
     v->data[v->size++] = *b;
 }
 
-/* -------------------------------------------------------------------------
- * Split a bucket's prime list into batches of at most batch_size.
- * Mirrors split_bucket_into_batches() from split_bucket_batches.py.
- * ------------------------------------------------------------------------- */
-static BatchVec split_bucket_into_batches(int n, size_t batch_size)
+/* =========================================================================
+ * Split a bucket's prime list into batches.
+ *
+ * batch_size:   max primes per batch (already per-bucket computed by caller)
+ * resume_from:  skip primes ≤ this value; 0 = no skip
+ *
+ * Batch ordinals are reported relative to the full (un-skipped) prime list
+ * so that worker names remain stable across resume runs.
+ * ========================================================================= */
+static BatchVec split_bucket_into_batches(int n, size_t batch_size,
+                                           uint64_t resume_from)
 {
     U64Vec primes = enumerate_bucket_primes(n);
     BatchVec result = {NULL, 0, 0};
@@ -147,15 +229,35 @@ static BatchVec split_bucket_into_batches(int n, size_t batch_size)
     uint64_t lo, hi;
     bucket_range(n, &lo, &hi);
 
-    size_t total       = primes.size;
-    size_t batch_count = (total + batch_size - 1) / batch_size;
+    size_t total = primes.size;
+
+    /* Find the first prime that hasn't been tested yet. */
+    size_t skip = 0;
+    if (resume_from > 0) {
+        while (skip < total && primes.data[skip] <= resume_from)
+            skip++;
+    }
+
+    /* All primes in this bucket already tested – skip the bucket. */
+    if (skip == total) {
+        free(primes.data);
+        return result;
+    }
+
+    /* Remaining primes to test. */
+    uint64_t *rem   = primes.data + skip;
+    size_t    rem_n = total - skip;
+    size_t    batch_count = (rem_n + batch_size - 1) / batch_size;
 
     for (size_t i = 0; i < batch_count; i++) {
-        size_t start_idx  = i * batch_size;
-        size_t chunk_size = (start_idx + batch_size <= total)
-                            ? batch_size
-                            : (total - start_idx);
-        size_t end_idx    = start_idx + chunk_size - 1;
+        size_t start_in_rem = i * batch_size;
+        size_t chunk_size   = (start_in_rem + batch_size <= rem_n)
+                              ? batch_size : (rem_n - start_in_rem);
+        size_t end_in_rem   = start_in_rem + chunk_size - 1;
+
+        /* Absolute ordinals in the full bucket prime list (0-based). */
+        size_t abs_start = skip + start_in_rem;
+        size_t abs_end   = skip + end_in_rem;
 
         Batch b;
         b.bucket_n                = n;
@@ -163,17 +265,16 @@ static BatchVec split_bucket_into_batches(int n, size_t batch_size)
         b.bucket_max              = hi;
         b.batch_index             = i;
         b.batch_count             = batch_count;
-        b.batch_prime_start_index = start_idx;
-        b.batch_prime_end_index   = end_idx;
-        b.batch_min_exponent      = primes.data[start_idx];
-        b.batch_max_exponent      = primes.data[end_idx];
+        b.batch_prime_start_index = abs_start;
+        b.batch_prime_end_index   = abs_end;
+        b.batch_min_exponent      = rem[start_in_rem];
+        b.batch_max_exponent      = rem[end_in_rem];
         b.batch_size              = chunk_size;
 
-        /* Worker name: bucket-{N:02d}-batch-{s:04d}-{e:04d}-exp-{pmin}-{pmax} */
         snprintf(b.worker_name, WORKER_NAME_MAX,
                  "bucket-%02d-batch-%04zu-%04zu-exp-%" PRIu64 "-%" PRIu64,
                  n,
-                 start_idx + 1, end_idx + 1,
+                 abs_start + 1, abs_end + 1,
                  b.batch_min_exponent, b.batch_max_exponent);
 
         batch_push(&result, &b);
@@ -183,10 +284,9 @@ static BatchVec split_bucket_into_batches(int n, size_t batch_size)
     return result;
 }
 
-/* -------------------------------------------------------------------------
- * Print the batch matrix as a JSON array to *out.
- * Compact format (no extra whitespace) — valid JSON understood by fromJson().
- * ------------------------------------------------------------------------- */
+/* =========================================================================
+ * Print the batch matrix as a compact JSON array.
+ * ========================================================================= */
 static void print_json_matrix(FILE *out, const BatchVec *m)
 {
     fputc('[', out);
@@ -216,9 +316,9 @@ static void print_json_matrix(FILE *out, const BatchVec *m)
     fputs("]\n", out);
 }
 
-/* -------------------------------------------------------------------------
- * Parse a positive integer from a string; die with a clear error on failure.
- * ------------------------------------------------------------------------- */
+/* =========================================================================
+ * Argument helpers
+ * ========================================================================= */
 static size_t parse_positive_int(const char *opt, const char *str)
 {
     char *end;
@@ -231,47 +331,75 @@ static size_t parse_positive_int(const char *opt, const char *str)
     return (size_t)val;
 }
 
-/* -------------------------------------------------------------------------
+static uint64_t parse_nonneg_uint64(const char *opt, const char *str)
+{
+    char *end;
+    unsigned long long val = strtoull(str, &end, 10);
+    if (*end != '\0' || end == str) {
+        fprintf(stderr, "ERROR: %s requires a non-negative integer, got '%s'\n",
+                opt, str);
+        exit(1);
+    }
+    return (uint64_t)val;
+}
+
+static double parse_nonneg_double(const char *opt, const char *str)
+{
+    char *end;
+    double val = strtod(str, &end);
+    if (*end != '\0' || end == str || val < 0.0) {
+        fprintf(stderr, "ERROR: %s requires a non-negative number, got '%s'\n",
+                opt, str);
+        exit(1);
+    }
+    return val;
+}
+
+/* =========================================================================
  * main
- * ------------------------------------------------------------------------- */
+ * ========================================================================= */
 int main(int argc, char **argv)
 {
-    int         bucket_start = 1;
-    int         bucket_end   = 64;
-    size_t      batch_size   = BATCH_SIZE_DEFAULT;
-    int         dry_run      = 0;
-    int         count_only   = 0;
-    const char *output_file  = NULL;
+    int         bucket_start     = 1;
+    int         bucket_end       = 64;
+    size_t      batch_size       = BATCH_SIZE_DEFAULT;
+    double      time_limit_sec   = 0.0;   /* 0 = use --batch-size only */
+    uint64_t    resume_from      = 0;     /* 0 = no skip               */
+    int         dry_run          = 0;
+    int         count_only       = 0;
+    const char *output_file      = NULL;
 
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "--bucket-start") && i + 1 < argc)
-            bucket_start = (int)parse_positive_int("--bucket-start", argv[++i]);
-        else if (!strcmp(argv[i], "--bucket-end")   && i + 1 < argc)
-            bucket_end   = (int)parse_positive_int("--bucket-end",   argv[++i]);
-        else if (!strcmp(argv[i], "--batch-size")   && i + 1 < argc)
-            batch_size   = parse_positive_int("--batch-size", argv[++i]);
+        if      (!strcmp(argv[i], "--bucket-start")        && i + 1 < argc)
+            bucket_start   = (int)parse_positive_int("--bucket-start", argv[++i]);
+        else if (!strcmp(argv[i], "--bucket-end")          && i + 1 < argc)
+            bucket_end     = (int)parse_positive_int("--bucket-end",   argv[++i]);
+        else if (!strcmp(argv[i], "--batch-size")          && i + 1 < argc)
+            batch_size     = parse_positive_int("--batch-size", argv[++i]);
+        else if (!strcmp(argv[i], "--time-limit-seconds")  && i + 1 < argc)
+            time_limit_sec = parse_nonneg_double("--time-limit-seconds", argv[++i]);
+        else if (!strcmp(argv[i], "--resume-from-exponent") && i + 1 < argc)
+            resume_from    = parse_nonneg_uint64("--resume-from-exponent", argv[++i]);
         else if (!strcmp(argv[i], "--dry-run"))
-            dry_run      = 1;
+            dry_run        = 1;
         else if (!strcmp(argv[i], "--count-only"))
-            count_only   = 1;
-        else if (!strcmp(argv[i], "--output")       && i + 1 < argc)
-            output_file  = argv[++i];
+            count_only     = 1;
+        else if (!strcmp(argv[i], "--output")              && i + 1 < argc)
+            output_file    = argv[++i];
         else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
             return 1;
         }
     }
 
-    /* Validate inputs */
+    /* Validate */
     if (bucket_start < 1 || bucket_start > 64) {
-        fprintf(stderr,
-                "ERROR: --bucket-start must be in [1, 64], got %d\n",
+        fprintf(stderr, "ERROR: --bucket-start must be in [1, 64], got %d\n",
                 bucket_start);
         return 1;
     }
     if (bucket_end < 1 || bucket_end > 64) {
-        fprintf(stderr,
-                "ERROR: --bucket-end must be in [1, 64], got %d\n",
+        fprintf(stderr, "ERROR: --bucket-end must be in [1, 64], got %d\n",
                 bucket_end);
         return 1;
     }
@@ -281,45 +409,75 @@ int main(int argc, char **argv)
                 bucket_start, bucket_end);
         return 1;
     }
-    if (batch_size < 1) {
-        fprintf(stderr, "ERROR: --batch-size must be >= 1\n");
-        return 1;
-    }
 
     /* Enumerate all batches across the selected bucket range. */
     BatchVec matrix = {NULL, 0, 0};
     for (int n = bucket_start; n <= bucket_end; n++) {
-        BatchVec bv = split_bucket_into_batches(n, batch_size);
+        size_t bs;
+        if (time_limit_sec > 0.0) {
+            /* Per-bucket batch size from timing data, capped by --batch-size. */
+            size_t tl_bs = batch_size_for_bucket(n, time_limit_sec);
+            bs = (tl_bs < batch_size) ? tl_bs : batch_size;
+        } else {
+            bs = batch_size;
+        }
+        BatchVec bv = split_bucket_into_batches(n, bs, resume_from);
         for (size_t j = 0; j < bv.size; j++)
             batch_push(&matrix, &bv.data[j]);
         free(bv.data);
     }
 
-    /* --count-only: print the batch count and exit. */
+    /* --count-only */
     if (count_only) {
         printf("%zu\n", matrix.size);
         free(matrix.data);
         return 0;
     }
 
-    /* --dry-run: print a human-readable plan and exit. */
+    /* --dry-run */
     if (dry_run) {
-        printf("bucket_start  : %d\n", bucket_start);
-        printf("bucket_end    : %d\n", bucket_end);
-        printf("batch_size    : %zu\n", batch_size);
-        printf("total batches : %zu\n", matrix.size);
+        printf("bucket_start         : %d\n", bucket_start);
+        printf("bucket_end           : %d\n", bucket_end);
+        if (time_limit_sec > 0.0) {
+            printf("time_limit_seconds   : %.0f  (%.1f h per worker)\n",
+                   time_limit_sec, time_limit_sec / 3600.0);
+            printf("batch_size cap       : %zu\n", batch_size);
+        } else {
+            printf("batch_size           : %zu\n", batch_size);
+        }
+        if (resume_from > 0)
+            printf("resume_from_exponent : %" PRIu64
+                   "  (skipping exponents <= %" PRIu64 ")\n",
+                   resume_from, resume_from);
+        printf("total batches        : %zu\n", matrix.size);
         printf("\n");
         for (size_t i = 0; i < matrix.size; i++) {
             const Batch *b = &matrix.data[i];
-            printf("  [%3zu/%3zu]  bucket=%2d"
-                   "  primes=%6zu-%6zu"
-                   "  exp=%" PRIu64 "-%" PRIu64
-                   "  name=%s\n",
-                   b->batch_index, b->batch_count,
-                   b->bucket_n,
-                   b->batch_prime_start_index, b->batch_prime_end_index,
-                   b->batch_min_exponent, b->batch_max_exponent,
-                   b->worker_name);
+            if (time_limit_sec > 0.0) {
+                double w = worst_sec_for_bucket(b->bucket_n);
+                printf("  [%3zu/%3zu]  bucket=%2d"
+                       "  primes=%6zu-%6zu"
+                       "  exp=%" PRIu64 "-%" PRIu64
+                       "  size=%zu  est_worst=%.3fs/exp  est_max=%.2fh"
+                       "  name=%s\n",
+                       b->batch_index, b->batch_count,
+                       b->bucket_n,
+                       b->batch_prime_start_index, b->batch_prime_end_index,
+                       b->batch_min_exponent, b->batch_max_exponent,
+                       b->batch_size, w,
+                       (double)b->batch_size * w / 3600.0,
+                       b->worker_name);
+            } else {
+                printf("  [%3zu/%3zu]  bucket=%2d"
+                       "  primes=%6zu-%6zu"
+                       "  exp=%" PRIu64 "-%" PRIu64
+                       "  name=%s\n",
+                       b->batch_index, b->batch_count,
+                       b->bucket_n,
+                       b->batch_prime_start_index, b->batch_prime_end_index,
+                       b->batch_min_exponent, b->batch_max_exponent,
+                       b->worker_name);
+            }
         }
         if (matrix.size > GITHUB_MATRIX_MAX) {
             fprintf(stderr,

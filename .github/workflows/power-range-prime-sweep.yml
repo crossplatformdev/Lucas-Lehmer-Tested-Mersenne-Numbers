@@ -1,7 +1,7 @@
 name: Power-Range Prime Sweep (64 Buckets)
 
 # Manual-only workflow: tests all prime exponents across 64 power-of-two
-# exponent ranges (batched into groups of ≤ 1000 primes per worker job).
+# exponent ranges (batched into groups sized to fit within the time limit).
 #
 # Bucket definition (1-indexed):
 #   B_1  = [2, 2]               (normalized)
@@ -12,8 +12,15 @@ name: Power-Range Prime Sweep (64 Buckets)
 #   most vCPUs (4) and RAM (16 GB).  ubuntu-22.04 only provides 2 vCPUs/7 GB.
 #   macOS runners (3 vCPU M1) are incompatible because the build requires apt-get.
 #
+# Batch sizing strategy:
+#   The plan stage uses the inverse rule of three to compute per-bucket batch
+#   sizes from measured benchmark timing data (see REPORT_MERSENNE_EXPONENTS-*).
+#   The formula is: batch_size = floor(time_limit_seconds / worst_case_time_per_prime)
+#   This ensures each worker completes in well under the 6-hour GitHub cap.
+#
 # Workflow stages:
-#   1. plan    – builds the batch matrix JSON (one entry per ≤ 1000-prime batch)
+#   1. plan    – auto-detects last tested exponent, builds the batch matrix
+#                with per-bucket batch sizes derived from timing data
 #   2. build   – compiles the binary once and caches it
 #   3. worker  – up to 20 parallel jobs (free-tier concurrency limit), one per batch
 #   4. merge   – downloads all artifacts and produces a combined summary
@@ -61,10 +68,20 @@ on:
         type: boolean
         default: false
       resume_from_exponent:
-        description: "Skip exponents below this value (0 = no skip)"
+        description: "Skip exponents ≤ this value (0 = use auto_resume result or no skip)"
         required: false
         type: string
         default: "0"
+      auto_resume:
+        description: "Auto-detect the last tested exponent from bucket_artifacts/ and resume from there (overridden by resume_from_exponent if > 0)"
+        required: false
+        type: boolean
+        default: true
+      time_limit_minutes:
+        description: "Per-worker time budget in minutes; batch sizes are scaled per-bucket so each worker finishes within this limit (default: 360 = 6 h)"
+        required: false
+        type: string
+        default: "360"
       benchmark_mode:
         description: "Skip is_prime_exponent() check (safe only for known-prime lists)"
         required: false
@@ -123,10 +140,20 @@ on:
         type: boolean
         default: false
       resume_from_exponent:
-        description: "Skip exponents below this value (0 = no skip)"
+        description: "Skip exponents ≤ this value (0 = use auto_resume result or no skip)"
         required: false
         type: string
         default: "0"
+      auto_resume:
+        description: "Auto-detect the last tested exponent from bucket_artifacts/ and resume from there (overridden by resume_from_exponent if > 0)"
+        required: false
+        type: boolean
+        default: true
+      time_limit_minutes:
+        description: "Per-worker time budget in minutes; batch sizes are scaled per-bucket so each worker finishes within this limit (default: 360 = 6 h)"
+        required: false
+        type: string
+        default: "360"
       benchmark_mode:
         description: "Skip is_prime_exponent() check (safe only for known-prime lists)"
         required: false
@@ -156,14 +183,17 @@ jobs:
   # Stage 1: Plan – validate inputs and build the batch matrix.
   #
   # For each selected bucket the prime exponents are enumerated
-  # and partitioned into contiguous batches of at most 1000
-  # primes.  Each batch becomes one entry in the worker matrix.
+  # and partitioned into batches sized by the inverse rule of
+  # three:  batch_size = floor(time_limit / worst_case_time).
+  # Already-tested exponents are skipped automatically when
+  # auto_resume=true (reads from bucket_artifacts/ names).
   # ──────────────────────────────────────────────────────────
   plan:
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
     outputs:
-      batch_matrix: ${{ steps.build-matrix.outputs.batch_matrix }}
-      batch_count:  ${{ steps.build-matrix.outputs.batch_count }}
+      batch_matrix:      ${{ steps.build-matrix.outputs.batch_matrix }}
+      batch_count:       ${{ steps.build-matrix.outputs.batch_count }}
+      effective_resume:  ${{ steps.build-matrix.outputs.effective_resume }}
     steps:
       - name: Validate bucket range
         run: |
@@ -187,33 +217,68 @@ jobs:
           mkdir -p bin
           gcc -std=c11 -O2 -o bin/split_bucket_batches src/split_bucket_batches.c
 
+      - name: Auto-detect last tested exponent
+        id: auto-resume
+        run: |
+          # Scan committed bucket_artifacts/ filenames for the highest tested
+          # exponent.  This is the resume point if auto_resume is enabled.
+          AUTO_EXP=$(python3 scripts/find_resume_exponent.py bucket_artifacts/ 2>/dev/null || echo "0")
+          echo "last_exponent=${AUTO_EXP}" >> "$GITHUB_OUTPUT"
+          echo "Auto-resume scan: last tested exponent = ${AUTO_EXP}"
+
       - name: Build batch matrix JSON
         id: build-matrix
         run: |
           START="${{ inputs.bucket_start }}"
           END="${{ inputs.bucket_end }}"
 
+          # Determine effective resume exponent:
+          #   - explicit resume_from_exponent input wins if > 0
+          #   - otherwise fall back to the auto-detected value (when auto_resume=true)
+          INPUT_RESUME="${{ inputs.resume_from_exponent }}"
+          AUTO_EXP="${{ steps.auto-resume.outputs.last_exponent }}"
+          AUTO_ENABLED="${{ inputs.auto_resume }}"
+
+          if [[ "${INPUT_RESUME}" -gt 0 ]]; then
+            EFFECTIVE_RESUME="${INPUT_RESUME}"
+            echo "Resume: using explicit input resume_from_exponent=${EFFECTIVE_RESUME}"
+          elif [[ "${AUTO_ENABLED}" == "true" && "${AUTO_EXP}" -gt 0 ]]; then
+            EFFECTIVE_RESUME="${AUTO_EXP}"
+            echo "Resume: auto-detected last tested exponent=${EFFECTIVE_RESUME}"
+          else
+            EFFECTIVE_RESUME="0"
+            echo "Resume: starting from the beginning (no resume point)"
+          fi
+
+          # Per-worker time limit (seconds) for per-bucket batch sizing.
+          TIME_LIMIT_SEC=$(( ${{ inputs.time_limit_minutes }} * 60 ))
+          echo "Time limit per worker: ${TIME_LIMIT_SEC}s (${{ inputs.time_limit_minutes }} min)"
+
           # Print human-readable plan (always useful for audit).
           bin/split_bucket_batches \
-            --bucket-start "${START}" \
-            --bucket-end   "${END}" \
-            --batch-size   1000 \
+            --bucket-start          "${START}" \
+            --bucket-end            "${END}" \
+            --time-limit-seconds    "${TIME_LIMIT_SEC}" \
+            --resume-from-exponent  "${EFFECTIVE_RESUME}" \
             --dry-run
 
           # Generate the JSON matrix (errors if > 256 batches).
           BATCH_MATRIX=$(bin/split_bucket_batches \
-            --bucket-start "${START}" \
-            --bucket-end   "${END}" \
-            --batch-size   1000)
+            --bucket-start          "${START}" \
+            --bucket-end            "${END}" \
+            --time-limit-seconds    "${TIME_LIMIT_SEC}" \
+            --resume-from-exponent  "${EFFECTIVE_RESUME}")
 
           BATCH_COUNT=$(bin/split_bucket_batches \
-            --bucket-start "${START}" \
-            --bucket-end   "${END}" \
-            --batch-size   1000 \
+            --bucket-start          "${START}" \
+            --bucket-end            "${END}" \
+            --time-limit-seconds    "${TIME_LIMIT_SEC}" \
+            --resume-from-exponent  "${EFFECTIVE_RESUME}" \
             --count-only)
 
-          echo "batch_matrix=${BATCH_MATRIX}" >> "$GITHUB_OUTPUT"
-          echo "batch_count=${BATCH_COUNT}"   >> "$GITHUB_OUTPUT"
+          echo "batch_matrix=${BATCH_MATRIX}"     >> "$GITHUB_OUTPUT"
+          echo "batch_count=${BATCH_COUNT}"        >> "$GITHUB_OUTPUT"
+          echo "effective_resume=${EFFECTIVE_RESUME}" >> "$GITHUB_OUTPUT"
           echo "Total batches: ${BATCH_COUNT}"
 
   # ──────────────────────────────────────────────────────────
