@@ -217,7 +217,19 @@ jobs:
             echo "::error::bucket_start ($START) and bucket_end ($END) must both be in [1,64] with start <= end."
             exit 1
           fi
+          TIME_LIMIT="${{ inputs.time_limit_minutes }}"
+          if ! [[ "$TIME_LIMIT" =~ ^[0-9]+$ ]] || (( TIME_LIMIT < 1 )); then
+            echo "::error::time_limit_minutes must be a positive integer, got '${TIME_LIMIT}'."
+            exit 1
+          fi
+          TARGET_WORKERS="${{ inputs.target_workers }}"
+          if ! [[ "$TARGET_WORKERS" =~ ^[0-9]+$ ]]; then
+            echo "::error::target_workers must be a non-negative integer, got '${TARGET_WORKERS}'."
+            exit 1
+          fi
           echo "Bucket range validated: ${START}..${END}"
+          echo "time_limit_minutes validated: ${TIME_LIMIT}"
+          echo "target_workers validated: ${TARGET_WORKERS}"
 
       - name: Checkout
         uses: actions/checkout@v4

@@ -27,6 +27,7 @@ Example:
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -316,6 +317,8 @@ def main() -> None:
         parser.error(f"--batch-size must be >= 1, got {args.batch_size}")
     if args.time_limit_seconds < 0:
         parser.error(f"--time-limit-seconds must be >= 0, got {args.time_limit_seconds}")
+    if not math.isfinite(args.time_limit_seconds):
+        parser.error(f"--time-limit-seconds must be a finite number, got {args.time_limit_seconds}")
     if args.resume_from_exponent < 0:
         parser.error(f"--resume-from-exponent must be >= 0, got {args.resume_from_exponent}")
     if args.target_workers < 0:

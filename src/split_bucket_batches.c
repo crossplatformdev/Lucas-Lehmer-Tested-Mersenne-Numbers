@@ -339,6 +339,23 @@ static size_t parse_positive_int(const char *opt, const char *str)
     return (size_t)val;
 }
 
+static size_t parse_nonneg_int(const char *opt, const char *str)
+{
+    if (str[0] == '-') {
+        fprintf(stderr, "ERROR: %s requires a non-negative integer, got '%s'\n",
+                opt, str);
+        exit(1);
+    }
+    char *end;
+    unsigned long val = strtoul(str, &end, 10);
+    if (*end != '\0' || end == str) {
+        fprintf(stderr, "ERROR: %s requires a non-negative integer, got '%s'\n",
+                opt, str);
+        exit(1);
+    }
+    return (size_t)val;
+}
+
 static uint64_t parse_nonneg_uint64(const char *opt, const char *str)
 {
     char *end;
@@ -357,6 +374,11 @@ static double parse_nonneg_double(const char *opt, const char *str)
     double val = strtod(str, &end);
     if (*end != '\0' || end == str || val < 0.0) {
         fprintf(stderr, "ERROR: %s requires a non-negative number, got '%s'\n",
+                opt, str);
+        exit(1);
+    }
+    if (!isfinite(val)) {
+        fprintf(stderr, "ERROR: %s requires a finite number, got '%s'\n",
                 opt, str);
         exit(1);
     }
@@ -390,7 +412,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--resume-from-exponent") && i + 1 < argc)
             resume_from    = parse_nonneg_uint64("--resume-from-exponent", argv[++i]);
         else if (!strcmp(argv[i], "--target-workers")      && i + 1 < argc)
-            target_workers = parse_positive_int("--target-workers", argv[++i]);
+            target_workers = parse_nonneg_int("--target-workers", argv[++i]);
         else if (!strcmp(argv[i], "--dry-run"))
             dry_run        = 1;
         else if (!strcmp(argv[i], "--count-only"))

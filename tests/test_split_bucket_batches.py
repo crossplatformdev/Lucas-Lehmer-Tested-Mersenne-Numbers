@@ -474,5 +474,291 @@ class TestWriteSummaryMdExponentTable(unittest.TestCase):
         self.assertEqual(len(exp_rows), len(results))
 
 
+class TestResumeFromExponent(unittest.TestCase):
+    """--resume-from-exponent: skip tested primes, preserve ordinals."""
+
+    def test_resume_skips_primes_within_bucket(self):
+        # Bucket 5: [8,15] → primes 11,13 (2 primes)
+        # Resume from 11 → only 13 should remain.
+        primes = enumerate_bucket_primes(5)
+        self.assertGreaterEqual(len(primes), 2)
+        first = primes[0]
+        batches_full = split_bucket_into_batches(5, batch_size=1000)
+        batches_resumed = split_bucket_into_batches(5, batch_size=1000, resume_from=first)
+        # The first prime is skipped.
+        all_resumed_mins = [b["batch_min_exponent"] for b in batches_resumed]
+        self.assertNotIn(first, all_resumed_mins)
+        # Total primes in resumed batches is one fewer.
+        total_full = sum(b["batch_size"] for b in batches_full)
+        total_resumed = sum(b["batch_size"] for b in batches_resumed)
+        self.assertEqual(total_resumed, total_full - 1)
+
+    def test_resume_skips_entire_bucket(self):
+        # Resume from a value >= max prime in bucket 5 → empty list.
+        primes = enumerate_bucket_primes(5)
+        last = primes[-1]
+        batches = split_bucket_into_batches(5, batch_size=1000, resume_from=last)
+        self.assertEqual(batches, [])
+
+    def test_resume_preserves_absolute_ordinals(self):
+        # Ordinals in the resumed batch must still be relative to the full list.
+        primes = enumerate_bucket_primes(6)
+        skip_count = 3
+        resume_exp = primes[skip_count - 1]   # skip first 3 primes
+        batches = split_bucket_into_batches(6, batch_size=1000, resume_from=resume_exp)
+        self.assertGreater(len(batches), 0)
+        first_batch = batches[0]
+        # start_ordinal (1-based) should be skip_count + 1
+        self.assertEqual(first_batch["batch_prime_start_index"], skip_count)
+
+    def test_resume_zero_means_no_skip(self):
+        batches_no_resume = split_bucket_into_batches(5, batch_size=1000, resume_from=0)
+        batches_with_resume = split_bucket_into_batches(5, batch_size=1000)
+        self.assertEqual(batches_no_resume, batches_with_resume)
+
+    def test_generate_matrix_skips_complete_buckets(self):
+        # Bucket 1 has only one prime (2).  Resume from 2 → bucket 1 absent from matrix.
+        matrix = generate_batch_matrix(1, 3, batch_size=1000, resume_from=2)
+        bucket_ns = {e["bucket_n"] for e in matrix}
+        self.assertNotIn(1, bucket_ns)
+
+    def test_generate_matrix_resume_partial_bucket(self):
+        # Bucket 5 has primes 11, 13.  Resume from 11 → only 13 remains in bucket 5.
+        primes_b5 = enumerate_bucket_primes(5)
+        matrix_full = generate_batch_matrix(5, 5, batch_size=1000)
+        matrix_resumed = generate_batch_matrix(5, 5, batch_size=1000,
+                                               resume_from=primes_b5[0])
+        total_full = sum(e["batch_size"] for e in matrix_full)
+        total_resumed = sum(e["batch_size"] for e in matrix_resumed)
+        self.assertEqual(total_resumed, total_full - 1)
+
+
+class TestTargetWorkers(unittest.TestCase):
+    """--target-workers: splits total primes into ~N equal batches."""
+
+    def test_single_bucket_target_workers(self):
+        # Bucket 6 has > 4 primes.  With target_workers=2 we should get ≤ 2 batches.
+        primes = enumerate_bucket_primes(6)
+        matrix = generate_batch_matrix(6, 6, batch_size=1000, target_workers=2)
+        self.assertLessEqual(len(matrix), 2)
+        total = sum(e["batch_size"] for e in matrix)
+        self.assertEqual(total, len(primes))
+
+    def test_total_primes_unchanged(self):
+        # All primes must still be covered regardless of target_workers.
+        expected_total = sum(len(enumerate_bucket_primes(n)) for n in range(5, 8))
+        matrix = generate_batch_matrix(5, 7, batch_size=1000, target_workers=50)
+        actual_total = sum(e["batch_size"] for e in matrix)
+        self.assertEqual(actual_total, expected_total)
+
+    def test_number_of_batches_close_to_target(self):
+        # With target_workers=N, len(matrix) should be >= 1 and <= N + slack
+        # (small buckets may produce fewer batches than requested).
+        target = 10
+        matrix = generate_batch_matrix(5, 7, batch_size=1000, target_workers=target)
+        self.assertGreaterEqual(len(matrix), 1)
+        # Should not produce significantly more than the target.
+        self.assertLessEqual(len(matrix), target * 2)
+
+    def test_target_workers_zero_uses_batch_size(self):
+        # target_workers=0 should fall back to batch_size.
+        batch_size = 3
+        matrix = generate_batch_matrix(5, 5, batch_size=batch_size, target_workers=0)
+        for entry in matrix:
+            self.assertLessEqual(entry["batch_size"], batch_size)
+
+    def test_batch_size_is_hard_upper_cap(self):
+        # Even when target_workers would compute a larger per-batch value,
+        # batch_size must never be exceeded.
+        cap = 2
+        matrix = generate_batch_matrix(5, 5, batch_size=cap, target_workers=1)
+        for entry in matrix:
+            self.assertLessEqual(entry["batch_size"], cap)
+
+
+class TestTimeLimitPerBucketCap(unittest.TestCase):
+    """--time-limit-seconds: per-bucket batch size cap from timing data."""
+
+    def test_large_time_limit_does_not_shrink_small_buckets(self):
+        # A huge time limit should not result in 0 primes per batch.
+        matrix = generate_batch_matrix(5, 5, batch_size=1000,
+                                       time_limit_seconds=86400.0)
+        self.assertGreater(len(matrix), 0)
+        for entry in matrix:
+            self.assertGreater(entry["batch_size"], 0)
+
+    def test_small_time_limit_shrinks_large_buckets(self):
+        # A very small time limit on bucket 16 (worst ≈ 5.646 s) should produce
+        # batch_size = 1 (floor(1 / 5.646) = 0, clamped to 1).
+        matrix = generate_batch_matrix(16, 16, batch_size=1000,
+                                       time_limit_seconds=1.0)
+        for entry in matrix:
+            self.assertEqual(entry["batch_size"], 1)
+
+    def test_time_limit_and_target_workers_both_apply(self):
+        # With target_workers=1 (would give all primes in one batch) but a
+        # tight time limit, each batch must still be small.
+        matrix = generate_batch_matrix(16, 16, batch_size=1000,
+                                       time_limit_seconds=1.0,
+                                       target_workers=1)
+        for entry in matrix:
+            self.assertEqual(entry["batch_size"], 1)
+
+
+class TestCLINewFlags(unittest.TestCase):
+    """CLI smoke tests for --target-workers, --resume-from-exponent, --time-limit-seconds."""
+
+    _SCRIPT = os.path.join(_REPO_ROOT, "scripts", "split_bucket_batches.py")
+
+    def _run(self, *args, expect_success: bool = True) -> subprocess.CompletedProcess:
+        result = subprocess.run(
+            [sys.executable, self._SCRIPT, *args],
+            capture_output=True, text=True,
+        )
+        if expect_success:
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return result
+
+    def test_target_workers_flag_accepted(self):
+        result = self._run("--bucket-start", "5", "--bucket-end", "5",
+                           "--target-workers", "3")
+        parsed = json.loads(result.stdout)
+        self.assertIsInstance(parsed, list)
+
+    def test_target_workers_zero_accepted(self):
+        # 0 means "off"; the flag must not be rejected.
+        result = self._run("--bucket-start", "5", "--bucket-end", "5",
+                           "--target-workers", "0")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_resume_from_exponent_skips_primes(self):
+        primes_b5 = enumerate_bucket_primes(5)
+        resume = str(primes_b5[0])
+        result = self._run("--bucket-start", "5", "--bucket-end", "5",
+                           "--resume-from-exponent", resume)
+        parsed = json.loads(result.stdout)
+        for entry in parsed:
+            self.assertGreater(entry["batch_min_exponent"], int(resume))
+
+    def test_time_limit_seconds_accepted(self):
+        result = self._run("--bucket-start", "5", "--bucket-end", "5",
+                           "--time-limit-seconds", "21600")
+        parsed = json.loads(result.stdout)
+        self.assertIsInstance(parsed, list)
+
+    def test_time_limit_seconds_inf_rejected(self):
+        result = self._run("--bucket-start", "5", "--bucket-end", "5",
+                           "--time-limit-seconds", "inf",
+                           expect_success=False)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_time_limit_seconds_nan_rejected(self):
+        result = self._run("--bucket-start", "5", "--bucket-end", "5",
+                           "--time-limit-seconds", "nan",
+                           expect_success=False)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_dry_run_shows_target_workers(self):
+        result = self._run("--bucket-start", "5", "--bucket-end", "5",
+                           "--target-workers", "5", "--dry-run")
+        self.assertIn("target_workers", result.stdout)
+
+    def test_negative_target_workers_rejected(self):
+        result = self._run("--bucket-start", "5", "--bucket-end", "5",
+                           "--target-workers", "-1",
+                           expect_success=False)
+        self.assertNotEqual(result.returncode, 0)
+
+
+class TestFindResumeExponent(unittest.TestCase):
+    """Unit tests for scripts/find_resume_exponent.py."""
+
+    _SCRIPT = os.path.join(_REPO_ROOT, "scripts", "find_resume_exponent.py")
+
+    def setUp(self):
+        import importlib
+        # scripts/ is already on sys.path (inserted at module level above).
+        self._mod = importlib.import_module("find_resume_exponent")
+
+    def _run(self, *args) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, self._SCRIPT, *args],
+            capture_output=True, text=True,
+        )
+
+    def test_missing_directory_returns_zero(self):
+        result = self._mod.find_last_exponent("/tmp/does_not_exist_42abc")
+        self.assertEqual(result, 0)
+
+    def test_empty_directory_returns_zero(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            result = self._mod.find_last_exponent(d)
+            self.assertEqual(result, 0)
+
+    def test_non_matching_files_ignored(self):
+        import pathlib, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            pathlib.Path(d, "README.md").touch()
+            pathlib.Path(d, "bucket-17-batch-0001-0100.txt").touch()
+            result = self._mod.find_last_exponent(d)
+            self.assertEqual(result, 0)
+
+    def test_single_zip_artifact_parsed(self):
+        import pathlib, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            pathlib.Path(d, "bucket-17-batch-0001-0708-exp-65537-131071-results.zip").touch()
+            result = self._mod.find_last_exponent(d)
+            self.assertEqual(result, 131071)
+
+    def test_single_directory_artifact_parsed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "bucket-17-batch-0001-0708-exp-65537-131071-results"))
+            result = self._mod.find_last_exponent(d)
+            self.assertEqual(result, 131071)
+
+    def test_multiple_artifacts_returns_highest(self):
+        import pathlib, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            for fname in [
+                "bucket-16-batch-0001-1000-exp-32771-65521-results.zip",
+                "bucket-17-batch-0001-0708-exp-65537-131071-results.zip",
+                "bucket-17-batch-0709-1416-exp-131101-196561-results.zip",
+            ]:
+                pathlib.Path(d, fname).touch()
+            result = self._mod.find_last_exponent(d)
+            self.assertEqual(result, 196561)
+
+    def test_mixed_zip_and_directory_artifacts(self):
+        import pathlib, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            pathlib.Path(d, "bucket-16-batch-0001-1000-exp-32771-65521-results.zip").touch()
+            os.makedirs(os.path.join(d, "bucket-17-batch-0001-0708-exp-65537-262144-results"))
+            result = self._mod.find_last_exponent(d)
+            self.assertEqual(result, 262144)
+
+    def test_cli_missing_dir_outputs_zero(self):
+        result = self._run("/tmp/no_such_dir_xyz987")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "0")
+
+    def test_cli_too_many_args_errors(self):
+        result = self._run("a", "b")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_cli_returns_highest_exponent(self):
+        import pathlib, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            for fname in [
+                "bucket-16-batch-0001-1000-exp-32771-65521-results.zip",
+                "bucket-17-batch-0001-0708-exp-65537-131071-results.zip",
+            ]:
+                pathlib.Path(d, fname).touch()
+            result = self._run(d)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.strip(), "131071")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
