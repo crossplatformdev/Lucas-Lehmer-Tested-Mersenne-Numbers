@@ -200,6 +200,20 @@ static void test_sweep_prime() {
     assert(v3.empty());  // 15 is 3*5, no primes in [14,16]? 14=2*7, 15=3*5, 16=2^4 → empty
 }
 
+// ---- sweep::generate_prime segmented sieve correctness ----
+static void test_generate_prime_segmented_sieve_vs_is_prime_exponent() {
+    // Compare segmented sieve output with trial-division is_prime_exponent for [2, 100000].
+    constexpr uint32_t MAX_EXP = 100000u;
+    const auto sieve_primes = sweep::generate_prime(2u, MAX_EXP);
+
+    // Build reference list via is_prime_exponent.
+    std::vector<uint32_t> ref_primes;
+    for (uint32_t i = 2u; i <= MAX_EXP; ++i)
+        if (mersenne::is_prime_exponent(i)) ref_primes.push_back(i);
+
+    assert(sieve_primes == ref_primes);
+}
+
 // ---- sweep::generate_mersenne_first tests ----
 static void test_sweep_mersenne_first() {
     // Range [2, 30]: known Mersenne primes = {2,3,5,7,13,17,19} (31 > 30)
@@ -321,6 +335,7 @@ int main() {
     // --- Sweep-mode generator tests ---
     test_sweep_natural();
     test_sweep_prime();
+    test_generate_prime_segmented_sieve_vs_is_prime_exponent();
     test_sweep_mersenne_first();
     test_sweep_apply_shard();
     test_sweep_mersenne_first_determinism();

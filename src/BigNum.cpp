@@ -307,12 +307,58 @@ inline std::vector<uint32_t> generate_natural(uint32_t min_exp, uint32_t max_exp
 }
 
 // mode 'p': all prime numbers in [min_exp, max_exp] inclusive.
+// Uses a segmented sieve of Eratosthenes:
+//   (1) compute base primes up to floor(sqrt(max_exp)) via a simple sieve,
+//   (2) sieve in segments of 1M numbers,
+//   (3) collect all primes in [start, max_exp].
 inline std::vector<uint32_t> generate_prime(uint32_t min_exp, uint32_t max_exp) {
     std::vector<uint32_t> v;
     const uint32_t start = (min_exp < 2u) ? 2u : min_exp;
-    for (uint32_t i = start; i <= max_exp; ++i)
-        if (mersenne::is_prime_exponent(i))
-            v.push_back(i);
+    if (start > max_exp) return v;
+
+    // Step 1: base primes up to floor(sqrt(max_exp)).
+    // Use floating-point sqrt then adjust for exactness (same pattern as is_prime_exponent).
+    uint32_t sqrt_max = static_cast<uint32_t>(std::sqrt(static_cast<double>(max_exp)));
+    while ((static_cast<uint64_t>(sqrt_max) + 1u) * (static_cast<uint64_t>(sqrt_max) + 1u)
+           <= static_cast<uint64_t>(max_exp))
+        ++sqrt_max;
+
+    std::vector<bool> base_sieve(sqrt_max + 1u, true);
+    base_sieve[0] = false;
+    if (sqrt_max >= 1u) base_sieve[1] = false;
+    for (uint32_t i = 2u; static_cast<uint64_t>(i) * i <= sqrt_max; ++i)
+        if (base_sieve[i])
+            for (uint32_t j = i * i; j <= sqrt_max; j += i)
+                base_sieve[j] = false;
+
+    std::vector<uint32_t> base_primes;
+    for (uint32_t i = 2u; i <= sqrt_max; ++i)
+        if (base_sieve[i]) base_primes.push_back(i);
+
+    // Step 2: segmented sieve in blocks of 1M numbers.
+    constexpr uint32_t SEG_SIZE = 1000000u;
+    uint32_t seg_lo = start;
+    while (seg_lo <= max_exp) {
+        const uint32_t seg_hi = (max_exp - seg_lo < SEG_SIZE) ? max_exp : seg_lo + SEG_SIZE - 1u;
+        std::vector<bool> sieve(seg_hi - seg_lo + 1u, true);
+
+        // Cross off composites using base primes.
+        for (uint32_t p : base_primes) {
+            // First multiple of p in [seg_lo, seg_hi]; skip p itself.
+            uint64_t first = ((static_cast<uint64_t>(seg_lo) + p - 1u) / p) * p;
+            if (first == static_cast<uint64_t>(p)) first += p;
+            for (uint64_t j = first; j <= seg_hi; j += p)
+                sieve[static_cast<size_t>(j - seg_lo)] = false;
+        }
+
+        // Collect primes from this segment.
+        for (uint32_t i = seg_lo; i <= seg_hi; ++i)
+            if (sieve[i - seg_lo]) v.push_back(i);
+
+        if (seg_hi == max_exp) break;
+        seg_lo = seg_hi + 1u;
+    }
+
     return v;
 }
 
