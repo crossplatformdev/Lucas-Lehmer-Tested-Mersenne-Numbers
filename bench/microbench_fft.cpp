@@ -92,6 +92,14 @@ int main(int argc, char** argv) {
     std::printf("p                : %u\n", p);
     std::printf("iters            : %u%s\n", bench_iters, full_run ? " (full, p-2)" : " (partial)");
     std::printf("backend          : FftMersenneBackend\n");
+    // Report intra-FFT thread configuration.
+    {
+        const char* fft_threads_env = std::getenv("LL_FFT_THREADS");
+        const char* outer_env       = std::getenv("LL_THREADS");
+        const unsigned fft_t = fft_threads_env ? static_cast<unsigned>(std::atoi(fft_threads_env)) : 1u;
+        const unsigned outer = outer_env        ? static_cast<unsigned>(std::atoi(outer_env))        : 1u;
+        std::printf("LL_FFT_THREADS   : %u (outer LL_THREADS=%u)\n", fft_t, outer);
+    }
     std::fflush(stdout);
 
     // Ensure p is large enough to exercise the FFT backend.
