@@ -2711,7 +2711,7 @@ int main(int argc, char** argv) {
     const bool largest_first = read_env_bool("LL_LARGEST_FIRST", false);
 
     // LL_THREADS: override thread count (if not already set via argv[2]).
-    // A value of 0 means "half of available cores" (see benchmark comment above).
+    // A value of 0 means all available cores (maxCores).
     if (argc < 3) {
         const unsigned long t = read_env_ul("LL_THREADS", 0ul);
         if (t == 0ul)
