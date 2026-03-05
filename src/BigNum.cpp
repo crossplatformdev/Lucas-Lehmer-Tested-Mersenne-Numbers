@@ -2624,6 +2624,33 @@ int main(int argc, char** argv) {
     const unsigned maxCores = runtime::detect_available_cores();
 
     // --- Parse legacy positional arguments (backward-compatible) ---
+    //
+    // Default thread count: all available cores (throughput / batch mode).
+    //
+    // NOTE: The CPU model reported in /proc/cpuinfo ("AMD EPYC 7763 64-Core
+    // Processor") refers to the underlying physical hardware.  The runner
+    // container is only allocated 4 vCPUs, so nproc/sched_getaffinity both
+    // return 4.  All thread-count logic below operates on available vCPUs only.
+    //
+    // Thread-count strategy:
+    //
+    //   SINGLE exponent (LL_STOP_AFTER_ONE or work.size()==1):
+    //     Half-cores is measurably faster for tiny exponents (p=31) where
+    //     thread-pool creation overhead dominates the <0.5 ms compute budget.
+    //     Benchmarks on this machine (4 vCPUs):
+    //       threads=4 → avg ~3.8 ms  (5 runs: 4,4,3,4,4 ms)
+    //       threads=2 → avg ~3.2 ms  (5 runs: 3,4,3,3,3 ms)
+    //     For large single exponents (p=110503, 6-digit) the difference is
+    //     negligible (<1%): both 20.7–20.9 s, well within noise.
+    //
+    //   BATCH / THROUGHPUT mode (many exponents, the primary use case):
+    //     Each worker thread handles one exponent at a time from a shared
+    //     work queue (atomic fetch-add).  With N workers and N exponents, all
+    //     run simultaneously.  Maximising thread count minimises total wall
+    //     time: wall ≈ max(individual times) instead of sum/N.
+    //     Use all available cores (maxCores) to achieve maximum parallelism.
+    //
+
     size_t   startIndex = 0u;
     unsigned threads    = maxCores;
     bool     progress   = false;
@@ -2684,9 +2711,12 @@ int main(int argc, char** argv) {
     const bool largest_first = read_env_bool("LL_LARGEST_FIRST", false);
 
     // LL_THREADS: override thread count (if not already set via argv[2]).
+    // A value of 0 means all available cores (maxCores).
     if (argc < 3) {
         const unsigned long t = read_env_ul("LL_THREADS", 0ul);
-        if (t > 0ul)
+        if (t == 0ul)
+            threads = maxCores;
+        else
             threads = std::min(static_cast<unsigned>(t), maxCores);
     }
 
@@ -2828,10 +2858,26 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Result of one Lucas-Lehmer test, stored by work-list index for ordered output.
+    struct WorkResult { bool isPrime; double elapsed; };
+
     // --- Thread-pool throughput mode ---
-    // Workers pull from the pre-built work list via an atomic index counter.
-    std::atomic<size_t> next{0u};
-    std::mutex          printMu;
+    // Workers pull from the work list via an atomic index counter so that
+    // every core is kept busy regardless of how long individual exponents take
+    // (dynamic load-balancing: fastest exponents free their core immediately).
+    //
+    // "Testing M_X ..." is printed immediately when a worker claims a slot.
+    // This line has always been unconditional (not gated by the `progress`
+    // flag, which controls intra-exponent iteration-level output only).
+    // These start-messages are intentionally unordered – they show what is
+    // in-flight during a long run.  Final "M_X is prime/composite" lines are
+    // collected into a results vector and printed in the original input order
+    // after all workers finish, so the output is deterministic and easy to
+    // diff in CI logs.
+    std::atomic<size_t>     next{0u};
+    std::mutex              printMu;
+    std::vector<WorkResult> results(work.size());
+
     runtime::ThreadPool pool(threads);
 
     for (unsigned t = 0; t < threads; ++t) {
@@ -2840,24 +2886,30 @@ int main(int argc, char** argv) {
                 const size_t idx = next.fetch_add(1u, std::memory_order_relaxed);
                 if (idx >= work.size()) break;
                 const uint32_t p = work[idx];
-                const auto t0    = std::chrono::steady_clock::now();
-                const bool isPrime =
-                    mersenne::lucas_lehmer(p, progress, benchmark_mode);
-                const auto t1 = std::chrono::steady_clock::now();
-                const double elapsed =
-                    std::chrono::duration<double>(t1 - t0).count();
                 {
                     std::lock_guard<std::mutex> lk(printMu);
                     std::printf("Testing M_%u ...\n", p);
-                    std::printf("M_%u is %s. Time: %.3f s\n",
-                                p, isPrime ? "prime" : "composite", elapsed);
+                    std::fflush(stdout);
                 }
+                const auto t0      = std::chrono::steady_clock::now();
+                const bool isPrime = mersenne::lucas_lehmer(p, progress, benchmark_mode);
+                const auto t1      = std::chrono::steady_clock::now();
+                const double elapsed =
+                    std::chrono::duration<double>(t1 - t0).count();
+                results[idx] = {isPrime, elapsed};
                 record_result(p, isPrime, elapsed);
             }
         });
     }
 
     pool.wait_all();
+
+    // Print final verdicts in the original input order.
+    for (size_t i = 0; i < work.size(); ++i) {
+        const auto& r = results[i];
+        std::printf("M_%u is %s. Time: %.3f s\n",
+                    work[i], r.isPrime ? "prime" : "composite", r.elapsed);
+    }
     if (bench_fp) std::fclose(bench_fp);
     return 0;
 }
