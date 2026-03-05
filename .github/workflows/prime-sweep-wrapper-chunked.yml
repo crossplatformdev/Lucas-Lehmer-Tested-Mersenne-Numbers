@@ -1,0 +1,267 @@
+name: Prime Sweep Wrapper (Auto-Chunked)
+
+# Multi-run orchestrator that automatically splits large prime sweeps into
+# N separate workflow runs, each with at most 256 worker jobs (the GitHub
+# Actions matrix hard limit).
+#
+# How it works:
+#   1. count_chunks job: runs the Python planner in count_chunks mode to
+#      determine how many chunks are needed for the requested sweep
+#      parameters.
+#   2. sweep_chunk job (matrix): spawns one copy of power-range-prime-sweep.yml
+#      for each chunk.  Each spawned run executes at most 256 parallel workers.
+#
+# When total_batches <= 256 (chunk_count == 1), this wrapper is equivalent
+# to calling prime-sweep-wrapper.yml directly – no extra overhead.
+#
+# Artifact strategy (Option 1 – simple):
+#   Each chunk run produces its own merged-results artifact.  The final
+#   report job links to all of them.  A future enhancement could merge
+#   across runs, but cross-workflow artifact access requires the GitHub API
+#   and is out of scope for the initial implementation.
+#
+# Half definition (used when sweep_range != full):
+#   All prime exponents in the selected bucket range are enumerated in
+#   ascending order.  The midpoint is total // 2.
+#   Lower Half = first  mid  primes  (indices 0 .. mid-1)
+#   Upper Half = last total-mid primes  (indices mid .. total-1)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sweep_range:
+        description: "Portion of prime exponents to test (primes ordered ascending by value)"
+        required: false
+        type: choice
+        default: "full"
+        options:
+          - "full"
+          - "upper_half"
+          - "lower_half"
+      bucket_min:
+        description: "Lower bucket start (1-64)"
+        required: true
+        type: string
+        default: "1"
+      bucket_top:
+        description: "Upper bucket end (bucket_min to 64)"
+        required: true
+        type: string
+        default: "64"
+      auto_resume:
+        description: "Auto-detect the last tested exponent from bucket_artifacts/ and skip already-done primes (default: true)"
+        required: false
+        type: boolean
+        default: true
+      time_limit_minutes:
+        description: "Per-worker time budget in minutes; batch sizes shrink automatically for larger exponents (default: 360 = 6 h)"
+        required: false
+        type: string
+        default: "360"
+      target_workers:
+        description: "Target number of parallel workers per chunk (default: 250). Primes are split across this many workers so they run concurrently."
+        required: false
+        type: string
+        default: "250"
+      chunk_size:
+        description: "Maximum batches per sweep run / GitHub Actions matrix limit (default: 256)"
+        required: false
+        type: string
+        default: "256"
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # Stage 1: Validate – reject invalid inputs early.
+  # ──────────────────────────────────────────────────────────
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate inputs
+        run: |
+          MIN="${{ inputs.bucket_min }}"
+          TOP="${{ inputs.bucket_top }}"
+          if ! [[ "$MIN" =~ ^[0-9]+$ ]] || ! [[ "$TOP" =~ ^[0-9]+$ ]]; then
+            echo "::error::bucket_min and bucket_top must be integers."
+            exit 1
+          fi
+          if (( MIN < 1 || MIN > 64 || TOP < MIN || TOP > 64 )); then
+            echo "::error::bucket_min ($MIN) must be in [1,64] and bucket_top ($TOP) must be in [bucket_min,64]."
+            exit 1
+          fi
+          TIME_LIMIT="${{ inputs.time_limit_minutes }}"
+          if ! [[ "$TIME_LIMIT" =~ ^[0-9]+$ ]] || (( TIME_LIMIT < 1 )); then
+            echo "::error::time_limit_minutes must be a positive integer, got '${TIME_LIMIT}'."
+            exit 1
+          fi
+          TARGET_WORKERS="${{ inputs.target_workers }}"
+          if ! [[ "$TARGET_WORKERS" =~ ^[0-9]+$ ]]; then
+            echo "::error::target_workers must be a non-negative integer, got '${TARGET_WORKERS}'."
+            exit 1
+          fi
+          CHUNK_SIZE="${{ inputs.chunk_size }}"
+          if ! [[ "$CHUNK_SIZE" =~ ^[0-9]+$ ]] || (( CHUNK_SIZE < 1 )); then
+            echo "::error::chunk_size must be a positive integer, got '${CHUNK_SIZE}'."
+            exit 1
+          fi
+          echo "Input validated: buckets ${MIN}..${TOP}, sweep_range='${{ inputs.sweep_range }}'"
+          echo "time_limit_minutes=${TIME_LIMIT}, target_workers=${TARGET_WORKERS}, chunk_size=${CHUNK_SIZE}"
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 2: Count chunks – determine how many sweep runs are
+  # needed so each has at most chunk_size worker jobs.
+  # ──────────────────────────────────────────────────────────
+  count_chunks:
+    needs: validate
+    runs-on: ubuntu-24.04
+    outputs:
+      chunk_matrix: ${{ steps.count.outputs.chunk_matrix }}
+      chunk_count:  ${{ steps.count.outputs.chunk_count }}
+      total_batches: ${{ steps.count.outputs.total_batches }}
+      effective_resume: ${{ steps.count.outputs.effective_resume }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Auto-detect last tested exponent
+        id: auto-resume
+        run: |
+          AUTO_EXP=$(python3 scripts/find_resume_exponent.py bucket_artifacts/ 2>/dev/null || echo "0")
+          echo "last_exponent=${AUTO_EXP}" >> "$GITHUB_OUTPUT"
+          echo "Auto-resume scan: last tested exponent = ${AUTO_EXP}"
+
+      - name: Count chunks
+        id: count
+        run: |
+          TIME_LIMIT_SEC=$(( ${{ inputs.time_limit_minutes }} * 60 ))
+
+          AUTO_EXP="${{ steps.auto-resume.outputs.last_exponent }}"
+          AUTO_ENABLED="${{ inputs.auto_resume }}"
+          if [[ "${AUTO_ENABLED}" == "true" && "${AUTO_EXP}" -gt 0 ]]; then
+            EFFECTIVE_RESUME="${AUTO_EXP}"
+          else
+            EFFECTIVE_RESUME="0"
+          fi
+          echo "Effective resume exponent: ${EFFECTIVE_RESUME}"
+
+          CHUNK_INFO=$(python3 scripts/plan_bucket_sweep.py \
+            --mode           count_chunks \
+            --bucket-start   "${{ inputs.bucket_min }}" \
+            --bucket-end     "${{ inputs.bucket_top }}" \
+            --target-workers "${{ inputs.target_workers }}" \
+            --time-limit-seconds "${TIME_LIMIT_SEC}" \
+            --resume-from-exponent "${EFFECTIVE_RESUME}" \
+            --prime-half     "${{ inputs.sweep_range }}" \
+            --chunk-size     "${{ inputs.chunk_size }}")
+
+          echo "Chunk info: ${CHUNK_INFO}"
+
+          TOTAL_BATCHES=$(echo "${CHUNK_INFO}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['total_batches'])")
+          CHUNK_COUNT=$(echo "${CHUNK_INFO}"   | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['chunk_count'])")
+
+          # Build the chunk matrix: [{"chunk_index": 0}, {"chunk_index": 1}, ...]
+          CHUNK_MATRIX=$(python3 -c "
+import json, sys
+n = int('${CHUNK_COUNT}')
+print(json.dumps([{'chunk_index': str(i)} for i in range(n)]))")
+
+          echo "total_batches=${TOTAL_BATCHES}"      >> "$GITHUB_OUTPUT"
+          echo "chunk_count=${CHUNK_COUNT}"           >> "$GITHUB_OUTPUT"
+          echo "chunk_matrix=${CHUNK_MATRIX}"         >> "$GITHUB_OUTPUT"
+          echo "effective_resume=${EFFECTIVE_RESUME}" >> "$GITHUB_OUTPUT"
+
+          echo "Total batches: ${TOTAL_BATCHES}  →  ${CHUNK_COUNT} chunk(s) of <= ${{ inputs.chunk_size }}"
+
+          # Print workflow run link for audit.
+          echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 3: Sweep chunks – one call to the full sweep
+  # workflow per chunk.  Each run executes at most chunk_size
+  # (default: 256) parallel workers.
+  # ──────────────────────────────────────────────────────────
+  sweep_chunk:
+    needs: count_chunks
+    strategy:
+      fail-fast: false
+      max-parallel: 256
+      matrix:
+        include: ${{ fromJson(needs.count_chunks.outputs.chunk_matrix) }}
+    uses: ./.github/workflows/power-range-prime-sweep.yml
+    with:
+      bucket_start:       ${{ inputs.bucket_min }}
+      bucket_end:         ${{ inputs.bucket_top }}
+      auto_resume:        ${{ inputs.auto_resume }}
+      time_limit_minutes: ${{ inputs.time_limit_minutes }}
+      target_workers:     ${{ inputs.target_workers }}
+      prime_half:         ${{ inputs.sweep_range }}
+      chunk_index:        ${{ matrix.chunk_index }}
+      chunk_size:         ${{ inputs.chunk_size }}
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 4: Report – summarize the multi-chunk sweep.
+  # Each chunk run produced its own merged-results artifact.
+  # Download them all and present a combined summary.
+  # ──────────────────────────────────────────────────────────
+  report:
+    needs: [count_chunks, sweep_chunk]
+    if: success() || failure()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download all merged results artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bucket-sweep-merged-results*
+          path: all_results/
+          merge-multiple: false
+
+      - name: Present multi-chunk sweep summary
+        run: |
+          {
+            echo "## Prime Sweep Wrapper (Auto-Chunked) – Final Report"
+            echo ""
+            echo "**Sweep range:** ${{ inputs.sweep_range }}"
+            echo "**Buckets swept:** ${{ inputs.bucket_min }}–${{ inputs.bucket_top }}"
+            echo "**Total batches:** ${{ needs.count_chunks.outputs.total_batches }}"
+            echo "**Chunks spawned:** ${{ needs.count_chunks.outputs.chunk_count }}"
+            echo "**Chunk size:** ${{ inputs.chunk_size }}"
+            echo "**Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo ""
+            echo "### Per-Chunk Summaries"
+            echo ""
+            if [ -d all_results/ ]; then
+              for chunk_dir in all_results/*/; do
+                artifact_name=$(basename "${chunk_dir}")
+                echo "#### ${artifact_name}"
+                if [ -f "${chunk_dir}/merged_summary.md" ]; then
+                  # Include first portion of each chunk summary (omit large tables).
+                  awk '/^## Composite Exponents Tested/{
+                    print ""
+                    print "_Full composite table in artifact: '"'"'${artifact_name}'"'"'_"
+                    exit
+                  } {print}' "${chunk_dir}/merged_summary.md"
+                elif [ -f "${chunk_dir}/bucket-sweep-merged-results/merged_summary.md" ]; then
+                  awk '/^## Composite Exponents Tested/{
+                    print ""
+                    print "_Full composite table in artifact: '"'"'${artifact_name}'"'"'_"
+                    exit
+                  } {print}' "${chunk_dir}/bucket-sweep-merged-results/merged_summary.md"
+                else
+                  echo "_(summary not available for this chunk)_"
+                fi
+                echo ""
+              done
+            else
+              echo "_(no merged results available – all chunks may have produced no results)_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Emit discovery notice
+        if: needs.sweep_chunk.outputs.new_discovery == 'true'
+        run: |
+          echo "::notice title=NEW MERSENNE PRIME FOUND::Check the bucket-sweep-merged-results artifacts for details!"
+          echo "## 🚨 NEW MERSENNE PRIME FOUND" >> "$GITHUB_STEP_SUMMARY"
+          echo "Check the **bucket-sweep-merged-results** artifacts from each chunk for details." >> "$GITHUB_STEP_SUMMARY"

@@ -112,6 +112,16 @@ on:
         required: false
         type: string
         default: "full"
+      chunk_index:
+        description: "0-based chunk index when the full matrix is split across multiple runs (default: 0)"
+        required: false
+        type: string
+        default: "0"
+      chunk_size:
+        description: "Maximum number of batches per run / GitHub Actions matrix limit (default: 256)"
+        required: false
+        type: string
+        default: "256"
   workflow_dispatch:
     inputs:
       bucket_start:
@@ -198,6 +208,16 @@ on:
           - "full"
           - "lower_half"
           - "upper_half"
+      chunk_index:
+        description: "0-based chunk index when the full matrix is split across multiple runs (default: 0)"
+        required: false
+        type: string
+        default: "0"
+      chunk_size:
+        description: "Maximum number of batches per run / GitHub Actions matrix limit (default: 256)"
+        required: false
+        type: string
+        default: "256"
 
 permissions:
   contents: read
@@ -248,11 +268,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compile plan tool
-        run: |
-          mkdir -p bin
-          gcc -std=c11 -O2 -o bin/split_bucket_batches src/split_bucket_batches.c
-
       - name: Auto-detect last tested exponent
         id: auto-resume
         run: |
@@ -267,8 +282,9 @@ jobs:
         run: |
           START="${{ inputs.bucket_start }}"
           END="${{ inputs.bucket_end }}"
-          BATCH_SIZE="100"
-          
+          CHUNK_INDEX="${{ inputs.chunk_index }}"
+          CHUNK_SIZE="${{ inputs.chunk_size }}"
+
           # Determine effective resume exponent:
           #   - explicit resume_from_exponent input wins if > 0
           #   - otherwise fall back to the auto-detected value (when auto_resume=true)
@@ -291,36 +307,31 @@ jobs:
           TIME_LIMIT_SEC=$(( ${{ inputs.time_limit_minutes }} * 60 ))
           echo "Time limit per worker: ${TIME_LIMIT_SEC}s (${{ inputs.time_limit_minutes }} min)"
 
+          # Shared planner flags used for both dry-run audit and JSON matrix.
+          PLANNER_FLAGS=(
+            --bucket-start         "${START}"
+            --bucket-end           "${END}"
+            --target-workers       "${{ inputs.target_workers }}"
+            --time-limit-seconds   "${TIME_LIMIT_SEC}"
+            --resume-from-exponent "${EFFECTIVE_RESUME}"
+            --prime-half           "${{ inputs.prime_half }}"
+            --chunk-size           "${CHUNK_SIZE}"
+            --chunk-index          "${CHUNK_INDEX}"
+          )
+
           # Print human-readable plan (always useful for audit).
-          bin/split_bucket_batches \
-            --bucket-start          "${START}" \
-            --bucket-end            "${END}" \
-            --target-workers        "${{ inputs.target_workers }}" \
-            --time-limit-seconds    "${TIME_LIMIT_SEC}" \
-            --resume-from-exponent  "${EFFECTIVE_RESUME}" \
-            --dry-run
+          python3 scripts/plan_bucket_sweep.py "${PLANNER_FLAGS[@]}" --dry-run
 
-          # Generate the JSON matrix (errors if > 256 batches).
-          BATCH_MATRIX=$(bin/split_bucket_batches \
-            --bucket-start          "${START}" \
-            --bucket-end            "${END}" \
-            --target-workers        "${{ inputs.target_workers }}" \
-            --time-limit-seconds    "${TIME_LIMIT_SEC}" \
-            --resume-from-exponent  "${EFFECTIVE_RESUME}")
-
-          # Apply prime-half filter (lower_half / upper_half) when requested.
-          PRIME_HALF="${{ inputs.prime_half }}"
-          if [ "${PRIME_HALF}" = "lower_half" ] || [ "${PRIME_HALF}" = "upper_half" ]; then
-            echo "Applying prime_half filter: ${PRIME_HALF}"
-            BATCH_MATRIX=$(echo "${BATCH_MATRIX}" | python3 scripts/select_prime_half.py "${PRIME_HALF}")
-          fi
+          # Generate the JSON matrix for this chunk (no 256-entry limit error;
+          # the planner handles chunking transparently).
+          BATCH_MATRIX=$(python3 scripts/plan_bucket_sweep.py "${PLANNER_FLAGS[@]}")
 
           BATCH_COUNT=$(echo "${BATCH_MATRIX}" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))")
 
-          echo "batch_matrix=${BATCH_MATRIX}"     >> "$GITHUB_OUTPUT"
-          echo "batch_count=${BATCH_COUNT}"        >> "$GITHUB_OUTPUT"
-          echo "effective_resume=${EFFECTIVE_RESUME}" >> "$GITHUB_OUTPUT"
-          echo "Total batches: ${BATCH_COUNT}"
+          echo "batch_matrix=${BATCH_MATRIX}"           >> "$GITHUB_OUTPUT"
+          echo "batch_count=${BATCH_COUNT}"              >> "$GITHUB_OUTPUT"
+          echo "effective_resume=${EFFECTIVE_RESUME}"    >> "$GITHUB_OUTPUT"
+          echo "Total batches in this chunk: ${BATCH_COUNT}"
 
   # ──────────────────────────────────────────────────────────
   # Stage 2: Build – compile the binary once and cache it
