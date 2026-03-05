@@ -267,7 +267,8 @@ jobs:
         run: |
           START="${{ inputs.bucket_start }}"
           END="${{ inputs.bucket_end }}"
-
+          BATCH_SIZE="100"
+          
           # Determine effective resume exponent:
           #   - explicit resume_from_exponent input wins if > 0
           #   - otherwise fall back to the auto-detected value (when auto_resume=true)
@@ -309,7 +310,7 @@ jobs:
 
           # Apply prime-half filter (lower / upper) when requested.
           PRIME_HALF="${{ inputs.prime_half }}"
-          if [ "${PRIME_HALF}" = "lower" ] || [ "${PRIME_HALF}" = "upper" ]; then
+          if [ "${PRIME_HALF}" = "lower_half" ] || [ "${PRIME_HALF}" = "upper_half" ]; then
             echo "Applying prime_half filter: ${PRIME_HALF}"
             BATCH_MATRIX=$(echo "${BATCH_MATRIX}" | python3 scripts/select_prime_half.py "${PRIME_HALF}")
           fi
