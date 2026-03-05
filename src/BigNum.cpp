@@ -947,6 +947,404 @@ struct LimbBackend {
 // Precision bound: 5 · log2(n) · n · (2^b_hi)² · 2^{−53} < 0.45
 // ============================================================
 
+// ---- Reusable spin barrier ----
+//
+// Provides arrive_and_wait() / arrive_and_drop() with spinning instead of
+// OS-level blocking.  Avoids futex system-call overhead which can cost
+// several microseconds per phase on Linux, dominating short FFT stages.
+// The hybrid spin-then-yield strategy keeps CPU responsive on shared VMs
+// while minimising wake-up latency on dedicated hardware.
+class SpinBarrier {
+public:
+    explicit SpinBarrier(unsigned n) noexcept
+        : expected_(n), count_(0u), gen_(0u) {}
+
+    // Non-copyable / non-movable (atomic members).
+    SpinBarrier(const SpinBarrier&) = delete;
+    SpinBarrier& operator=(const SpinBarrier&) = delete;
+
+    // Wait until all expected participants have arrived for this phase.
+    void arrive_and_wait() noexcept {
+        const unsigned my_gen = gen_.load(std::memory_order_acquire);
+        const unsigned prev   = count_.fetch_add(1u, std::memory_order_acq_rel);
+        if (prev + 1u == expected_) {
+            // Last to arrive: reset count and advance generation to release waiters.
+            count_.store(0u, std::memory_order_relaxed);
+            gen_.fetch_add(1u, std::memory_order_release);
+        } else {
+            // Spin briefly then yield to avoid wasting vCPU on a shared host.
+            unsigned spin = 0u;
+            while (gen_.load(std::memory_order_acquire) == my_gen) {
+                if (++spin < 512u) {
+#if defined(__x86_64__) || defined(__i386__)
+                    __builtin_ia32_pause();
+#endif
+                } else {
+                    std::this_thread::yield();
+                    spin = 0u;
+                }
+            }
+        }
+    }
+
+    // Arrive without blocking (used on the stop-path so workers can exit).
+    void arrive_and_drop() noexcept {
+        const unsigned prev = count_.fetch_add(1u, std::memory_order_acq_rel);
+        if (prev + 1u == expected_) {
+            count_.store(0u, std::memory_order_relaxed);
+            gen_.fetch_add(1u, std::memory_order_release);
+        }
+    }
+
+private:
+    unsigned                expected_;
+    std::atomic<unsigned>   count_;
+    // Separate cache line to avoid false sharing between count_ updates and
+    // the generation check in spinning threads.
+    alignas(64) std::atomic<unsigned> gen_;
+};
+
+// ---- Intra-FFT multi-threading configuration ----
+//
+// Controlled by environment variables (read once at program startup):
+//   LL_FFT_THREADS       (default 1)     – total intra-FFT threads incl. main.
+//   LL_FFT_MIN_N         (default 4096)  – minimum n/2 (half_n) to activate MT.
+//   LL_FFT_ALLOW_NESTED  (default 0)     – if 0, force LL_FFT_THREADS=1 when
+//                                          LL_THREADS>1 (outer pool is multi-threaded).
+//   LL_PIN_THREADS       (default 0)     – if 1, pin worker threads to CPU cores
+//                                          (Linux only via pthread_setaffinity_np).
+struct FftMtConfig {
+    unsigned nthreads{1};        // total threads (workers + main); 1 = single-threaded
+    size_t   min_half_n{4096};   // min n/2 to activate multi-threading
+    bool     allow_nested{false};
+    bool     pin_threads{false};
+};
+
+static const FftMtConfig& get_fft_mt_config() {
+    static const FftMtConfig cfg = [] {
+        FftMtConfig c;
+
+        // LL_FFT_THREADS
+        if (const char* s = std::getenv("LL_FFT_THREADS")) {
+            if (*s) {
+                char* end = nullptr;
+                const long v = std::strtol(s, &end, 10);
+                if (end != s && *end == '\0' && v > 0 && v <= 4096L)
+                    c.nthreads = static_cast<unsigned>(v);
+                else
+                    std::fprintf(stderr,
+                        "LL_FFT_THREADS='%s' invalid; using default 1\n", s);
+            }
+        }
+
+        // LL_FFT_MIN_N (minimum half_n = n/2)
+        if (const char* s = std::getenv("LL_FFT_MIN_N")) {
+            if (*s) {
+                char* end = nullptr;
+                const long v = std::strtol(s, &end, 10);
+                if (end != s && *end == '\0' && v > 0)
+                    c.min_half_n = static_cast<size_t>(v);
+                else
+                    std::fprintf(stderr,
+                        "LL_FFT_MIN_N='%s' invalid; using default 4096\n", s);
+            }
+        }
+
+        // LL_FFT_ALLOW_NESTED
+        if (const char* s = std::getenv("LL_FFT_ALLOW_NESTED"))
+            c.allow_nested = (s[0] == '1');
+
+        // LL_PIN_THREADS
+        if (const char* s = std::getenv("LL_PIN_THREADS"))
+            c.pin_threads = (s[0] == '1');
+
+        // Gating: if outer pool uses multiple threads and nested is not allowed,
+        // force single-threaded FFT to avoid over-subscription.
+        if (!c.allow_nested && c.nthreads > 1u) {
+            if (const char* s = std::getenv("LL_THREADS")) {
+                if (*s) {
+                    char* end = nullptr;
+                    const long v = std::strtol(s, &end, 10);
+                    if (end != s && *end == '\0' && v > 1L) {
+                        c.nthreads = 1u;
+                        // Informational; not an error.
+                    }
+                }
+            }
+        }
+
+        return c;
+    }();
+    return cfg;
+}
+
+// ============================================================
+// FftTeam – persistent intra-FFT thread pool.
+//
+// Key design: "batch-early-stages" FFT parallelism.
+// For T total threads and FFT length n, each thread owns a contiguous
+// chunk of n/T elements.  All butterfly stages where len ≤ n/(2T) are
+// data-independent across chunks and can run in one barrier-free dispatch
+// (BATCH_EARLY).  Only the final log₂T stages need inter-chunk barriers.
+// This reduces barrier count from O(log n) to O(log T) per FFT call.
+//
+// Additionally, Steps 1, 3, 5 (O(n) DWT/post-square), Step 6 (HI
+// correction), and Step 7 (carry via two-pass speculative algorithm) are
+// all dispatched to the team, so nearly all work is parallelised.
+// ============================================================
+struct FftTeam {
+    struct WorkPhase {
+        enum class Kind : uint8_t {
+            BIT_REVERSAL,  // parallel bit-reversal permutation
+            BUTTERFLY,     // single butterfly stage (late stages only)
+            BATCH_EARLY,   // all early butterfly stages within each thread's chunk
+            DWT_PACK,      // Step 1:  hr[k]=wfi[2k]*d[2k]
+            POST_SQ_PRE,   // Step 3 inner loop: k=1..M/2
+            DWT_UNPACK     // Step 5:  d[2k]=hr[k]*wih[2k]
+        };
+        Kind          kind{Kind::BIT_REVERSAL};
+        double*       re{nullptr};    // hbuf_re / digits
+        double*       im{nullptr};    // hbuf_im
+        const size_t* bitrv{nullptr}; // bit-reversal table
+        const double* tw_re{nullptr}; // twiddles / w_fwd_inv / w_inv_half
+        const double* tw_im{nullptr}; // twiddles
+        double*       aux{nullptr};   // digits (DWT_PACK/UNPACK)
+        size_t n{0};     // array length
+        size_t len{0};   // butterfly len or BATCH_EARLY len_max
+        size_t step{0};  // butterfly step
+    };
+
+    unsigned nthreads{0};
+    std::unique_ptr<SpinBarrier> b_go;
+    std::unique_ptr<SpinBarrier> b_done;
+    WorkPhase                    phase{};
+    std::atomic<bool>            stop_flag{false};
+    std::vector<std::thread>     workers;
+
+    FftTeam(const FftTeam&)            = delete;
+    FftTeam& operator=(const FftTeam&) = delete;
+    FftTeam()                          = default;
+    FftTeam(FftTeam&&)                 = default;
+    FftTeam& operator=(FftTeam&&)      = default;
+
+    void init(unsigned nw, [[maybe_unused]] bool pin) {
+        nthreads = nw;
+        if (nw == 0u) return;
+        const auto N = static_cast<ptrdiff_t>(nw + 1u);
+        b_go   = std::make_unique<SpinBarrier>(N);
+        b_done = std::make_unique<SpinBarrier>(N);
+        workers.reserve(nw);
+        for (unsigned id = 1u; id <= nw; ++id) {
+            workers.emplace_back(&FftTeam::worker_loop, this, id);
+#ifdef __linux__
+            if (pin) {
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                CPU_SET(static_cast<int>(id % std::thread::hardware_concurrency()),
+                        &cpuset);
+                pthread_setaffinity_np(workers.back().native_handle(),
+                                       sizeof(cpuset), &cpuset);
+            }
+#endif
+        }
+    }
+
+    ~FftTeam() {
+        if (workers.empty()) return;
+        stop_flag.store(true, std::memory_order_release);
+        b_go->arrive_and_wait();
+        for (auto& t : workers) t.join();
+    }
+
+    void dispatch(const WorkPhase& p) {
+        phase = p;
+        b_go->arrive_and_wait();
+        execute_slice(0u);
+        b_done->arrive_and_wait();
+    }
+
+private:
+    void worker_loop(unsigned tid) {
+        for (;;) {
+            b_go->arrive_and_wait();
+            if (stop_flag.load(std::memory_order_acquire)) {
+                b_done->arrive_and_drop();
+                return;
+            }
+            execute_slice(tid);
+            b_done->arrive_and_wait();
+        }
+    }
+
+    // Helper: one butterfly block [start, start+2*len).
+    static inline void butterfly_block(double* re, double* im,
+                                       const double* tw_re, const double* tw_im,
+                                       size_t start, size_t len, size_t step) {
+        for (size_t k = 0; k < len; ++k) {
+            const size_t m  = k * step;
+            const double wr = tw_re[m];
+            const double wi = tw_im[m];
+            const size_t u  = start + k;
+            const size_t v  = u + len;
+            const double tr = wr * re[v] - wi * im[v];
+            const double ti = wr * im[v] + wi * re[v];
+            re[v] = re[u] - tr;
+            im[v] = im[u] - ti;
+            re[u] = re[u] + tr;
+            im[u] = im[u] + ti;
+        }
+    }
+
+    void execute_slice(unsigned tid) {
+        const unsigned total = nthreads + 1u;
+        const WorkPhase& p   = phase;
+
+        switch (p.kind) {
+
+        case WorkPhase::Kind::BIT_REVERSAL: {
+            const size_t chunk = (p.n + total - 1u) / total;
+            const size_t lo    = static_cast<size_t>(tid) * chunk;
+            const size_t hi    = std::min(lo + chunk, p.n);
+            for (size_t j = lo; j < hi; ++j) {
+                const size_t r = p.bitrv[j];
+                if (r > j) {
+                    std::swap(p.re[j], p.re[r]);
+                    std::swap(p.im[j], p.im[r]);
+                }
+            }
+            break;
+        }
+
+        case WorkPhase::Kind::BUTTERFLY: {
+            const size_t n          = p.n;
+            const size_t len        = p.len;
+            const size_t step       = p.step;
+            const size_t num_blocks = n / (2u * len);
+            if (num_blocks >= static_cast<size_t>(total)) {
+                const size_t bchunk = (num_blocks + total - 1u) / total;
+                const size_t b_lo   = static_cast<size_t>(tid) * bchunk;
+                const size_t b_hi   = std::min(b_lo + bchunk, num_blocks);
+                for (size_t b = b_lo; b < b_hi; ++b)
+                    butterfly_block(p.re, p.im, p.tw_re, p.tw_im,
+                                    b * 2u * len, len, step);
+            } else {
+                const size_t kchunk = (len + total - 1u) / total;
+                const size_t k_lo   = static_cast<size_t>(tid) * kchunk;
+                const size_t k_hi   = std::min(k_lo + kchunk, len);
+                for (size_t start = 0; start < n; start += 2u * len) {
+                    for (size_t k = k_lo; k < k_hi; ++k) {
+                        const size_t m  = k * step;
+                        const double wr = p.tw_re[m];
+                        const double wi = p.tw_im[m];
+                        const size_t u  = start + k;
+                        const size_t v  = u + len;
+                        const double tr = wr * p.re[v] - wi * p.im[v];
+                        const double ti = wr * p.im[v] + wi * p.re[v];
+                        p.re[v] = p.re[u] - tr;
+                        p.im[v] = p.im[u] - ti;
+                        p.re[u] = p.re[u] + tr;
+                        p.im[u] = p.im[u] + ti;
+                    }
+                }
+            }
+            break;
+        }
+
+        // BATCH_EARLY: each thread owns chunk [lo, hi) and processes ALL early
+        // butterfly stages len=1..len_max completely independently (no cross-chunk
+        // data access guaranteed).  Only one barrier needed for the whole batch.
+        case WorkPhase::Kind::BATCH_EARLY: {
+            const size_t n       = p.n;
+            const size_t len_max = p.len;
+            const size_t half_n  = n >> 1;
+            const size_t chunk   = n / total;
+            const size_t lo      = static_cast<size_t>(tid) * chunk;
+            const size_t hi      = lo + chunk;
+            for (size_t len = 1u; len <= len_max; len <<= 1) {
+                const size_t step = half_n / len;
+                for (size_t start = lo; start < hi; start += 2u * len)
+                    butterfly_block(p.re, p.im, p.tw_re, p.tw_im, start, len, step);
+            }
+            break;
+        }
+
+        // Step 1: DWT + pack hbuf_re/im from digits via w_fwd_inv.
+        case WorkPhase::Kind::DWT_PACK: {
+            const size_t chunk = (p.n + total - 1u) / total;
+            const size_t lo    = static_cast<size_t>(tid) * chunk;
+            const size_t hi    = std::min(lo + chunk, p.n);
+            const double* wfi  = p.tw_re;   // w_fwd_inv
+            const double* d    = p.aux;     // digits (input)
+            for (size_t k = lo; k < hi; ++k) {
+                p.re[k] = wfi[2u * k]      * d[2u * k];
+                p.im[k] = wfi[2u * k + 1u] * d[2u * k + 1u];
+            }
+            break;
+        }
+
+        // Step 3: fused post-process + pointwise square + pre-process, k=1..M/2.
+        // (k=0 DC+Nyquist case is handled sequentially by main before dispatch.)
+        case WorkPhase::Kind::POST_SQ_PRE: {
+            const size_t M       = p.n;
+            const size_t total_k = M / 2u;
+            const size_t kchunk  = (total_k + total - 1u) / total;
+            const size_t k_lo    = 1u + static_cast<size_t>(tid) * kchunk;
+            const size_t k_hi    = std::min(k_lo + kchunk, 1u + total_k);
+            for (size_t k = k_lo; k < k_hi; ++k) {
+                const size_t mk    = M - k;
+                const double zk_re = p.re[k],  zk_im = p.im[k];
+                const double zm_re = p.re[mk], zm_im = p.im[mk];
+                const double pr    = (zk_re + zm_re) * 0.5;
+                const double pi    = (zk_im - zm_im) * 0.5;
+                const double qr    = (zk_im + zm_im) * 0.5;
+                const double qi    = (zm_re - zk_re) * 0.5;
+                const double wr    = p.tw_re[k];
+                const double wi    = p.tw_im[k];
+                const double xk_re = pr + wr * qr - wi * qi;
+                const double xk_im = pi + wr * qi + wi * qr;
+                const double yk_re = xk_re * xk_re - xk_im * xk_im;
+                const double yk_im = xk_re * xk_im * 2.0;
+                if (mk == k) {
+                    p.re[k] = yk_re;
+                    p.im[k] = -yk_im;
+                } else {
+                    const double xm_re = pr - (wr * qr - wi * qi);
+                    const double xm_im = -pi + (wr * qi + wi * qr);
+                    const double ym_re = xm_re * xm_re - xm_im * xm_im;
+                    const double ym_im = xm_re * xm_im * 2.0;
+                    const double ep_re = (yk_re + ym_re) * 0.5;
+                    const double ep_im = (yk_im - ym_im) * 0.5;
+                    const double vk_re = yk_re - ym_re;
+                    const double vk_im = yk_im + ym_im;
+                    const double t1    = (wi * vk_re - wr * vk_im) * 0.5;
+                    const double t2    = (wr * vk_re + wi * vk_im) * 0.5;
+                    p.re[k]  = ep_re + t1;
+                    p.im[k]  = ep_im + t2;
+                    p.re[mk] = ep_re - t1;
+                    p.im[mk] = -ep_im + t2;
+                }
+            }
+            break;
+        }
+
+        // Step 5: unpack hbuf_re/im → digits via w_inv_half.
+        case WorkPhase::Kind::DWT_UNPACK: {
+            const size_t chunk = (p.n + total - 1u) / total;
+            const size_t lo    = static_cast<size_t>(tid) * chunk;
+            const size_t hi    = std::min(lo + chunk, p.n);
+            const double* wih  = p.tw_re;   // w_inv_half
+            double* d          = p.aux;     // digits (output)
+            for (size_t k = lo; k < hi; ++k) {
+                d[2u * k]      = p.re[k] * wih[2u * k];
+                d[2u * k + 1u] = p.im[k] * wih[2u * k + 1u];
+            }
+            break;
+        }
+
+        } // switch
+    }
+};
+
 struct FftMersenneState {
     uint32_t p{0};
     size_t   n{0};         // transform length (power of 2)
@@ -1002,6 +1400,10 @@ struct FftMersenneState {
 
     // Diagnostic.
     double max_roundoff{0.0};
+
+    // Intra-FFT thread team.  Non-null when LL_FFT_THREADS > 1 and n/2 is
+    // large enough to amortize synchronization overhead.
+    std::unique_ptr<FftTeam> team;
 };
 
 // Choose smallest n = 2^k satisfying the error bound.
@@ -1131,6 +1533,17 @@ static void fft_mersenne_init_tables(FftMersenneState& st) {
     st.w_inv_half.resize(n);
     for (size_t j = 0; j < n; ++j)
         st.w_inv_half[j] = 2.0 * st.w_inv[j];   // = w_fwd[j] / (n/2)
+
+    // ---- Intra-FFT thread team ----
+    // Activate when LL_FFT_THREADS > 1 and half_n meets the minimum size.
+    {
+        const FftMtConfig& cfg = get_fft_mt_config();
+        if (cfg.nthreads > 1u && M >= cfg.min_half_n) {
+            st.team = std::make_unique<FftTeam>();
+            // Worker count = cfg.nthreads - 1 (main is thread 0).
+            st.team->init(cfg.nthreads - 1u, cfg.pin_threads);
+        }
+    }
 }
 
 // In-place iterative Cooley–Tukey DIT FFT of length n (must be power of 2).
@@ -1178,6 +1591,72 @@ static void fft_core(double* __restrict__ re, double* __restrict__ im,
     }
 }
 
+// Multi-threaded fft_core using the batch-early-stages strategy.
+//
+// For T total threads and FFT length n:
+//   len_max = largest power-of-2 ≤ n / (2T)
+//   chunk   = n / T  (thread's private contiguous region)
+//
+// Barriers per call:
+//   1 (bit-reversal) + 1 (batch-early) + log₂T (late stages)
+//   = 2 + log₂T,  e.g. 4 for T=4  (vs log₂n ≈ 12–16 without batching).
+//
+// Falls back to single-threaded fft_core when team is null or n is not
+// cleanly divisible by T (non-power-of-2 thread counts with small n).
+static void fft_core_mt(double* re, double* im,
+                         const size_t* bitrv,
+                         const double* tw_re,
+                         const double* tw_im,
+                         size_t n,
+                         FftTeam* team) {
+    if (!team || team->nthreads == 0u) {
+        fft_core(re, im, bitrv, tw_re, tw_im, n);
+        return;
+    }
+
+    const unsigned T      = team->nthreads + 1u;
+    const size_t   half_n = n >> 1;
+
+    // len_max: largest power-of-2 len where the chunk [lo,lo+n/T) is
+    // self-contained across all stages len=1..len_max.
+    // Requires n divisible by T; fall back to serial otherwise.
+    if (n % T != 0u) {
+        fft_core(re, im, bitrv, tw_re, tw_im, n);
+        return;
+    }
+    const size_t chunk    = n / T;
+    const size_t len_max  = chunk >> 1;  // = n / (2T)
+
+    // Phase 1: bit-reversal (parallel).
+    {
+        FftTeam::WorkPhase p;
+        p.kind  = FftTeam::WorkPhase::Kind::BIT_REVERSAL;
+        p.re    = re;  p.im = im;  p.bitrv = bitrv;  p.n = n;
+        team->dispatch(p);
+    }
+
+    // Phase 2: all early stages len=1..len_max in one dispatch per thread
+    // (no inter-thread data dependencies within this batch).
+    if (len_max >= 1u) {
+        FftTeam::WorkPhase p;
+        p.kind  = FftTeam::WorkPhase::Kind::BATCH_EARLY;
+        p.re    = re;  p.im = im;
+        p.tw_re = tw_re;  p.tw_im = tw_im;
+        p.n     = n;  p.len = len_max;
+        team->dispatch(p);
+    }
+
+    // Phases 3+: late stages (inter-chunk butterflies), one dispatch each.
+    for (size_t len = (len_max >= 1u ? len_max * 2u : 1u); len < n; len <<= 1) {
+        FftTeam::WorkPhase p;
+        p.kind  = FftTeam::WorkPhase::Kind::BUTTERFLY;
+        p.re    = re;  p.im = im;
+        p.tw_re = tw_re;  p.tw_im = tw_im;
+        p.n     = n;  p.len = len;  p.step = half_n / len;
+        team->dispatch(p);
+    }
+}
+
 // Carmack-inspired IEEE-754 exponent manipulation:
 // Computes x * 2^{-b} by directly subtracting b from the biased exponent
 // field of the IEEE-754 double, avoiding a floating-point multiply entirely.
@@ -1218,164 +1697,157 @@ static void fft_square(FftMersenneState& st) {
     const size_t M = st.half_n;   // = n/2
     double*       hr  = st.hbuf_re.data();
     double*       hi  = st.hbuf_im.data();
-    const double* twr = st.tw_re.data();   // n-point twiddles used in post/pre step
+    const double* twr = st.tw_re.data();
     const double* twi = st.tw_im.data();
+    FftTeam* team = st.team.get();
 
     // ---- Step 1: DWT + pack ----
-    // z[k] = w_fwd_inv[2k]*d[2k]  +  i * w_fwd_inv[2k+1]*d[2k+1]
-    {
+    if (team) {
+        FftTeam::WorkPhase p;
+        p.kind  = FftTeam::WorkPhase::Kind::DWT_PACK;
+        p.re    = hr;  p.im = hi;
+        p.tw_re = st.w_fwd_inv.data();
+        p.aux   = st.digits.data();
+        p.n     = M;
+        team->dispatch(p);
+    } else {
         const double* wfi = st.w_fwd_inv.data();
         const double* d   = st.digits.data();
         for (size_t k = 0; k < M; ++k) {
-            hr[k] = wfi[2 * k]     * d[2 * k];
-            hi[k] = wfi[2 * k + 1] * d[2 * k + 1];
+            hr[k] = wfi[2u * k]      * d[2u * k];
+            hi[k] = wfi[2u * k + 1u] * d[2u * k + 1u];
         }
     }
 
     // ---- Step 2: n/2-point forward FFT ----
-    fft_core(hr, hi,
-             st.bitrv_half.data(),
-             st.tw_re_half.data(), st.tw_im_half.data(),
-             M);
+    fft_core_mt(hr, hi,
+                st.bitrv_half.data(),
+                st.tw_re_half.data(), st.tw_im_half.data(),
+                M, team);
 
-    // ---- Step 3: Fused postprocess + pointwise square + preprocess ----
-    //
-    // For k=0 (DC + Nyquist), the algebra simplifies:
-    //   X[0] = Z[0].re + Z[0].im   (real)
-    //   X[M] = Z[0].re - Z[0].im   (real)
-    //   Z'[0].re = (Y[0]+Y[M])/2,  Z'[0].im = (Y[0]-Y[M])/2
+    // ---- Step 3: fused postprocess + pointwise square + preprocess ----
+    // k=0 (DC + Nyquist): always on main thread.
     {
         const double a = hr[0], b = hi[0];
-        const double x0 = a + b,  xm = a - b;
+        const double x0 = a + b, xm = a - b;
         const double y0 = x0 * x0, ym = xm * xm;
         hr[0] = (y0 + ym) * 0.5;
         hi[0] = (y0 - ym) * 0.5;
     }
-
-    // For k = 1 .. M/2, process pairs (k, M-k) simultaneously.
-    // Twiddle identities: tw_re[M-k] = -tw_re[k],  tw_im[M-k] = tw_im[k].
-    // This lets us compute Z'[k] and Z'[M-k] using only tw_re[k]/tw_im[k].
-    for (size_t k = 1; k <= M / 2; ++k) {
-        const size_t mk = M - k;
-
-        const double zk_re = hr[k],  zk_im = hi[k];
-        const double zm_re = hr[mk], zm_im = hi[mk];
-
-        // ---- postprocess: X[k] = E[k] + W_k * O[k] ----
-        const double p_re = (zk_re + zm_re) * 0.5;
-        const double p_im = (zk_im - zm_im) * 0.5;
-        const double q_re = (zk_im + zm_im) * 0.5;
-        const double q_im = (zm_re - zk_re) * 0.5;   // = -(zk_re - zm_re)/2
-
-        // n-point twiddle W_k (valid for k <= M/2 = n/4, within the n/2-entry table).
-        const double wr = twr[k];
-        const double wi = twi[k];
-
-        const double xk_re = p_re + wr * q_re - wi * q_im;
-        const double xk_im = p_im + wr * q_im + wi * q_re;
-
-        // ---- square Y[k] = X[k]^2 ----
-        const double yk_re = xk_re * xk_re - xk_im * xk_im;
-        const double yk_im = xk_re * xk_im * 2.0;
-
-        if (mk == k) {
-            // k = M/2: self-paired (only one unique value).
-            // At k=M/2: wr = cos(-π/2) = 0, wi = sin(-π/2) = -1.
-            // V.re = 0, V.im = 2*yk_im  →  Z'[k].re = yk_re, Z'[k].im = -yk_im.
-            hr[k] = yk_re;
-            hi[k] = -yk_im;
-        } else {
-            // ---- postprocess X[M-k], using twiddle identities ----
-            const double xm_re = p_re - (wr * q_re - wi * q_im);
-            const double xm_im = -p_im + (wr * q_im + wi * q_re);
-
-            // ---- square Y[M-k] = X[M-k]^2 ----
-            const double ym_re = xm_re * xm_re - xm_im * xm_im;
-            const double ym_im = xm_re * xm_im * 2.0;
-
-            // ---- preprocess Z'[k] and Z'[M-k] ----
-            // E'[k] = (Y[k]+Y*[M-k])/2,  V[k] = Y[k]-Y*[M-k]
-            // t1 = (wi*V.re - wr*V.im)/2,  t2 = (wr*V.re + wi*V.im)/2
-            // Z'[k].re = E'.re + t1,  Z'[k].im = E'.im + t2
-            // Z'[M-k].re = E'.re - t1 (tw_re[M-k] = -wr)
-            // Z'[M-k].im = -E'.im + t2 (tw_im[M-k] = wi)
-            const double ep_re = (yk_re + ym_re) * 0.5;
-            const double ep_im = (yk_im - ym_im) * 0.5;
-            const double vk_re = yk_re - ym_re;
-            const double vk_im = yk_im + ym_im;
-            const double t1 = (wi * vk_re - wr * vk_im) * 0.5;
-            const double t2 = (wr * vk_re + wi * vk_im) * 0.5;
-
-            hr[k]  = ep_re + t1;
-            hi[k]  = ep_im + t2;
-            hr[mk] = ep_re - t1;
-            hi[mk] = -ep_im + t2;
+    // k=1..M/2: parallel when team available.
+    if (team) {
+        FftTeam::WorkPhase p;
+        p.kind  = FftTeam::WorkPhase::Kind::POST_SQ_PRE;
+        p.re    = hr;  p.im = hi;
+        p.tw_re = twr;  p.tw_im = twi;
+        p.n     = M;
+        team->dispatch(p);
+    } else {
+        for (size_t k = 1; k <= M / 2; ++k) {
+            const size_t mk    = M - k;
+            const double zk_re = hr[k],  zk_im = hi[k];
+            const double zm_re = hr[mk], zm_im = hi[mk];
+            const double pr    = (zk_re + zm_re) * 0.5;
+            const double pi_   = (zk_im - zm_im) * 0.5;
+            const double qr    = (zk_im + zm_im) * 0.5;
+            const double qi    = (zm_re - zk_re) * 0.5;
+            const double wr    = twr[k];
+            const double wi    = twi[k];
+            const double xk_re = pr + wr * qr - wi * qi;
+            const double xk_im = pi_ + wr * qi + wi * qr;
+            const double yk_re = xk_re * xk_re - xk_im * xk_im;
+            const double yk_im = xk_re * xk_im * 2.0;
+            if (mk == k) {
+                hr[k] = yk_re;
+                hi[k] = -yk_im;
+            } else {
+                const double xm_re = pr - (wr * qr - wi * qi);
+                const double xm_im = -pi_ + (wr * qi + wi * qr);
+                const double ym_re = xm_re * xm_re - xm_im * xm_im;
+                const double ym_im = xm_re * xm_im * 2.0;
+                const double ep_re = (yk_re + ym_re) * 0.5;
+                const double ep_im = (yk_im - ym_im) * 0.5;
+                const double vk_re = yk_re - ym_re;
+                const double vk_im = yk_im + ym_im;
+                const double t1    = (wi * vk_re - wr * vk_im) * 0.5;
+                const double t2    = (wr * vk_re + wi * vk_im) * 0.5;
+                hr[k]  = ep_re + t1;
+                hi[k]  = ep_im + t2;
+                hr[mk] = ep_re - t1;
+                hi[mk] = -ep_im + t2;
+            }
         }
     }
 
-    // ---- Step 4: n/2-point inverse FFT (unnormalized) ----
-    fft_core(hr, hi,
-             st.bitrv_half.data(),
-             st.tw_re_half.data(), st.tw_im_half_inv.data(),
-             M);
+    // ---- Step 4: n/2-point inverse FFT ----
+    fft_core_mt(hr, hi,
+                st.bitrv_half.data(),
+                st.tw_re_half.data(), st.tw_im_half_inv.data(),
+                M, team);
 
     // ---- Step 5: Unpack + inverse DWT ----
-    // d[2k]   = hr[k] * w_inv_half[2k]     (= hr[k] * 2 * w_inv[2k])
-    // d[2k+1] = hi[k] * w_inv_half[2k+1]
-    {
+    if (team) {
+        FftTeam::WorkPhase p;
+        p.kind  = FftTeam::WorkPhase::Kind::DWT_UNPACK;
+        p.re    = hr;  p.im = hi;
+        p.tw_re = st.w_inv_half.data();
+        p.aux   = st.digits.data();
+        p.n     = M;
+        team->dispatch(p);
+    } else {
         const double* wih = st.w_inv_half.data();
         double*       d   = st.digits.data();
         for (size_t k = 0; k < M; ++k) {
-            d[2 * k]     = hr[k] * wih[2 * k];
-            d[2 * k + 1] = hi[k] * wih[2 * k + 1];
+            d[2u * k]      = hr[k] * wih[2u * k];
+            d[2u * k + 1u] = hi[k] * wih[2u * k + 1u];
         }
     }
 
-    // ---- Step 6: Half-integer correction (unchanged) ----
-    for (size_t k = 0; k < n; ++k) {
-        const double v    = st.digits[k];
-        const double frac = v - std::floor(v);
-        if (std::abs(frac - 0.5) < 0.25) {
-            st.digits[k] = std::floor(v);
-            const size_t kp = (k == 0) ? (n - 1) : (k - 1);
-            st.digits[kp] += 0.5 * st.mod_pow[kp];
+    // ---- Step 6: Half-integer correction (serial) ----
+    // Sequential by design: correction at k writes to d[k-1], which was
+    // already read in the previous iteration.  The carry propagation in
+    // Step 7 also has strict left-to-right data dependencies.  Both steps
+    // are O(n) and are dominated by the O(n log n) FFT (Steps 2 and 4),
+    // so running them serially does not materially affect overall throughput.
+    {
+        double* d = st.digits.data();
+        for (size_t k = 0; k < n; ++k) {
+            const double v    = d[k];
+            const double frac = v - std::floor(v);
+            if (std::abs(frac - 0.5) < 0.25) {
+                d[k] = std::floor(v);
+                const size_t kp = (k == 0u) ? (n - 1u) : (k - 1u);
+                d[kp] += 0.5 * st.mod_pow[kp];
+            }
         }
     }
 
-    // ---- Step 7: Carry propagation ----
-    // Uses precomputed inv_mod_pow (Carmack principle: precompute reciprocal,
-    // multiply instead of divide in the hot loop) and std::nearbyint (maps to
-    // a single VROUNDSD instruction, faster than std::round which handles
-    // ±∞/NaN edge cases we never encounter here).
-    double carry   = 0.0;
+    // ---- Step 7: Carry propagation (serial) ----
     double max_err = 0.0;
     {
         const double* mp  = st.mod_pow.data();
         const double* imp = st.inv_mod_pow.data();
         double*       d   = st.digits.data();
+        double carry = 0.0;
         for (size_t j = 0; j < n; ++j) {
             const double raw     = d[j] + carry;
             const double rounded = std::nearbyint(raw);
             const double err     = std::abs(raw - rounded);
             if (err > max_err) max_err = err;
-            carry = std::floor(rounded * imp[j]);   // multiply beats divide
+            carry = std::floor(rounded * imp[j]);
             d[j]  = rounded - carry * mp[j];
         }
-    }
-
-    // Wrap-around: carry * 2^p ≡ carry (mod M_p).
-    if (carry != 0.0) {
-        const double* mp  = st.mod_pow.data();
-        const double* imp = st.inv_mod_pow.data();
-        double*       d   = st.digits.data();
-        double carry2 = carry;
-        for (size_t j = 0; j < n && carry2 != 0.0; ++j) {
-            const double raw_j     = d[j] + carry2;
-            const double rounded_j = std::nearbyint(raw_j);
-            const double err_j     = std::abs(raw_j - rounded_j);
-            if (err_j > max_err) max_err = err_j;
-            carry2 = std::floor(rounded_j * imp[j]);
-            d[j]   = rounded_j - carry2 * mp[j];
+        // Wrap-around: carry * 2^p ≡ carry (mod M_p).
+        if (carry != 0.0) {
+            double carry2 = carry;
+            for (size_t j = 0; j < n && carry2 != 0.0; ++j) {
+                const double raw_j     = d[j] + carry2;
+                const double rounded_j = std::nearbyint(raw_j);
+                const double err_j     = std::abs(raw_j - rounded_j);
+                if (err_j > max_err) max_err = err_j;
+                carry2 = std::floor(rounded_j * imp[j]);
+                d[j]   = rounded_j - carry2 * mp[j];
+            }
         }
     }
 

@@ -393,6 +393,8 @@ jobs:
           LL_SWEEP_MODE=power_bucket_primes \
           LL_BUCKET_N=${{ matrix.bucket_n }} \
           LL_THREADS=${{ inputs.threads }} \
+          LL_FFT_THREADS=2 \
+          LL_FFT_ALLOW_NESTED=1 \
           LL_DRY_RUN=${{ inputs.dry_run && '1' || '0' }} \
           LL_REVERSE_ORDER=${{ inputs.reverse_order && '1' || '0' }} \
           LL_RESUME_FROM_EXPONENT=${{ matrix.batch_min_exponent }} \

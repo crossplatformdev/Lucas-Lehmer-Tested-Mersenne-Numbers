@@ -123,6 +123,8 @@ jobs:
           LL_STOP_AFTER_N_CASES=${{ inputs.stop_after_n_cases }} \
           LL_DRY_RUN=${{ inputs.dry_run && '1' || '0' }} \
           LL_OUTPUT_DIR=discover_out/ \
+          LL_FFT_THREADS=2 \
+          LL_FFT_ALLOW_NESTED=1 \
           GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
           ./bin/bignum 0 ${{ inputs.threads }}
 
@@ -203,6 +205,8 @@ jobs:
           LL_STOP_AFTER_N_CASES=${{ inputs.stop_after_n_cases }} \
           LL_DRY_RUN=${{ inputs.dry_run && '1' || '0' }} \
           LL_OUTPUT_DIR=discover_out/ \
+          LL_FFT_THREADS=2 \
+          LL_FFT_ALLOW_NESTED=1 \
           GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
           ./bin/bignum 0 ${{ inputs.threads }}
 
