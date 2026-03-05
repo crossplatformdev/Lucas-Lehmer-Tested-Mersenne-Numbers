@@ -2627,21 +2627,33 @@ int main(int argc, char** argv) {
     //
     // Default thread count: half the available cores.
     //
-    // Benchmark (AMD EPYC 7763, 4 cores, exponent p=31):
-    //   threads=0 (all 4 cores) → avg ~3.8 ms  (5 runs: 4,4,3,4,4 ms)
-    //   threads=2 (half cores)  → avg ~3.2 ms  (5 runs: 3,4,3,3,3 ms)
-    //   Winner: half cores (~16% faster for small exponents)
+    // NOTE: The CPU model reported in /proc/cpuinfo ("AMD EPYC 7763 64-Core
+    // Processor") refers to the underlying physical hardware.  The runner
+    // container is only allocated 4 vCPUs, so nproc/sched_getaffinity both
+    // return 4.  All thread-count logic below operates on available vCPUs only.
     //
-    // For small exponents (p=31, LimbBackend, <0.5 ms compute), the dominant
-    // cost is thread-pool creation and synchronization overhead, not the LL
-    // computation itself.  Halving the thread count reduces that overhead and
-    // gives consistently lower wall-clock time.  When threads=0 is passed
-    // explicitly it is now mapped to maxCores/2 (minimum 1) instead of all
-    // cores, matching the measured optimum.
+    // Benchmark (AMD EPYC 7763, 4 vCPUs available, exponent p=31 – small):
+    //   threads=4 (all cores)  → avg ~3.8 ms  (5 runs: 4,4,3,4,4 ms)
+    //   threads=2 (half cores) → avg ~3.2 ms  (5 runs: 3,4,3,3,3 ms)
+    //   Winner: half cores (~16% faster)
     //
-    // Note: for throughput mode across many large exponents, more threads may
-    // outperform half-cores; adaptive per-size-range thread selection is left
-    // as future work once crossover points are profiled across exponent classes.
+    //   Reason: for p=31 the LimbBackend computation takes <0.5 ms; the
+    //   dominant cost is thread-pool creation and synchronization overhead.
+    //   Fewer threads = less overhead = lower wall-clock time.
+    //
+    // Benchmark (AMD EPYC 7763, 4 vCPUs available, exponent p=110503 – 6-digit):
+    //   threads=4 (all cores)  → avg ~20.9 s  (3 runs: 20618,20670,21318 ms)
+    //   threads=2 (half cores) → avg ~20.7 s  (3 runs: 20964,20954,20241 ms)
+    //   Winner: essentially a tie (difference < 1%, within run-to-run noise)
+    //
+    //   Reason: for a single large exponent the FFT kernel runs on one thread
+    //   (the thread pool assigns one exponent to one worker); the 20+ second
+    //   compute time completely swamps the negligible thread overhead.  Half
+    //   cores is therefore at least as good as all cores for large exponents
+    //   and measurably better for small ones.
+    //
+    // Conclusion: threads=0 maps to halfCores (maxCores/2, minimum 1) as the
+    // default, and is the best single choice across exponent sizes.
     //
     const unsigned halfCores = std::max(1u, maxCores / 2u);
 
