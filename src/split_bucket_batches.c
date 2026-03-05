@@ -418,6 +418,14 @@ static BatchVec apply_prime_half(const BatchVec *m, int prime_half)
                 if (end_idx < primes.size)
                     partial.batch_max_exponent = primes.data[end_idx];
                 free(primes.data);
+                /* Regenerate worker_name to reflect the trimmed end ordinal/exponent. */
+                snprintf(partial.worker_name, WORKER_NAME_MAX,
+                         "bucket-%02d-batch-%04zu-%04zu-exp-%" PRIu64 "-%" PRIu64,
+                         partial.bucket_n,
+                         partial.batch_prime_start_index + 1,
+                         end_idx + 1,
+                         partial.batch_min_exponent,
+                         partial.batch_max_exponent);
                 batch_push(&result, &partial);
             }
             seen += take;
@@ -451,6 +459,14 @@ static BatchVec apply_prime_half(const BatchVec *m, int prime_half)
                 if (new_start_idx < primes.size)
                     partial.batch_min_exponent = primes.data[new_start_idx];
                 free(primes.data);
+                /* Regenerate worker_name to reflect the advanced start ordinal/exponent. */
+                snprintf(partial.worker_name, WORKER_NAME_MAX,
+                         "bucket-%02d-batch-%04zu-%04zu-exp-%" PRIu64 "-%" PRIu64,
+                         partial.bucket_n,
+                         new_start_idx + 1,
+                         partial.batch_prime_end_index + 1,
+                         partial.batch_min_exponent,
+                         partial.batch_max_exponent);
                 batch_push(&result, &partial);
             } else {
                 batch_push(&result, b);

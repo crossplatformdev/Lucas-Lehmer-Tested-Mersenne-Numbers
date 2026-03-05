@@ -347,10 +347,27 @@ jobs:
 
           BATCH_COUNT=$(echo "${BATCH_MATRIX}" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))")
 
+          # Check total chunk count so a manual run at chunk_index=0 can warn the
+          # user if the sweep has additional chunks that won't be processed.
+          CHUNK_TOTAL_INFO=$(bin/split_bucket_batches \
+            --bucket-start         "${START}" \
+            --bucket-end           "${END}" \
+            --target-workers       "${{ inputs.target_workers }}" \
+            --time-limit-seconds   "${TIME_LIMIT_SEC}" \
+            --resume-from-exponent "${EFFECTIVE_RESUME}" \
+            --prime-half           "${{ inputs.prime_half }}" \
+            --chunk-size           "${CHUNK_SIZE}" \
+            --count-chunks)
+          TOTAL_CHUNK_COUNT=$(echo "${CHUNK_TOTAL_INFO}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['chunk_count'])")
+
+          if (( TOTAL_CHUNK_COUNT > 1 && CHUNK_INDEX == 0 )); then
+            echo "::warning title=Partial sweep::This sweep has ${TOTAL_CHUNK_COUNT} chunks of ${CHUNK_SIZE} batches each. Only chunk 0 is being run. Use the prime-sweep-wrapper-chunked.yml workflow, or re-run with --chunk-index 1 through $((TOTAL_CHUNK_COUNT - 1)) to cover all batches."
+          fi
+
           echo "batch_matrix=${BATCH_MATRIX}"           >> "$GITHUB_OUTPUT"
           echo "batch_count=${BATCH_COUNT}"              >> "$GITHUB_OUTPUT"
           echo "effective_resume=${EFFECTIVE_RESUME}"    >> "$GITHUB_OUTPUT"
-          echo "Total batches in this chunk: ${BATCH_COUNT}"
+          echo "Total batches in this chunk: ${BATCH_COUNT} (chunk ${CHUNK_INDEX} of ${TOTAL_CHUNK_COUNT})"
 
   # ──────────────────────────────────────────────────────────
   # Stage 2: Build – compile the binary once and cache it

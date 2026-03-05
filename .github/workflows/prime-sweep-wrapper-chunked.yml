@@ -102,8 +102,8 @@ jobs:
             exit 1
           fi
           CHUNK_SIZE="${{ inputs.chunk_size }}"
-          if ! [[ "$CHUNK_SIZE" =~ ^[0-9]+$ ]] || (( CHUNK_SIZE < 1 )); then
-            echo "::error::chunk_size must be a positive integer, got '${CHUNK_SIZE}'."
+          if ! [[ "$CHUNK_SIZE" =~ ^[0-9]+$ ]] || (( CHUNK_SIZE < 1 || CHUNK_SIZE > 256 )); then
+            echo "::error::chunk_size must be an integer in [1,256], got '${CHUNK_SIZE}'."
             exit 1
           fi
           echo "Input validated: buckets ${MIN}..${TOP}, sweep_range='${{ inputs.sweep_range }}'"
@@ -178,6 +178,18 @@ print(json.dumps([{'chunk_index': str(i)} for i in range(n)]))")
           echo "effective_resume=${EFFECTIVE_RESUME}" >> "$GITHUB_OUTPUT"
 
           echo "Total batches: ${TOTAL_BATCHES}  →  ${CHUNK_COUNT} chunk(s) of <= ${{ inputs.chunk_size }}"
+
+          # Warn when chunk_count is very large.  Each chunk spawns one matrix
+          # job (plus overhead jobs) in this workflow run.  GitHub Actions allows
+          # at most 256 matrix entries per strategy block; if chunk_count exceeds
+          # that the sweep_chunk matrix itself would fail at plan time.
+          if (( CHUNK_COUNT > 256 )); then
+            echo "::error title=Too many chunks::chunk_count=${CHUNK_COUNT} exceeds the GitHub Actions matrix limit of 256. Increase --chunk-size (currently ${{ inputs.chunk_size }}) or narrow the bucket range."
+            exit 1
+          fi
+          if (( CHUNK_COUNT > 50 )); then
+            echo "::warning title=Large chunk count::chunk_count=${CHUNK_COUNT} is large. Each chunk spawns a separate sweep run. Consider increasing chunk_size to reduce the number of orchestration jobs."
+          fi
 
           # Print workflow run link for audit.
           echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
