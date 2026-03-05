@@ -4,8 +4,22 @@ name: Prime Sweep Wrapper
 # (64 Buckets) workflow and presents the merged results report at the end.
 #
 # Inputs:
+#   sweep_range – which portion of the prime exponents to test:
+#                   Full       = all primes in [bucket_min, bucket_top]
+#                   Upper Half = the upper half by count (ascending order)
+#                   Lower Half = the lower half by count (ascending order)
 #   bucket_min  – first bucket to sweep  (1-64)
 #   bucket_top  – last  bucket to sweep  (bucket_min to 64)
+#
+# Half definition (used when sweep_range ≠ Full):
+#   All prime exponents in the selected bucket range are enumerated in
+#   ascending order.  The midpoint is total // 2.
+#   Lower Half = first  mid  primes  (indices 0 .. mid-1)
+#   Upper Half = last total-mid primes  (indices mid .. total-1)
+#
+# When bucket_min == bucket_top (single bucket) the primes within that one
+# bucket are split; running Lower Half and Upper Half in two separate manual
+# dispatches is equivalent to one Full run.
 #
 # The called workflow enforces the GitHub Actions matrix limit of 256 jobs,
 # so this wrapper guarantees no more than 256 parallel worker tasks are ever
@@ -14,6 +28,15 @@ name: Prime Sweep Wrapper
 on:
   workflow_dispatch:
     inputs:
+      sweep_range:
+        description: "Portion of prime exponents to test (primes ordered ascending by value)"
+        required: false
+        type: choice
+        default: "Full"
+        options:
+          - "Full"
+          - "Upper Half"
+          - "Lower Half"
       bucket_min:
         description: "Lower bucket start (1-64)"
         required: true
@@ -51,7 +74,7 @@ jobs:
   validate:
     runs-on: ubuntu-24.04
     steps:
-      - name: Validate bucket range
+      - name: Validate inputs
         run: |
           MIN="${{ inputs.bucket_min }}"
           TOP="${{ inputs.bucket_top }}"
@@ -73,7 +96,7 @@ jobs:
             echo "::error::target_workers must be a non-negative integer, got '${TARGET_WORKERS}'."
             exit 1
           fi
-          echo "Input validated: buckets ${MIN}..${TOP}"
+          echo "Input validated: buckets ${MIN}..${TOP}, sweep_range='${{ inputs.sweep_range }}'"
           echo "time_limit_minutes validated: ${TIME_LIMIT}"
           echo "target_workers validated: ${TARGET_WORKERS}"
 
@@ -91,6 +114,7 @@ jobs:
       auto_resume:        ${{ inputs.auto_resume }}
       time_limit_minutes: ${{ inputs.time_limit_minutes }}
       target_workers:     ${{ inputs.target_workers }}
+      prime_half:         ${{ inputs.sweep_range == 'Upper Half' && 'upper' || inputs.sweep_range == 'Lower Half' && 'lower' || 'full' }}
 
   # ──────────────────────────────────────────────────────────
   # Stage 3: Report – download the merged artifact produced by
@@ -129,6 +153,7 @@ jobs:
           {
             echo "## Prime Sweep Wrapper – Final Report"
             echo ""
+            echo "**Sweep range:** ${{ inputs.sweep_range }}"
             echo "**Buckets swept:** ${{ inputs.bucket_min }}–${{ inputs.bucket_top }}"
             echo "**Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo ""
