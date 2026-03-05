@@ -1,3 +1,6 @@
+/* Enable POSIX extensions for popen()/pclose(). */
+#define _POSIX_C_SOURCE 200809L
+
 /*
  * src/split_bucket_batches.c
  *
@@ -15,6 +18,10 @@
  *                        [--count-chunks]
  *                        [--dry-run]
  *                        [--output FILE] [--count-only]
+ *                        [--bignum-path PATH]
+ *                        [--threads N]
+ *                        [--fft-threads N]
+ *                        [--fft-allow-nested 0|1]
  *
  * Bucket definition (1-indexed, n in [1, 64]):
  *   B_1  = [2, 2]
@@ -31,9 +38,28 @@
  * --time-limit-seconds S
  *   Compute a per-bucket batch size using the inverse rule of three:
  *       batch_size = floor(S / worst_case_time_per_exponent)
- *   Timing data for buckets 9-16 is taken from benchmark measurements
- *   (REPORT_MERSENNE_EXPONENTS-256-65536.MD); buckets 17+ are extrapolated
- *   at ×4.5 per bucket.  The result is capped by --batch-size (default 1000).
+ *   When --bignum-path is provided the worst-case time is measured by running
+ *   the binary on the highest prime in each bucket; otherwise timing data for
+ *   buckets 9-16 is taken from benchmark measurements and buckets 17+ are
+ *   extrapolated at ×4.5 per bucket.  The result is capped by --batch-size
+ *   (default 1000).
+ *
+ * --bignum-path PATH
+ *   Path to the compiled bignum binary.  When combined with
+ *   --time-limit-seconds, the planner runs a single-exponent timing probe on
+ *   the highest prime in each requested bucket and uses the measured elapsed
+ *   time for accurate batch sizing.  Falls back to the built-in table on any
+ *   probe failure.  PATH must not contain shell metacharacters or spaces.
+ *
+ * --threads N  (default: 0 = all cores)
+ *   LL_THREADS value passed to the timing probe.  Should match the thread
+ *   count used by the actual worker jobs.
+ *
+ * --fft-threads N  (default: 2)
+ *   LL_FFT_THREADS value passed to the timing probe.
+ *
+ * --fft-allow-nested 0|1  (default: 1)
+ *   LL_FFT_ALLOW_NESTED value passed to the timing probe.
  *
  * --resume-from-exponent N
  *   Skip all prime exponents ≤ N.  Buckets whose last prime is ≤ N are
@@ -136,14 +162,6 @@ static double worst_sec_for_bucket(int n)
     return w;
 }
 
-/* Inverse rule of three: how many primes fit in time_limit_sec? */
-static size_t batch_size_for_bucket(int n, double time_limit_sec)
-{
-    double worst = worst_sec_for_bucket(n);
-    if (worst <= 0.0) return BATCH_SIZE_DEFAULT;
-    size_t sz = (size_t)(time_limit_sec / worst);
-    return sz < 1 ? 1 : sz;
-}
 
 /* =========================================================================
  * Primality test (trial division).
@@ -211,6 +229,124 @@ static U64Vec enumerate_bucket_primes(int n)
         }
     }
     return v;
+}
+
+/* Minimum measurable time in seconds.  Results below this threshold are
+ * treated as probe failures and the table estimate is used instead.
+ * Sub-millisecond exponents are trivially fast and the table is already
+ * accurate enough for batch sizing purposes.                           */
+#define MIN_MEASURABLE_SEC 0.001
+
+/* Maximum length (bytes) for the timing-probe path, including quotes and
+ * all surrounding flags.  Must be large enough for the longest realistic
+ * path; 4096 leaves ample room even for absolute paths in deep directories. */
+#define PROBE_CMD_BUF 4096
+
+/* =========================================================================
+ * Live timing probe.
+ *
+ * Runs the bignum binary on the highest prime in bucket n using the given
+ * thread configuration, parses the "Time: X.XXX s" output line, and returns
+ * the measured elapsed time in seconds.
+ *
+ * Returns -1.0 on any failure (binary not found, parse error, exponent too
+ * large for uint32, or measured time below MIN_MEASURABLE_SEC).  The caller
+ * should fall back to the built-in table in that case.
+ *
+ * bignum_path is validated to contain only safe filesystem characters
+ * (alphanumeric, '/', '.', '-', '_') before being embedded in the shell
+ * command, so the caller does not need to pre-validate the value.
+ * ========================================================================= */
+static double measure_bucket_sec(const char *bignum_path, int bucket_n,
+                                  int ll_threads, int fft_threads,
+                                  int fft_allow_nested)
+{
+    if (!bignum_path || !*bignum_path) return -1.0;
+
+    /* Validate path: only allow characters safe to embed in a shell command.
+     * This prevents command injection if a caller passes a malicious path.  */
+    for (const char *p = bignum_path; *p; p++) {
+        char c = *p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') ||
+              c == '/' || c == '.' || c == '-' || c == '_')) {
+            return -1.0;  /* unsafe character; refuse to proceed */
+        }
+    }
+
+    /* Find the highest prime in the bucket – that is the worst case. */
+    U64Vec primes = enumerate_bucket_primes(bucket_n);
+    if (primes.size == 0) { free(primes.data); return -1.0; }
+    uint64_t highest = primes.data[primes.size - 1];
+    free(primes.data);
+
+    /* The current bignum binary only handles exponents up to UINT32_MAX. */
+    if (highest > (uint64_t)0xFFFFFFFFU) return -1.0;
+
+    /* Build the shell command.  Environment variables and positional args:
+     *
+     *   LL_SWEEP_MODE=power_bucket_primes – bucket sweep mode
+     *   LL_BUCKET_N=N                     – only this bucket
+     *   LL_MAX_EXPONENTS_PER_JOB=1        – test exactly one exponent
+     *   LL_RESUME_FROM_EXPONENT=0         – always start from the beginning
+     *   LL_REVERSE_ORDER=1                – highest prime first
+     *   LL_THREADS=T                      – used when argv[2] is absent
+     *   LL_FFT_THREADS / LL_FFT_ALLOW_NESTED – FFT thread config
+     *   LL_PROGRESS=0, LL_BENCHMARK_MODE=1   – suppress extra output
+     *   LL_OUTPUT_DIR=                    – empty → write no result files
+     *
+     *   argv[1]=0   – start_index (ignored in bucket mode)
+     *   argv[2]=T   – thread count positional override; bignum gives argv[2]
+     *                 priority over LL_THREADS when argc >= 3, so both are
+     *                 set to the same value for consistency with worker jobs.
+     *
+     * Stderr is discarded; stdout (containing the "Time:" line) is captured.
+     */
+    char cmd[PROBE_CMD_BUF];
+    int len = snprintf(cmd, sizeof(cmd),
+             "LL_SWEEP_MODE=power_bucket_primes"
+             " LL_BUCKET_N=%d"
+             " LL_MAX_EXPONENTS_PER_JOB=1"
+             " LL_RESUME_FROM_EXPONENT=0"
+             " LL_REVERSE_ORDER=1"
+             " LL_THREADS=%d"
+             " LL_FFT_THREADS=%d"
+             " LL_FFT_ALLOW_NESTED=%d"
+             " LL_PROGRESS=0"
+             " LL_BENCHMARK_MODE=1"
+             " LL_OUTPUT_DIR="
+             " %s 0 %d 2>/dev/null",
+             bucket_n,
+             ll_threads, fft_threads, fft_allow_nested,
+             bignum_path,
+             ll_threads);
+    if (len < 0 || (size_t)len >= sizeof(cmd)) return -1.0;
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1.0;
+
+    /* Scan output for the "Time: X.XXX s" token produced by bignum's bucket
+     * sweep progress line:
+     *   "  M_P is prime|composite. Time: X.XXX s  residue: ..."      */
+    char line[512];
+    double measured = -1.0;
+    while (fgets(line, (int)sizeof(line), fp)) {
+        char *tok = strstr(line, "Time: ");
+        if (tok) {
+            double t;
+            if (sscanf(tok, "Time: %lf s", &t) == 1 && t >= 0.0) {
+                measured = t;
+                break;
+            }
+        }
+    }
+    pclose(fp);
+
+    /* Discard sub-millisecond results – the exponent is trivially fast and
+     * the table estimate is already fine for batch sizing. */
+    if (measured < MIN_MEASURABLE_SEC) return -1.0;
+
+    return measured;
 }
 
 /* =========================================================================
@@ -559,6 +695,11 @@ int main(int argc, char **argv)
     int         dry_run          = 0;
     int         count_only       = 0;
     const char *output_file      = NULL;
+    /* Live timing probe parameters (all optional). */
+    const char *bignum_path      = NULL;  /* --bignum-path PATH  */
+    int         ll_threads       = 0;     /* --threads N (0 = all cores) */
+    int         fft_threads      = 2;     /* --fft-threads N     */
+    int         fft_allow_nested = 1;     /* --fft-allow-nested  */
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--bucket-start")        && i + 1 < argc)
@@ -609,6 +750,14 @@ int main(int argc, char **argv)
             count_only     = 1;
         else if (!strcmp(argv[i], "--output")              && i + 1 < argc)
             output_file    = argv[++i];
+        else if (!strcmp(argv[i], "--bignum-path")         && i + 1 < argc)
+            bignum_path    = argv[++i];
+        else if (!strcmp(argv[i], "--threads")             && i + 1 < argc)
+            ll_threads     = (int)parse_nonneg_int("--threads", argv[++i]);
+        else if (!strcmp(argv[i], "--fft-threads")         && i + 1 < argc)
+            fft_threads    = (int)parse_positive_int("--fft-threads", argv[++i]);
+        else if (!strcmp(argv[i], "--fft-allow-nested")    && i + 1 < argc)
+            fft_allow_nested = (int)parse_nonneg_int("--fft-allow-nested", argv[++i]);
         else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
             return 1;
@@ -631,6 +780,43 @@ int main(int argc, char **argv)
                 "ERROR: --bucket-start (%d) must be <= --bucket-end (%d)\n",
                 bucket_start, bucket_end);
         return 1;
+    }
+
+    /* ── Step 1b: live timing calibration (when --bignum-path provided) ── */
+    /* Per-bucket array: measured_sec[n] > 0 means the probe succeeded.
+     * Only buckets [bucket_start, bucket_end] are probed.               */
+    double measured_sec[65];
+    for (int n = 0; n < 65; n++) measured_sec[n] = 0.0;
+
+    if (bignum_path && time_limit_sec > 0.0) {
+        fprintf(stderr,
+                "Timing calibration: probing highest prime per bucket"
+                " (%d bucket(s), threads=%d fft_threads=%d nested=%d)...\n",
+                bucket_end - bucket_start + 1,
+                ll_threads, fft_threads, fft_allow_nested);
+        for (int n = bucket_start; n <= bucket_end; n++) {
+            /* Report the prime being probed. */
+            U64Vec pv = enumerate_bucket_primes(n);
+            uint64_t highest = (pv.size > 0) ? pv.data[pv.size - 1] : 0;
+            free(pv.data);
+
+            fprintf(stderr, "  Bucket %2d  p=%-12" PRIu64 "  timing... ",
+                    n, highest);
+            fflush(stderr);
+
+            double t = measure_bucket_sec(bignum_path, n,
+                                          ll_threads, fft_threads,
+                                          fft_allow_nested);
+            if (t > 0.0) {
+                measured_sec[n] = t;
+                fprintf(stderr, "%.3f s  (measured)\n", t);
+            } else {
+                double fallback = worst_sec_for_bucket(n);
+                fprintf(stderr, "probe failed → table fallback: %.3f s\n",
+                        fallback);
+            }
+        }
+        fprintf(stderr, "Calibration complete.\n");
     }
 
     /* ── Step 1: count total remaining primes across all buckets ────────── */
@@ -666,11 +852,19 @@ int main(int argc, char **argv)
         /* Hard upper cap from --batch-size */
         if (bs > batch_size) bs = batch_size;
 
-        /* Per-bucket time-limit safety cap */
+        /* Per-bucket time-limit cap.
+         * Use the live-measured time for this bucket if the probe succeeded;
+         * otherwise fall back to the built-in table estimate.              */
         if (time_limit_sec > 0.0) {
-            size_t tl_bs = batch_size_for_bucket(n, time_limit_sec);
+            double worst = (measured_sec[n] > 0.0)
+                           ? measured_sec[n]
+                           : worst_sec_for_bucket(n);
+            size_t tl_bs = (worst > 0.0)
+                           ? (size_t)(time_limit_sec / worst)
+                           : BATCH_SIZE_DEFAULT;
             if (tl_bs < bs) bs = tl_bs;
         }
+        if (bs < 1) bs = 1;
 
         BatchVec bv = split_bucket_into_batches(n, bs, resume_from);
         for (size_t j = 0; j < bv.size; j++)
@@ -728,17 +922,26 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < filtered.size; i++) {
             const Batch *b = &filtered.data[i];
             if (time_limit_sec > 0.0) {
-                double w = worst_sec_for_bucket(b->bucket_n);
+                /* Show measured time when available, otherwise table estimate. */
+                double w;
+                const char *src;
+                if (measured_sec[b->bucket_n] > 0.0) {
+                    w   = measured_sec[b->bucket_n];
+                    src = "measured";
+                } else {
+                    w   = worst_sec_for_bucket(b->bucket_n);
+                    src = "estimated";
+                }
                 printf("  [%3zu/%3zu]  bucket=%2d"
                        "  primes=%6zu-%6zu"
                        "  exp=%" PRIu64 "-%" PRIu64
-                       "  size=%zu  est_worst=%.3fs/exp  est_max=%.2fh"
+                       "  size=%zu  worst=%.3fs/exp(%s)  est_max=%.2fh"
                        "  name=%s\n",
                        b->batch_index, b->batch_count,
                        b->bucket_n,
                        b->batch_prime_start_index, b->batch_prime_end_index,
                        b->batch_min_exponent, b->batch_max_exponent,
-                       b->batch_size, w,
+                       b->batch_size, w, src,
                        (double)b->batch_size * w / 3600.0,
                        b->worker_name);
             } else {

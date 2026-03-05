@@ -224,15 +224,48 @@ permissions:
 
 jobs:
   # ──────────────────────────────────────────────────────────
-  # Stage 1: Plan – validate inputs and build the batch matrix.
+  # Stage 1: Build – compile the binary first so the plan step
+  # can use it for live timing calibration.
+  # ──────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
+    timeout-minutes: 10
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute cache key
+        id: cache-key
+        run: |
+          echo "key=bignum-bucket-${{ hashFiles('src/BigNum.cpp', 'Makefile') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Build release binary
+        run: make all
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bignum-binary
+          path: bin/bignum
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 2: Plan – validate inputs and build the batch matrix.
   #
-  # The plan tool counts all remaining primes, then splits them
-  # into ceil(total / target_workers) primes per batch, targeting
-  # ~250 parallel workers.  The per-bucket time-limit cap ensures
-  # no single worker can exceed the 6-hour GitHub Actions limit.
-  # Already-tested exponents are skipped when auto_resume=true.
+  # Depends on build so the compiled binary is available for live
+  # timing calibration: the planner runs the binary on the highest
+  # prime in each requested bucket and uses the actual elapsed time
+  # to compute accurate batch sizes, replacing the extrapolated table.
   # ──────────────────────────────────────────────────────────
   plan:
+    needs: build
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
     outputs:
       batch_matrix:      ${{ steps.build-matrix.outputs.batch_matrix }}
@@ -287,6 +320,15 @@ jobs:
           mkdir -p bin
           gcc -std=c11 -O2 -o bin/split_bucket_batches src/split_bucket_batches.c -lm
 
+      - name: Download bignum binary for timing calibration
+        uses: actions/download-artifact@v4
+        with:
+          name: bignum-binary
+          path: bin/
+
+      - name: Make bignum executable
+        run: chmod +x bin/bignum
+
       - name: Auto-detect last tested exponent
         id: auto-resume
         run: |
@@ -326,8 +368,13 @@ jobs:
           TIME_LIMIT_SEC=$(( ${{ inputs.time_limit_minutes }} * 60 ))
           echo "Time limit per worker: ${TIME_LIMIT_SEC}s (${{ inputs.time_limit_minutes }} min)"
 
-          # Shared planner flags used for both dry-run audit and JSON matrix.
-          PLANNER_FLAGS=(
+          # Thread configuration – must match what the worker jobs will use.
+          # threads=0 means "all available cores" in both the probe and the workers.
+          THREADS="${{ inputs.threads }}"
+
+          # Base planner flags (no timing probe) – used for the dry-run audit
+          # and the chunk-count query so we don't run the probe multiple times.
+          PLANNER_FLAGS_BASE=(
             --bucket-start         "${START}"
             --bucket-end           "${END}"
             --target-workers       "${{ inputs.target_workers }}"
@@ -338,25 +385,33 @@ jobs:
             --chunk-index          "${CHUNK_INDEX}"
           )
 
-          # Print human-readable plan (always useful for audit).
-          bin/split_bucket_batches "${PLANNER_FLAGS[@]}" --dry-run
+          # Extended flags used only when generating the JSON matrix – adds the
+          # live timing probe so batch sizes are based on actual measured times.
+          PLANNER_FLAGS_TIMED=(
+            "${PLANNER_FLAGS_BASE[@]}"
+            --bignum-path          "bin/bignum"
+            --threads              "${THREADS}"
+            --fft-threads          "2"
+            --fft-allow-nested     "1"
+          )
 
-          # Generate the JSON matrix for this chunk (no 256-entry limit error;
-          # the planner handles chunking transparently).
-          BATCH_MATRIX=$(bin/split_bucket_batches "${PLANNER_FLAGS[@]}")
+          # Print human-readable plan using table estimates (fast, no live probe).
+          # PLANNER_FLAGS_BASE has no --bignum-path, so no timing runs here.
+          bin/split_bucket_batches "${PLANNER_FLAGS_BASE[@]}" --dry-run
+
+          # Generate the JSON matrix using live timing for accurate batch sizing.
+          # PLANNER_FLAGS_TIMED adds --bignum-path, triggering one timing probe per
+          # bucket.  Calibration messages go to stderr (visible in the log);
+          # stdout captures only the JSON.  The probe does NOT run a second time
+          # for the dry-run above or the count-chunks call below.
+          BATCH_MATRIX=$(bin/split_bucket_batches "${PLANNER_FLAGS_TIMED[@]}")
 
           BATCH_COUNT=$(echo "${BATCH_MATRIX}" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))")
 
           # Check total chunk count so a manual run at chunk_index=0 can warn the
           # user if the sweep has additional chunks that won't be processed.
           CHUNK_TOTAL_INFO=$(bin/split_bucket_batches \
-            --bucket-start         "${START}" \
-            --bucket-end           "${END}" \
-            --target-workers       "${{ inputs.target_workers }}" \
-            --time-limit-seconds   "${TIME_LIMIT_SEC}" \
-            --resume-from-exponent "${EFFECTIVE_RESUME}" \
-            --prime-half           "${{ inputs.prime_half }}" \
-            --chunk-size           "${CHUNK_SIZE}" \
+            "${PLANNER_FLAGS_BASE[@]}" \
             --count-chunks)
           TOTAL_CHUNK_COUNT=$(echo "${CHUNK_TOTAL_INFO}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['chunk_count'])")
 
@@ -368,39 +423,6 @@ jobs:
           echo "batch_count=${BATCH_COUNT}"              >> "$GITHUB_OUTPUT"
           echo "effective_resume=${EFFECTIVE_RESUME}"    >> "$GITHUB_OUTPUT"
           echo "Total batches in this chunk: ${BATCH_COUNT} (chunk ${CHUNK_INDEX} of ${TOTAL_CHUNK_COUNT})"
-
-  # ──────────────────────────────────────────────────────────
-  # Stage 2: Build – compile the binary once and cache it
-  # ──────────────────────────────────────────────────────────
-  build:
-    needs: plan
-    runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
-    timeout-minutes: 10
-    outputs:
-      cache-key: ${{ steps.cache-key.outputs.key }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Compute cache key
-        id: cache-key
-        run: |
-          echo "key=bignum-bucket-${{ hashFiles('src/BigNum.cpp', 'Makefile') }}" >> "$GITHUB_OUTPUT"
-
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y g++ make libboost-dev pkg-config
-
-      - name: Build release binary
-        run: make all
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: bignum-binary
-          path: bin/bignum
-          retention-days: 1
 
   # ──────────────────────────────────────────────────────────
   # Stage 3: Workers – one job per batch, targeting ~250 workers

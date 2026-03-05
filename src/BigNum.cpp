@@ -2117,6 +2117,14 @@ LLResult lucas_lehmer_ex(uint32_t p, bool progress, bool benchmark_mode,
 
 // ---- Discover-mode infrastructure ----
 
+// Minimum elapsed time (seconds) for a bucket exponent to trigger an
+// incremental checkpoint write.  Exponents below this threshold are fast
+// enough that the whole batch completes quickly; losing a few is cheap.
+// For large buckets (18+) every exponent far exceeds this limit, so
+// checkpoints always fire.  The threshold avoids O(n²) I/O growth for
+// small-bucket batches with thousands of fast exponents.
+static constexpr double kCheckpointMinElapsedSec = 5.0;
+
 // UTF-8 discovery banner prefix (fire+siren emoji: 🚨).
 static constexpr const char* kDiscoveryEmoji = "\xF0\x9F\x9A\xA8";
 
@@ -2959,7 +2967,7 @@ static int run_power_bucket_mode(int argc, char** argv) {
             // exponents finish in milliseconds and the whole batch completes
             // in seconds anyway.  For large buckets (18+) every exponent
             // comfortably exceeds the threshold, so the checkpoint always fires.
-            if (!bdir.empty() && results.back().elapsed_sec >= 5.0) {
+            if (!bdir.empty() && results.back().elapsed_sec >= kCheckpointMinElapsedSec) {
                 const std::string pfx = bdir + "bucket_" + std::to_string(n);
                 write_bucket_csv (pfx + "_results.csv",  results);
                 write_bucket_json(pfx + "_results.json", results,
