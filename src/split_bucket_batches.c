@@ -65,21 +65,21 @@
  * ========================================================================= */
 #define BUCKET_WORST_SEC_MAX 21   /* highest index in the table below */
 static const double BUCKET_WORST_SEC[BUCKET_WORST_SEC_MAX + 1] = {
-    /* 0  */ 0.001,  /* unused – bucket indices start at 1 */
-    /* 1  */ 0.001,  /* 2  */ 0.001,  /* 3  */ 0.001,  /* 4  */ 0.001,
-    /* 5  */ 0.001,  /* 6  */ 0.001,  /* 7  */ 0.001,  /* 8  */ 0.001,
-    /* 9  */ 0.001,  /* 10 */ 0.001,  /* measured: <1 ms            */
-    /* 11 */ 0.005,  /* measured                                     */
-    /* 12 */ 0.027,  /* measured                                     */
-    /* 13 */ 0.093,  /* measured                                     */
-    /* 14 */ 0.325,  /* measured                                     */
-    /* 15 */ 1.283,  /* measured                                     */
-    /* 16 */ 5.646,  /* measured                                     */
-    /* 17 */ 25.407, /* extrapolated: 5.646 × 4.5                   */
-    /* 18 */ 114.332,/* extrapolated: 25.407 × 4.5                  */
-    /* 19 */ 514.492,/* extrapolated: 114.332 × 4.5                 */
-    /* 20 */ 2315.213,/* extrapolated: 514.492 × 4.5                */
-    /* 21 */ 10418.458,/* extrapolated: 2315.213 × 4.5              */
+    /* 0  */ 0.000575,  /* unused – bucket indices start at 1 */
+    /* 1  */ 0.000575,  /* 2  */ 0.000575,  /* 3  */ 0.000575,  /* 4  */ 0.000575,
+    /* 5  */ 0.000575,  /* 6  */ 0.000575,  /* 7  */ 0.000575,  /* 8  */ 0.000575,
+    /* 9  */ 0.000575,  /* 10 */ 0.000575,  /* measured: <1 ms            */
+    /* 11 */ 0.002875,  /* measured                                     */
+    /* 12 */ 0.015525,  /* measured                                     */
+    /* 13 */ 0.053475,  /* measured                                     */
+    /* 14 */ 0.186875,  /* measured                                     */
+    /* 15 */ 0.737725,  /* measured                                     */
+    /* 16 */ 3.246450,  /* measured                                     */
+    /* 17 */ 14.609025, /* extrapolated: previous × 4.5                 */
+    /* 18 */ 65.740900, /* extrapolated: previous × 4.5                 */
+    /* 19 */ 295.832900,/* extrapolated: previous × 4.5                 */
+    /* 20 */ 1331.247475,/* extrapolated: previous × 4.5                */
+    /* 21 */ 5990.613350,/* extrapolated: previous × 4.5                */
 };
 #define BUCKET_WORST_GROWTH 4.5   /* extrapolation factor for buckets > 21 */
 
