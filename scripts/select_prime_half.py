@@ -141,6 +141,12 @@ def select_half(matrix: list, half: str) -> list:
                 partial["batch_min_exponent"] = new_min_exp
                 partial["batch_size"] = b["batch_size"] - skip_in_batch
                 partial["batch_prime_start_index"] = new_start_idx
+                # Regenerate worker_name (if present) so it reflects the new start.
+                old_worker_name = b.get("worker_name")
+                if old_worker_name is not None:
+                    partial["worker_name"] = (
+                        f"{old_worker_name}-upper-half-from-exp-{new_min_exp}-idx-{new_start_idx}"
+                    )
                 result.append(partial)
             else:
                 result.append(b)
