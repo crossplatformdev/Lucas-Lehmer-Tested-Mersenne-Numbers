@@ -42,10 +42,10 @@ def _all_exponents(matrix: list) -> list:
 
 class TestSelectHalfEmpty(unittest.TestCase):
     def test_empty_matrix_lower(self):
-        self.assertEqual(select_half([], "lower"), [])
+        self.assertEqual(select_half([], "lower_half"), [])
 
     def test_empty_matrix_upper(self):
-        self.assertEqual(select_half([], "upper"), [])
+        self.assertEqual(select_half([], "upper_half"), [])
 
 
 class TestSelectHalfInvalidArg(unittest.TestCase):
@@ -73,7 +73,7 @@ class TestSelectHalfSingleBucket(unittest.TestCase):
         matrix = self._matrix()
         all_primes = self._all_primes()
         mid = len(all_primes) // 2
-        lower = select_half(matrix, "lower")
+        lower = select_half(matrix, "lower_half")
         got = _all_exponents(lower)
         self.assertEqual(len(got), mid)
 
@@ -81,15 +81,15 @@ class TestSelectHalfSingleBucket(unittest.TestCase):
         matrix = self._matrix()
         all_primes = self._all_primes()
         mid = len(all_primes) // 2
-        upper = select_half(matrix, "upper")
+        upper = select_half(matrix, "upper_half")
         got = _all_exponents(upper)
         self.assertEqual(len(got), len(all_primes) - mid)
 
     def test_lower_plus_upper_covers_all(self):
         matrix = self._matrix()
         all_primes = self._all_primes()
-        lower = _all_exponents(select_half(matrix, "lower"))
-        upper = _all_exponents(select_half(matrix, "upper"))
+        lower = _all_exponents(select_half(matrix, "lower_half"))
+        upper = _all_exponents(select_half(matrix, "upper_half"))
         combined = lower + upper
         self.assertEqual(combined, all_primes)
 
@@ -97,24 +97,24 @@ class TestSelectHalfSingleBucket(unittest.TestCase):
         matrix = self._matrix()
         all_primes = self._all_primes()
         mid = len(all_primes) // 2
-        lower = _all_exponents(select_half(matrix, "lower"))
+        lower = _all_exponents(select_half(matrix, "lower_half"))
         self.assertEqual(lower, all_primes[:mid])
 
     def test_upper_is_second_half(self):
         matrix = self._matrix()
         all_primes = self._all_primes()
         mid = len(all_primes) // 2
-        upper = _all_exponents(select_half(matrix, "upper"))
+        upper = _all_exponents(select_half(matrix, "upper_half"))
         self.assertEqual(upper, all_primes[mid:])
 
     def test_lower_no_duplicates(self):
         matrix = self._matrix()
-        lower = _all_exponents(select_half(matrix, "lower"))
+        lower = _all_exponents(select_half(matrix, "lower_half"))
         self.assertEqual(len(lower), len(set(lower)))
 
     def test_upper_no_duplicates(self):
         matrix = self._matrix()
-        upper = _all_exponents(select_half(matrix, "upper"))
+        upper = _all_exponents(select_half(matrix, "upper_half"))
         self.assertEqual(len(upper), len(set(upper)))
 
     def test_partial_batch_lower_batch_size_correct(self):
@@ -123,7 +123,7 @@ class TestSelectHalfSingleBucket(unittest.TestCase):
         matrix = self._matrix(batch_size=10)
         all_primes = self._all_primes()
         mid = len(all_primes) // 2
-        lower = select_half(matrix, "lower")
+        lower = select_half(matrix, "lower_half")
         got = _all_exponents(lower)
         self.assertEqual(got, all_primes[:mid])
 
@@ -132,7 +132,7 @@ class TestSelectHalfSingleBucket(unittest.TestCase):
         matrix = self._matrix(batch_size=10)
         all_primes = self._all_primes()
         mid = len(all_primes) // 2
-        upper = select_half(matrix, "upper")
+        upper = select_half(matrix, "upper_half")
         got = _all_exponents(upper)
         self.assertEqual(got, all_primes[mid:])
 
@@ -143,8 +143,8 @@ class TestSelectHalfSingleBucket(unittest.TestCase):
         # Choose batch_size that divides mid exactly
         if mid > 0:
             matrix = self._matrix(batch_size=mid)
-            lower = _all_exponents(select_half(matrix, "lower"))
-            upper = _all_exponents(select_half(matrix, "upper"))
+            lower = _all_exponents(select_half(matrix, "lower_half"))
+            upper = _all_exponents(select_half(matrix, "upper_half"))
             self.assertEqual(lower, all_primes[:mid])
             self.assertEqual(upper, all_primes[mid:])
 
@@ -155,19 +155,19 @@ class TestSelectHalfTinyBuckets(unittest.TestCase):
     def test_single_prime_lower_is_empty(self):
         # Bucket 1 has exactly one prime: 2
         matrix = generate_batch_matrix(1, 1, batch_size=1000)
-        lower = select_half(matrix, "lower")
+        lower = select_half(matrix, "lower_half")
         self.assertEqual(lower, [])
 
     def test_single_prime_upper_has_prime(self):
         matrix = generate_batch_matrix(1, 1, batch_size=1000)
-        upper = _all_exponents(select_half(matrix, "upper"))
+        upper = _all_exponents(select_half(matrix, "upper_half"))
         self.assertEqual(upper, [2])
 
     def test_two_primes_even_split(self):
         # Bucket 2 has primes: 2, 3
         matrix = generate_batch_matrix(2, 2, batch_size=1000)
-        lower = _all_exponents(select_half(matrix, "lower"))
-        upper = _all_exponents(select_half(matrix, "upper"))
+        lower = _all_exponents(select_half(matrix, "lower_half"))
+        upper = _all_exponents(select_half(matrix, "upper_half"))
         self.assertEqual(lower, [2])
         self.assertEqual(upper, [3])
 
@@ -187,22 +187,22 @@ class TestSelectHalfMultiBucket(unittest.TestCase):
     def test_lower_plus_upper_covers_all(self):
         matrix = self._matrix()
         all_primes = self._all_primes()
-        lower = _all_exponents(select_half(matrix, "lower"))
-        upper = _all_exponents(select_half(matrix, "upper"))
+        lower = _all_exponents(select_half(matrix, "lower_half"))
+        upper = _all_exponents(select_half(matrix, "upper_half"))
         self.assertEqual(lower + upper, all_primes)
 
     def test_lower_count(self):
         matrix = self._matrix()
         all_primes = self._all_primes()
         mid = len(all_primes) // 2
-        lower = _all_exponents(select_half(matrix, "lower"))
+        lower = _all_exponents(select_half(matrix, "lower_half"))
         self.assertEqual(len(lower), mid)
 
     def test_upper_count(self):
         matrix = self._matrix()
         all_primes = self._all_primes()
         mid = len(all_primes) // 2
-        upper = _all_exponents(select_half(matrix, "upper"))
+        upper = _all_exponents(select_half(matrix, "upper_half"))
         self.assertEqual(len(upper), len(all_primes) - mid)
 
 
@@ -223,18 +223,18 @@ class TestSelectHalfCLI(unittest.TestCase):
         matrix = generate_batch_matrix(10, 10, batch_size=1000)
         all_primes = enumerate_bucket_primes(10)
         mid = len(all_primes) // 2
-        lower = _all_exponents(self._run("lower", matrix))
+        lower = _all_exponents(self._run("lower_half", matrix))
         self.assertEqual(lower, all_primes[:mid])
 
     def test_cli_upper(self):
         matrix = generate_batch_matrix(10, 10, batch_size=1000)
         all_primes = enumerate_bucket_primes(10)
         mid = len(all_primes) // 2
-        upper = _all_exponents(self._run("upper", matrix))
+        upper = _all_exponents(self._run("upper_half", matrix))
         self.assertEqual(upper, all_primes[mid:])
 
     def test_cli_empty_matrix(self):
-        lower = self._run("lower", [])
+        lower = self._run("lower_half", [])
         self.assertEqual(lower, [])
 
     def test_cli_invalid_arg_exits_nonzero(self):

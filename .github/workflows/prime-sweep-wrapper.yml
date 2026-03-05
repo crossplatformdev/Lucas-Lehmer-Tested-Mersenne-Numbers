@@ -114,7 +114,7 @@ jobs:
       auto_resume:        ${{ inputs.auto_resume }}
       time_limit_minutes: ${{ inputs.time_limit_minutes }}
       target_workers:     ${{ inputs.target_workers }}
-      prime_half:         ${{ inputs.sweep_range == 'upper_half' && 'upper' || inputs.sweep_range == 'lower_half' && 'lower' || 'full' }}
+      prime_half:         ${{ inputs.sweep_range }}
 
   # ──────────────────────────────────────────────────────────
   # Stage 3: Report – download the merged artifact produced by

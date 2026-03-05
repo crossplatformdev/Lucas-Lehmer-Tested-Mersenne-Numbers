@@ -108,7 +108,7 @@ on:
         type: string
         default: "0"
       prime_half:
-        description: "Which half of primes to test: full = all, lower = first half by count, upper = second half by count"
+        description: "Which half of primes to test: full = all, lower_half = first half by count, upper_half = second half by count"
         required: false
         type: string
         default: "full"
@@ -190,14 +190,14 @@ on:
         type: string
         default: "0"
       prime_half:
-        description: "Which half of primes to test: full = all, lower = first half by count (ascending), upper = second half by count"
+        description: "Which half of primes to test: full = all, lower_half = first half by count (ascending), upper_half = second half by count"
         required: false
         type: choice
         default: "full"
         options:
           - "full"
-          - "lower"
-          - "upper"
+          - "lower_half"
+          - "upper_half"
 
 permissions:
   contents: read
@@ -308,9 +308,9 @@ jobs:
             --time-limit-seconds    "${TIME_LIMIT_SEC}" \
             --resume-from-exponent  "${EFFECTIVE_RESUME}")
 
-          # Apply prime-half filter (lower / upper) when requested.
+          # Apply prime-half filter (lower_half / upper_half) when requested.
           PRIME_HALF="${{ inputs.prime_half }}"
-          if [ "${PRIME_HALF}" = "lower" ] || [ "${PRIME_HALF}" = "upper" ]; then
+          if [ "${PRIME_HALF}" = "lower_half" ] || [ "${PRIME_HALF}" = "upper_half" ]; then
             echo "Applying prime_half filter: ${PRIME_HALF}"
             BATCH_MATRIX=$(echo "${BATCH_MATRIX}" | python3 scripts/select_prime_half.py "${PRIME_HALF}")
           fi

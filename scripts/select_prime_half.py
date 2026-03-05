@@ -6,7 +6,7 @@ Filter a batch matrix JSON (as produced by split_bucket_batches) to include
 only the lower or upper half of the prime exponents, ordered ascending by value.
 
 Usage:
-    echo '<batch-matrix-json>' | python3 scripts/select_prime_half.py <lower|upper>
+    echo '<batch-matrix-json>' | python3 scripts/select_prime_half.py <lower_half|upper_half>
 
 Output:
     Filtered batch matrix JSON (suitable for use as a GitHub Actions matrix).
@@ -48,15 +48,15 @@ def select_half(matrix: list, half: str) -> list:
     Args:
         matrix: List of batch descriptor dicts, sorted ascending by exponent,
                 as produced by split_bucket_batches.
-        half:   'lower' or 'upper'.
+        half:   'lower_half' or 'upper_half'.
 
     Returns:
         Filtered list of batch descriptors covering the requested half.
         May be empty if the total prime count is 0 or the split produces an
-        empty side (e.g. single prime with half='lower').
+        empty side (e.g. single prime with half='lower_half').
     """
-    if half not in ("lower", "upper"):
-        raise ValueError(f"half must be 'lower' or 'upper', got {half!r}")
+    if half not in ("lower_half", "upper_half"):
+        raise ValueError(f"half must be 'lower_half' or 'upper_half', got {half!r}")
 
     if not matrix:
         return []
@@ -68,7 +68,7 @@ def select_half(matrix: list, half: str) -> list:
     # lower half: indices [0, mid-1], upper half: indices [mid, total-1]
     mid = total // 2
 
-    if half == "lower":
+    if half == "lower_half":
         if mid == 0:
             return []
 
@@ -157,10 +157,10 @@ def select_half(matrix: list, half: str) -> list:
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or sys.argv[1] not in ("lower", "upper"):
+    if len(sys.argv) != 2 or sys.argv[1] not in ("lower_half", "upper_half"):
         print(
             "Usage: echo '<batch-matrix-json>' | "
-            "python3 scripts/select_prime_half.py <lower|upper>",
+            "python3 scripts/select_prime_half.py <lower_half|upper_half>",
             file=sys.stderr,
         )
         sys.exit(1)
