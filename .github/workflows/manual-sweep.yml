@@ -132,14 +132,16 @@ jobs:
 
       - name: Run sweep
         env:
-          LL_SWEEP_MODE:    "${{ inputs.sweep_mode }}"
-          LL_MIN_EXPONENT:  "${{ inputs.min_exponent }}"
-          LL_MAX_EXPONENT:  "${{ inputs.max_exponent }}"
-          LL_SHARD_INDEX:   "${{ matrix.shard_index }}"
-          LL_SHARD_COUNT:   "${{ inputs.shard_count }}"
-          LL_REVERSE_ORDER: "${{ inputs.reverse_order }}"
-          LL_LARGEST_FIRST: "${{ inputs.largest_first }}"
-          LL_BENCH_OUTPUT:  "sweep_results_shard${{ matrix.shard_index }}.csv"
+          LL_SWEEP_MODE:        "${{ inputs.sweep_mode }}"
+          LL_MIN_EXPONENT:      "${{ inputs.min_exponent }}"
+          LL_MAX_EXPONENT:      "${{ inputs.max_exponent }}"
+          LL_SHARD_INDEX:       "${{ matrix.shard_index }}"
+          LL_SHARD_COUNT:       "${{ inputs.shard_count }}"
+          LL_REVERSE_ORDER:     "${{ inputs.reverse_order }}"
+          LL_LARGEST_FIRST:     "${{ inputs.largest_first }}"
+          LL_BENCH_OUTPUT:      "sweep_results_shard${{ matrix.shard_index }}.csv"
+          LL_FFT_THREADS:       "2"
+          LL_FFT_ALLOW_NESTED:  "1"
         run: |
           THREADS="${{ inputs.threads }}"
           MAX_CASES="${{ inputs.max_cases }}"

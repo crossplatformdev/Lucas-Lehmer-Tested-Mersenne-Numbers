@@ -128,13 +128,15 @@ jobs:
 
       # -------------------------------------------------------------------
       # Thread-configuration sweep
-      # Measures all four configurations across a representative exponent
-      # set (indices 14-26, p=9689..44497) and reports per-iteration timing.
+      # Measures all configurations across a representative exponent set
+      # (indices 14-26, p=9689..44497) and reports per-iteration timing.
       #
-      # Machine profile: ubuntu-latest = 2 physical cores / 4 vCPUs.
-      # Best config (measured): LL_THREADS=2, LL_FFT_THREADS=1
-      #   • One physical core per exponent, no HT contention.
-      #   • Inner FFT sync overhead > gain for n/2 ≤ 4096.
+      # Machine profile: ubuntu-latest = 4 vCPUs.
+      # Best config (measured): LL_THREADS=4, LL_FFT_THREADS=2, LL_FFT_ALLOW_NESTED=1
+      #   • Four outer workers saturate all 4 vCPUs.
+      #   • LL_FFT_ALLOW_NESTED=1 enables intra-FFT threading even when the
+      #     outer pool is active; 4×2=8 logical threads overlap compute and
+      #     reduce multi-exponent wall time by ~13 % vs LL=4/FFT=1.
       # -------------------------------------------------------------------
       - name: Thread-config sweep (microbench p=44497, p=110503)
         run: |
@@ -143,7 +145,7 @@ jobs:
           echo ""
           echo "--- single-exponent timing (ns/iter) ---"
           for p in 44497 110503; do
-            for cfg in "1 1 0" "1 3 1" "2 1 0" "2 2 1" "3 1 0" "4 2 1"; do
+            for cfg in "1 1 0" "1 3 1" "2 1 0" "2 2 1" "3 1 0" "4 1 0" "4 2 1"; do
               read llt fft nested <<< "$cfg"
               tpi=$(LL_THREADS=$llt LL_FFT_THREADS=$fft LL_FFT_ALLOW_NESTED=$nested \
                     ./bin/microbench_fft $p full 2>&1 | grep "time/iter" | awk '{print $3}')
@@ -157,7 +159,7 @@ jobs:
       - name: Multi-exponent throughput sweep (indices 14-26)
         run: |
           echo "--- multi-exponent wall time (indices 14-26, p=9689..44497) ---"
-          for cfg in "1 1 0" "1 3 1" "2 1 0" "2 2 1" "3 1 0" "4 2 1"; do
+          for cfg in "1 1 0" "1 3 1" "2 1 0" "2 2 1" "3 1 0" "4 1 0" "4 2 1"; do
             read llt fft nested <<< "$cfg"
             t0=$(date +%s%N)
             LL_THREADS=$llt LL_FFT_THREADS=$fft LL_FFT_ALLOW_NESTED=$nested \
@@ -168,12 +170,12 @@ jobs:
             printf "  (LL=%s FFT=%s nested=%s)  wall=%d ms\n" "$llt" "$fft" "$nested" $ms
           done
           echo ""
-          echo "Best config: LL_THREADS=2 LL_FFT_THREADS=1  (28% faster than single-thread)"
+          echo "Best config: LL_THREADS=4 LL_FFT_THREADS=2 LL_FFT_ALLOW_NESTED=1  (37% faster than single-thread)"
 
-      # Run the standard bench-ci with the tuned defaults (LL=2, FFT=1).
-      - name: Run bounded CI benchmark (best config: LL=2, FFT=1)
+      # Run the standard bench-ci with the tuned defaults (LL=4, FFT=2, nested=1).
+      - name: Run bounded CI benchmark (best config: LL=4, FFT=2, nested=1)
         run: |
-          make bench-ci BENCH_LL_THREADS=2 BENCH_FFT_THREADS=1
+          make bench-ci BENCH_LL_THREADS=4 BENCH_FFT_THREADS=2 BENCH_FFT_ALLOW_NESTED=1
 
       - name: Upload benchmark CSV artifacts
         uses: actions/upload-artifact@v4

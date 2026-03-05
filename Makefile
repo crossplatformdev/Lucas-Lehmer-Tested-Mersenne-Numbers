@@ -102,42 +102,44 @@ test: unit smoke regression
 # ---------------------------------------------------------------------------
 # bench-ci: bounded benchmark for CI (indices 14 … 26, p = 9689 … 44497).
 #
-# Thread configuration sweep (measured on 2-physical-core / 4-vCPU runner):
+# Thread configuration sweep (measured on 4-vCPU ubuntu-24.04 runner):
 #
-#   Config              single-exp ns/iter (p=44497)   multi-exp wall (14-26)
-#   (LL=1, FFT=1)       137,775 ns                     7,989 ms  ← baseline
-#   (LL=1, FFT=3)       137,935 ns                     8,084 ms  (FFT sync overhead > gain)
-#   (LL=2, FFT=1)       137,669 ns                     5,751 ms  ← BEST (28 % faster)
-#   (LL=2, FFT=2)       137,381 ns                     5,766 ms  (no gain over LL=2/FFT=1)
-#   (LL=3, FFT=1)       137,399 ns                     5,457 ms  (2nd best, slight gain)
-#   (LL=4, FFT=2)       138,326 ns                     5,133 ms  (over-subscribed on 2 cores)
+#   Config                        single-exp ns/iter (p=44497)   multi-exp wall (14-26)
+#   (LL=1, FFT=1, nested=0)       120,079 ns                     6,936 ms  ← baseline
+#   (LL=2, FFT=1, nested=0)       120,079 ns                     5,039 ms  (27 % faster)
+#   (LL=3, FFT=1, nested=0)         -                            4,825 ms
+#   (LL=4, FFT=1, nested=0)         -                            4,405 ms
+#   (LL=4, FFT=2, nested=1)       121,379 ns                     4,366 ms  ← BEST (37 % faster)
 #
-# Best config: LL_THREADS=2, LL_FFT_THREADS=1
-#   • One physical core per exponent — no HT contention.
-#   • Inner FFT MT (FFT>1) adds synchronisation overhead that outweighs
-#     the parallelism gain for n/2 ≤ 8192 on this 2-core runner.
-#   • Increasing outer LL_THREADS beyond 2 adds marginal gain (LL=3: 5,457 ms)
-#     but risks HT interference; LL=2 gives the best reliability/speed trade-off.
+# Best config: LL_THREADS=4, LL_FFT_THREADS=2, LL_FFT_ALLOW_NESTED=1
+#   • Four outer workers saturate all 4 vCPUs for multi-exponent throughput.
+#   • LL_FFT_ALLOW_NESTED=1 lets each FFT use 2 threads when nested under the
+#     outer pool; on a 4-vCPU machine the 4×2 = 8 logical threads overlap I/O
+#     and compute, reducing total wall time by ~13 % vs LL=4/FFT=1.
+#   • Single-exponent ns/iter is within noise (120 k vs 121 k) — the gain is
+#     entirely in multi-exponent throughput via better CPU utilisation.
 #
 # Override defaults at the command line:
-#   make bench-ci BENCH_LL_THREADS=3 BENCH_FFT_THREADS=1
+#   make bench-ci BENCH_LL_THREADS=2 BENCH_FFT_THREADS=1 BENCH_FFT_ALLOW_NESTED=0
 # ---------------------------------------------------------------------------
 # Tunable defaults (override on the make command line or in the environment).
-BENCH_LL_THREADS  ?= 2
-BENCH_FFT_THREADS ?= 1
+BENCH_LL_THREADS        ?= 4
+BENCH_FFT_THREADS       ?= 2
+BENCH_FFT_ALLOW_NESTED  ?= 1
 
 bench-ci: $(BIN)
 	@echo "=== CI benchmark (indices 14-26, 1 thread — baseline) ==="
 	@LL_STOP_AFTER_ONE=0 LL_MAX_EXPONENT_INDEX=27 \
-	    LL_FFT_THREADS=1 \
+	    LL_FFT_THREADS=1 LL_FFT_ALLOW_NESTED=0 \
 	    LL_BENCH_OUTPUT=bin/bench_ci_1t.csv ./$(BIN) $(BENCH_START_INDEX) 1
-	@echo "=== CI benchmark (indices 14-26, LL_THREADS=$(BENCH_LL_THREADS) FFT_THREADS=$(BENCH_FFT_THREADS) — optimised) ==="
+	@echo "=== CI benchmark (indices 14-26, LL_THREADS=$(BENCH_LL_THREADS) FFT_THREADS=$(BENCH_FFT_THREADS) nested=$(BENCH_FFT_ALLOW_NESTED) — optimised) ==="
 	@LL_STOP_AFTER_ONE=0 LL_MAX_EXPONENT_INDEX=27 \
 	    LL_FFT_THREADS=$(BENCH_FFT_THREADS) \
+	    LL_FFT_ALLOW_NESTED=$(BENCH_FFT_ALLOW_NESTED) \
 	    LL_BENCH_OUTPUT=bin/bench_ci_mt.csv \
 	    ./$(BIN) $(BENCH_START_INDEX) $(BENCH_LL_THREADS)
 	@echo "--- 1-thread CSV ---" && cat bin/bench_ci_1t.csv
-	@echo "--- optimised CSV (LL=$(BENCH_LL_THREADS) FFT=$(BENCH_FFT_THREADS)) ---" && cat bin/bench_ci_mt.csv
+	@echo "--- optimised CSV (LL=$(BENCH_LL_THREADS) FFT=$(BENCH_FFT_THREADS) nested=$(BENCH_FFT_ALLOW_NESTED)) ---" && cat bin/bench_ci_mt.csv
 
 # ---------------------------------------------------------------------------
 # bench: full interactive benchmark (1 thread vs max cores, start at index 14).
