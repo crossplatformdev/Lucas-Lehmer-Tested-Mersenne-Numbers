@@ -55,7 +55,7 @@ def select_half(matrix: list, half: str) -> list:
         May be empty if the total prime count is 0 or the split produces an
         empty side (e.g. single prime with half='lower').
     """
-    if half not in ("lower_half", "upper_half"):
+    if half not in ("lower", "upper"):
         raise ValueError(f"half must be 'lower' or 'upper', got {half!r}")
 
     if not matrix:
@@ -68,7 +68,7 @@ def select_half(matrix: list, half: str) -> list:
     # lower half: indices [0, mid-1], upper half: indices [mid, total-1]
     mid = total // 2
 
-    if half == "lower_half":
+    if half == "lower":
         if mid == 0:
             return []
 
