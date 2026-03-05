@@ -2951,6 +2951,20 @@ static int run_power_bucket_mode(int argc, char** argv) {
             }
 
             results.push_back(std::move(res));
+
+            // Incremental checkpoint: flush results to disk after each slow
+            // exponent (elapsed >= 5 s) so that already-completed work is
+            // preserved if the runner is preempted mid-batch.  The threshold
+            // avoids redundant O(n²) writes for small-bucket batches where
+            // exponents finish in milliseconds and the whole batch completes
+            // in seconds anyway.  For large buckets (18+) every exponent
+            // comfortably exceeds the threshold, so the checkpoint always fires.
+            if (!bdir.empty() && results.back().elapsed_sec >= 5.0) {
+                const std::string pfx = bdir + "bucket_" + std::to_string(n);
+                write_bucket_csv (pfx + "_results.csv",  results);
+                write_bucket_json(pfx + "_results.json", results,
+                                  n, br.lo, br.hi, run_url);
+            }
         }
 
         if (!bdir.empty()) {
