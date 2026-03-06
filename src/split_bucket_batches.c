@@ -22,6 +22,9 @@
  *                        [--threads N]
  *                        [--fft-threads N]
  *                        [--fft-allow-nested 0|1]
+ *                        [--exp-start N] [--exp-end N]
+ *                        [--fail-if-exceeds-seconds S]
+ *                        [--timing-check-only]
  *
  * Bucket definition (1-indexed, n in [1, 64]):
  *   B_1  = [2, 2]
@@ -107,6 +110,9 @@
 #define GITHUB_MATRIX_MAX   256
 #define BATCH_SIZE_DEFAULT  256
 #define WORKER_NAME_MAX     128
+/* Sentinel bucket_n value used by range-mode batches (--exp-start/--exp-end).
+ * Regular power-of-two buckets are 1-indexed (1..64), so 0 is unambiguous. */
+#define BUCKET_N_RANGE_MODE 0
 
 /* =========================================================================
  * Per-bucket worst-case single-exponent test time (seconds).
@@ -347,6 +353,95 @@ static double measure_bucket_sec(const char *bignum_path, int bucket_n,
     if (measured < MIN_MEASURABLE_SEC) return -1.0;
 
     return measured;
+}
+
+/* =========================================================================
+ * Range-mode timing probe.
+ *
+ * Like measure_bucket_sec(), but tests a caller-specified exponent using
+ * LL_SWEEP_MODE=p instead of power_bucket_primes.  Used for the 6-hour
+ * gate check in --exp-start / --exp-end range mode.
+ *
+ * Returns the measured elapsed time in seconds, or -1.0 on failure.
+ * ========================================================================= */
+static double measure_range_sec(const char *bignum_path, uint64_t exponent,
+                                 int ll_threads, int fft_threads,
+                                 int fft_allow_nested)
+{
+    if (!bignum_path || !*bignum_path) return -1.0;
+
+    /* Validate path: only allow characters safe to embed in a shell command. */
+    for (const char *p = bignum_path; *p; p++) {
+        char c = *p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') ||
+              c == '/' || c == '.' || c == '-' || c == '_')) {
+            return -1.0;
+        }
+    }
+
+    if (exponent > (uint64_t)0xFFFFFFFFU) return -1.0;
+
+    char cmd[PROBE_CMD_BUF];
+    int len = snprintf(cmd, sizeof(cmd),
+             "LL_SWEEP_MODE=p"
+             " LL_MIN_EXPONENT=%" PRIu64
+             " LL_MAX_EXPONENT=%" PRIu64
+             " LL_MAX_CASES=1"
+             " LL_THREADS=%d"
+             " LL_FFT_THREADS=%d"
+             " LL_FFT_ALLOW_NESTED=%d"
+             " LL_PROGRESS=0"
+             " LL_BENCHMARK_MODE=0"
+             " %s 0 %d 2>/dev/null",
+             exponent, exponent,
+             ll_threads, fft_threads, fft_allow_nested,
+             bignum_path,
+             ll_threads);
+    if (len < 0 || (size_t)len >= sizeof(cmd)) return -1.0;
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1.0;
+
+    char line[512];
+    double measured = -1.0;
+    while (fgets(line, (int)sizeof(line), fp)) {
+        char *tok = strstr(line, "Time: ");
+        if (tok) {
+            double t;
+            if (sscanf(tok, "Time: %lf s", &t) == 1 && t >= 0.0) {
+                measured = t;
+                break;
+            }
+        }
+    }
+    pclose(fp);
+
+    if (measured < MIN_MEASURABLE_SEC) return -1.0;
+    return measured;
+}
+
+/* =========================================================================
+ * Enumerate all prime exponents in [lo, hi] (arbitrary range), ascending.
+ * ========================================================================= */
+static U64Vec enumerate_range_primes(uint64_t lo, uint64_t hi)
+{
+    U64Vec v = {NULL, 0, 0};
+    if (lo > hi) return v;
+
+    uint64_t p = (lo < 2) ? 2 : lo;
+    if (p > 2 && (p & 1) == 0) p++;   /* advance to first odd if lo is even */
+
+    while (p <= hi) {
+        if (is_prime(p)) u64vec_push(&v, p);
+        if (p == 2) {
+            p = 3;
+        } else {
+            if (hi - p < 2) break;
+            p += 2;
+        }
+    }
+    return v;
 }
 
 /* =========================================================================
@@ -699,6 +794,11 @@ int main(int argc, char **argv)
     int         ll_threads       = 0;     /* --threads N (0 = all cores) */
     int         fft_threads      = 2;     /* --fft-threads N     */
     int         fft_allow_nested = 1;     /* --fft-allow-nested  */
+    /* Range mode: arbitrary [exp_range_start, exp_range_end] exponent range. */
+    uint64_t    exp_range_start  = 0;     /* --exp-start N (0 = not set) */
+    uint64_t    exp_range_end    = 0;     /* --exp-end N   (0 = not set) */
+    double      fail_if_exceeds  = 0.0;   /* --fail-if-exceeds-seconds S */
+    int         timing_check_only = 0;   /* --timing-check-only         */
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--bucket-start")        && i + 1 < argc)
@@ -757,10 +857,224 @@ int main(int argc, char **argv)
             fft_threads    = (int)parse_positive_int("--fft-threads", argv[++i]);
         else if (!strcmp(argv[i], "--fft-allow-nested")    && i + 1 < argc)
             fft_allow_nested = (int)parse_nonneg_int("--fft-allow-nested", argv[++i]);
+        else if (!strcmp(argv[i], "--exp-start")           && i + 1 < argc)
+            exp_range_start  = parse_nonneg_uint64("--exp-start", argv[++i]);
+        else if (!strcmp(argv[i], "--exp-end")             && i + 1 < argc)
+            exp_range_end    = parse_nonneg_uint64("--exp-end",   argv[++i]);
+        else if (!strcmp(argv[i], "--fail-if-exceeds-seconds") && i + 1 < argc)
+            fail_if_exceeds  = parse_nonneg_double("--fail-if-exceeds-seconds", argv[++i]);
+        else if (!strcmp(argv[i], "--timing-check-only"))
+            timing_check_only = 1;
         else {
             fprintf(stderr, "Unknown argument: %s\n", argv[i]);
             return 1;
         }
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * Range mode: --exp-start / --exp-end bypass the bucket system entirely.
+     * Primes are enumerated directly from [exp_range_start, exp_range_end].
+     * ═══════════════════════════════════════════════════════════════════════ */
+    if (exp_range_start > 0 || exp_range_end > 0) {
+        /* Validate range inputs. */
+        if (exp_range_start < 2) {
+            fprintf(stderr,
+                    "ERROR: --exp-start must be >= 2, got %" PRIu64 "\n",
+                    exp_range_start);
+            return 1;
+        }
+        if (exp_range_end < exp_range_start) {
+            fprintf(stderr,
+                    "ERROR: --exp-end (%" PRIu64
+                    ") must be >= --exp-start (%" PRIu64 ")\n",
+                    exp_range_end, exp_range_start);
+            return 1;
+        }
+
+        /* Enumerate all prime exponents in the range. */
+        U64Vec rprimes = enumerate_range_primes(exp_range_start, exp_range_end);
+
+        if (rprimes.size == 0) {
+            fprintf(stderr,
+                    "ERROR: no prime exponents found in [%" PRIu64 ", %" PRIu64 "]\n",
+                    exp_range_start, exp_range_end);
+            free(rprimes.data);
+            return 1;
+        }
+
+        /* ── Timing probe on the largest prime ── */
+        uint64_t largest_prime = rprimes.data[rprimes.size - 1];
+        double   probe_sec     = -1.0;
+
+        if (bignum_path) {
+            fprintf(stderr,
+                    "Range timing probe: p=%" PRIu64
+                    "  threads=%d fft_threads=%d nested=%d...\n",
+                    largest_prime, ll_threads, fft_threads, fft_allow_nested);
+            fflush(stderr);
+
+            probe_sec = measure_range_sec(bignum_path, largest_prime,
+                                          ll_threads, fft_threads,
+                                          fft_allow_nested);
+            if (probe_sec > 0.0) {
+                fprintf(stderr, "  p=%" PRIu64 "  measured: %.3f s  (%.2f h)\n",
+                        largest_prime, probe_sec, probe_sec / 3600.0);
+            } else {
+                fprintf(stderr, "  p=%" PRIu64 "  probe failed (using no estimate)\n",
+                        largest_prime);
+            }
+
+            /* Enforce 6-hour gate when --fail-if-exceeds-seconds is set. */
+            if (fail_if_exceeds > 0.0 && probe_sec > fail_if_exceeds) {
+                fprintf(stderr,
+                        "ERROR: largest prime M_%" PRIu64
+                        " took %.3f s (%.2f h), exceeds limit of"
+                        " %.0f s (%.2f h).  Aborting.\n",
+                        largest_prime,
+                        probe_sec, probe_sec / 3600.0,
+                        fail_if_exceeds, fail_if_exceeds / 3600.0);
+                free(rprimes.data);
+                return 1;
+            }
+        }
+
+        /* --timing-check-only: just report and exit. */
+        if (timing_check_only) {
+            printf("largest_prime=%" PRIu64 "\n", largest_prime);
+            if (probe_sec > 0.0)
+                printf("time_sec=%.3f\n", probe_sec);
+            else
+                printf("time_sec=unknown\n");
+            printf("total_primes=%zu\n", rprimes.size);
+            free(rprimes.data);
+            return 0;
+        }
+
+        /* ── Compute global batch size from target_workers ── */
+        size_t total_primes = rprimes.size;
+        size_t bs;
+        if (target_workers > 0 && total_primes > 0) {
+            /* ceil(total / target_workers) to cover all primes */
+            bs = (total_primes + target_workers - 1) / target_workers;
+        } else {
+            bs = batch_size;
+        }
+        if (bs < 1) bs = 1;
+
+        /* ── Build batch matrix ── */
+        BatchVec rmatrix = {NULL, 0, 0};
+        /* Use ceil-division so the last batch captures any remainder. */
+        size_t num_batches = (total_primes + bs - 1) / bs;
+        for (size_t i = 0; i < num_batches; i++) {
+            size_t start_idx = i * bs;
+            size_t end_idx   = start_idx + bs - 1;
+            if (end_idx >= total_primes) end_idx = total_primes - 1;
+            size_t actual_bs = end_idx - start_idx + 1;
+
+            Batch b;
+            b.bucket_n                = BUCKET_N_RANGE_MODE; /* 0 = range mode */
+            b.bucket_min              = exp_range_start;
+            b.bucket_max              = exp_range_end;
+            b.batch_index             = i;
+            b.batch_count             = num_batches;
+            b.batch_prime_start_index = start_idx;
+            b.batch_prime_end_index   = end_idx;
+            b.batch_min_exponent      = rprimes.data[start_idx];
+            b.batch_max_exponent      = rprimes.data[end_idx];
+            b.batch_size              = actual_bs;
+
+            snprintf(b.worker_name, WORKER_NAME_MAX,
+                     "range-batch-%04zu-%04zu-exp-%" PRIu64 "-%" PRIu64,
+                     start_idx + 1, end_idx + 1,
+                     b.batch_min_exponent, b.batch_max_exponent);
+
+            batch_push(&rmatrix, &b);
+        }
+
+        free(rprimes.data);
+
+        /* Cap at GitHub Actions matrix hard limit. */
+        if (rmatrix.size > GITHUB_MATRIX_MAX)
+            rmatrix.size = GITHUB_MATRIX_MAX;
+
+        /* --count-only */
+        if (count_only) {
+            printf("%zu\n", rmatrix.size);
+            free(rmatrix.data);
+            return 0;
+        }
+
+        /* --count-chunks */
+        if (count_chunks_mode) {
+            size_t num_chunks = (rmatrix.size + chunk_sz - 1) / chunk_sz;
+            printf("{\"total_batches\":%zu,\"chunk_size\":%zu,\"chunk_count\":%zu}\n",
+                   rmatrix.size, chunk_sz, num_chunks);
+            free(rmatrix.data);
+            return 0;
+        }
+
+        /* --dry-run */
+        if (dry_run) {
+            printf("exp_start            : %" PRIu64 "\n", exp_range_start);
+            printf("exp_end              : %" PRIu64 "\n", exp_range_end);
+            printf("total_primes         : %zu\n", total_primes);
+            if (target_workers > 0)
+                printf("target_workers       : %zu\n", target_workers);
+            printf("batch_size           : %zu\n", bs);
+            printf("total_batches        : %zu\n", rmatrix.size);
+            if (probe_sec > 0.0)
+                printf("largest_prime_time   : %.3f s  (%.2f h)\n",
+                       probe_sec, probe_sec / 3600.0);
+            printf("\n");
+            for (size_t i = 0; i < rmatrix.size; i++) {
+                const Batch *b = &rmatrix.data[i];
+                printf("  [%3zu/%3zu]  primes=%6zu-%6zu"
+                       "  exp=%" PRIu64 "-%" PRIu64
+                       "  size=%zu  name=%s\n",
+                       b->batch_index, b->batch_count,
+                       b->batch_prime_start_index, b->batch_prime_end_index,
+                       b->batch_min_exponent, b->batch_max_exponent,
+                       b->batch_size, b->worker_name);
+            }
+            free(rmatrix.data);
+            return 0;
+        }
+
+        /* Normal mode: output JSON for requested chunk. */
+        size_t slice_start = chunk_index * chunk_sz;
+        size_t slice_end   = slice_start + chunk_sz;
+
+        if (!chunking_enabled && rmatrix.size > GITHUB_MATRIX_MAX) {
+            fprintf(stderr,
+                    "ERROR: %zu batches exceeds the GitHub Actions matrix limit"
+                    " of %d.  Use --chunk-size / --chunk-index.\n",
+                    rmatrix.size, GITHUB_MATRIX_MAX);
+            free(rmatrix.data);
+            return 1;
+        }
+
+        if (slice_start >= rmatrix.size && rmatrix.size > 0) {
+            fprintf(stderr,
+                    "ERROR: --chunk-index %zu is out of range"
+                    " (total filtered batches: %zu, chunk_size: %zu)\n",
+                    chunk_index, rmatrix.size, chunk_sz);
+            free(rmatrix.data);
+            return 1;
+        }
+
+        FILE *rout = stdout;
+        if (output_file) {
+            rout = fopen(output_file, "w");
+            if (!rout) {
+                perror("fopen");
+                free(rmatrix.data);
+                return 1;
+            }
+        }
+        print_json_matrix_slice(rout, &rmatrix, slice_start, slice_end);
+        if (output_file) fclose(rout);
+        free(rmatrix.data);
+        return 0;
     }
 
     /* Validate */

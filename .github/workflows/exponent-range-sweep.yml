@@ -1,0 +1,351 @@
+name: Exponent Range Sweep
+
+# Manual-only workflow: tests all prime exponents in an arbitrary [low_cap, high_cap]
+# range, distributing them across up to 256 parallel workers.
+#
+# Inputs:
+#   low_cap   – lower bound of the exponent range (inclusive, must be ≥ 2)
+#   high_cap  – upper bound of the exponent range (inclusive, must be ≥ low_cap)
+#   workers   – number of parallel workers (1–256, default: 256)
+#   threads   – LL threads per worker job (0 = all cores, default: 0)
+#   dry_run   – print the exponent plan only, do not run LL tests
+#   progress  – enable per-exponent iteration progress output
+#
+# Workflow stages:
+#   1. validate – reject invalid inputs early
+#   2. build    – compile the binary and the plan tool once
+#   3. plan     – probe the LARGEST prime in the range (6-hour gate), then
+#                  build the worker batch matrix
+#   4. worker   – up to 256 parallel jobs, each runs LL_SWEEP_MODE=p on its
+#                  assigned sub-range of prime exponents
+#   5. merge    – concatenate all worker CSVs and write a markdown summary
+
+on:
+  workflow_dispatch:
+    inputs:
+      low_cap:
+        description: "Lower bound of exponent range (inclusive, ≥ 2)"
+        required: true
+        type: string
+      high_cap:
+        description: "Upper bound of exponent range (inclusive, ≥ low_cap)"
+        required: true
+        type: string
+      workers:
+        description: "Number of parallel workers (1–256)"
+        required: false
+        type: string
+        default: "256"
+      threads:
+        description: "Worker threads per job (0 = all cores)"
+        required: false
+        type: string
+        default: "0"
+      dry_run:
+        description: "Print exponent plan only – do not run Lucas-Lehmer tests"
+        required: false
+        type: boolean
+        default: false
+      progress:
+        description: "Enable per-exponent iteration progress output"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # Stage 1: Validate – reject invalid inputs early.
+  # ──────────────────────────────────────────────────────────
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate inputs
+        run: |
+          LOW="${{ inputs.low_cap }}"
+          HIGH="${{ inputs.high_cap }}"
+          WORKERS="${{ inputs.workers }}"
+
+          if ! [[ "$LOW" =~ ^[0-9]+$ ]]; then
+            echo "::error::low_cap must be a non-negative integer, got '${LOW}'."
+            exit 1
+          fi
+          if ! [[ "$HIGH" =~ ^[0-9]+$ ]]; then
+            echo "::error::high_cap must be a non-negative integer, got '${HIGH}'."
+            exit 1
+          fi
+          if (( LOW < 2 )); then
+            echo "::error::low_cap must be >= 2, got ${LOW}."
+            exit 1
+          fi
+          if (( HIGH < LOW )); then
+            echo "::error::high_cap (${HIGH}) must be >= low_cap (${LOW})."
+            exit 1
+          fi
+          if ! [[ "$WORKERS" =~ ^[0-9]+$ ]] || (( WORKERS < 1 || WORKERS > 256 )); then
+            echo "::error::workers must be an integer in [1, 256], got '${WORKERS}'."
+            exit 1
+          fi
+          echo "Inputs validated: range [${LOW}, ${HIGH}], workers=${WORKERS}"
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 2: Build – compile the binary and plan tool once.
+  # ──────────────────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Build bignum binary
+        run: make all
+
+      - name: Build plan tool
+        run: make plan-tool
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: range-sweep-binaries
+          path: |
+            bin/bignum
+            bin/split_bucket_batches
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 3: Plan – 6-hour gate check on the largest prime,
+  #           then build the worker batch matrix.
+  # ──────────────────────────────────────────────────────────
+  plan:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    outputs:
+      batch_matrix: ${{ steps.build-matrix.outputs.batch_matrix }}
+      batch_count:  ${{ steps.build-matrix.outputs.batch_count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: range-sweep-binaries
+          path: bin/
+
+      - name: Make binaries executable
+        run: chmod +x bin/bignum bin/split_bucket_batches
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
+
+      - name: Timing check on largest prime (6-hour gate)
+        run: |
+          LOW="${{ inputs.low_cap }}"
+          HIGH="${{ inputs.high_cap }}"
+          THREADS="${{ inputs.threads }}"
+
+          echo "=== Exponent Range Sweep – Timing Gate ==="
+          echo "Range: [${LOW}, ${HIGH}]"
+          echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo ""
+
+          # Run timing-check-only: probes the largest prime in the range.
+          # Fails (exit 1) if the measured time exceeds 21600 s (6 hours).
+          bin/split_bucket_batches \
+            --exp-start "${LOW}" \
+            --exp-end   "${HIGH}" \
+            --bignum-path bin/bignum \
+            --threads "${THREADS}" \
+            --fft-threads 2 \
+            --fft-allow-nested 1 \
+            --fail-if-exceeds-seconds 21600 \
+            --timing-check-only
+
+      - name: Build batch matrix
+        id: build-matrix
+        run: |
+          LOW="${{ inputs.low_cap }}"
+          HIGH="${{ inputs.high_cap }}"
+          WORKERS="${{ inputs.workers }}"
+
+          # Dry-run: print human-readable plan to the log.
+          bin/split_bucket_batches \
+            --exp-start "${LOW}" \
+            --exp-end   "${HIGH}" \
+            --target-workers "${WORKERS}" \
+            --dry-run
+
+          # Generate JSON matrix.
+          BATCH_MATRIX=$(bin/split_bucket_batches \
+            --exp-start "${LOW}" \
+            --exp-end   "${HIGH}" \
+            --target-workers "${WORKERS}")
+
+          BATCH_COUNT=$(echo "${BATCH_MATRIX}" | python3 -c \
+            "import json,sys; print(len(json.loads(sys.stdin.read())))")
+
+          echo "batch_matrix=${BATCH_MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "batch_count=${BATCH_COUNT}"   >> "$GITHUB_OUTPUT"
+          echo "Total worker batches: ${BATCH_COUNT}"
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 4: Workers – one job per batch.
+  #
+  # Each worker runs LL_SWEEP_MODE=p on its assigned sub-range
+  # of prime exponents.  All workers start concurrently (up to
+  # the GitHub Actions matrix hard cap of 256).
+  # ──────────────────────────────────────────────────────────
+  worker:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    # No timeout-minutes: LL tests must complete naturally.
+    # GitHub-hosted runners enforce a hard 6-hour cap regardless.
+    strategy:
+      fail-fast: false
+      max-parallel: 256
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.batch_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: range-sweep-binaries
+          path: bin/
+
+      - name: Make bignum executable
+        run: chmod +x bin/bignum
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
+
+      - name: Run batch ${{ matrix.worker_name }}
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: worker – ${{ matrix.worker_name }}"
+          echo "  exponent range: ${{ matrix.batch_min_exponent }}..${{ matrix.batch_max_exponent }}"
+          echo "  batch size    : ${{ matrix.batch_size }}"
+          echo "  batch index   : ${{ matrix.batch_index }} / ${{ matrix.batch_count }}"
+
+          mkdir -p batch_out/
+
+          LL_SWEEP_MODE=p \
+          LL_MIN_EXPONENT=${{ matrix.batch_min_exponent }} \
+          LL_MAX_EXPONENT=${{ matrix.batch_max_exponent }} \
+          LL_THREADS=${{ inputs.threads }} \
+          LL_FFT_THREADS=2 \
+          LL_FFT_ALLOW_NESTED=1 \
+          LL_DRY_RUN=${{ inputs.dry_run && '1' || '0' }} \
+          LL_BENCHMARK_MODE=0 \
+          LL_PROGRESS=${{ inputs.progress && '1' || '0' }} \
+          LL_BENCH_OUTPUT=batch_out/${{ matrix.worker_name }}.csv \
+          GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY}" \
+          ./bin/bignum 0 ${{ inputs.threads }}
+
+      - name: Upload batch results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.worker_name }}-results
+          path: batch_out/${{ matrix.worker_name }}.csv
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ──────────────────────────────────────────────────────────
+  # Stage 5: Merge – aggregate all worker CSVs and write a
+  #           markdown summary.
+  # ──────────────────────────────────────────────────────────
+  merge:
+    needs: worker
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download all batch results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: range-batch-*-results
+          path: batch_artifacts/
+          merge-multiple: true
+
+      - name: Merge worker CSVs
+        run: |
+          mkdir -p merged_out/
+
+          # Concatenate all worker CSVs (skip header from all but the first).
+          echo "p,is_prime,time_sec" > merged_out/merged_results.csv
+          for f in batch_artifacts/*.csv; do
+            [ -f "$f" ] && tail -n +2 "$f" >> merged_out/merged_results.csv || true
+          done
+
+          # Sort by exponent (numeric, ascending).
+          {
+            head -1 merged_out/merged_results.csv
+            tail -n +2 merged_out/merged_results.csv | sort -t, -k1 -n
+          } > merged_out/merged_sorted.csv
+          mv merged_out/merged_sorted.csv merged_out/merged_results.csv
+
+          TOTAL=$(( $(wc -l < merged_out/merged_results.csv) - 1 ))
+          PRIMES=$(grep -c ",true," merged_out/merged_results.csv || echo 0)
+          echo "Total primes tested : ${TOTAL}"
+          echo "Mersenne primes found: ${PRIMES}"
+
+      - name: Zip merged results
+        run: |
+          if [ -f merged_out/merged_results.csv ]; then
+            zip -9 merged_results.zip merged_out/merged_results.csv
+          fi
+
+      - name: Upload merged results artifact
+        if: hashFiles('merged_results.zip') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: range-sweep-merged-results
+          path: merged_results.zip          retention-days: 90
+          compression-level: 9
+
+      - name: Write workflow step summary
+        if: always()
+        run: |
+          TOTAL=$(( $(wc -l < merged_out/merged_results.csv 2>/dev/null || echo 1) - 1 ))
+          PRIMES=$(grep -c ",true," merged_out/merged_results.csv 2>/dev/null || echo 0)
+
+          {
+            echo "## Exponent Range Sweep – Final Report"
+            echo ""
+            echo "**Range:** ${{ inputs.low_cap }} – ${{ inputs.high_cap }}"
+            echo "**Workers requested:** ${{ inputs.workers }}"
+            echo "**Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Total prime exponents tested | ${TOTAL} |"
+            echo "| Mersenne primes found | ${PRIMES} |"
+            echo ""
+            if [ "${PRIMES}" -gt 0 ]; then
+              echo "### 🎉 Mersenne Primes Found!"
+              echo ""
+              echo "| Exponent | Time (s) |"
+              echo "|----------|----------|"
+              grep ",true," merged_out/merged_results.csv 2>/dev/null | \
+                while IFS=, read -r p result time_sec; do
+                  echo "| M_${p} | ${time_sec} |"
+                done
+            fi
+            echo ""
+            echo "_Full results available in the \`range-sweep-merged-results\` artifact._"
+          } >> "$GITHUB_STEP_SUMMARY"
