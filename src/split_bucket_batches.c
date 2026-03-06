@@ -105,7 +105,7 @@
 #include <math.h>
 
 #define GITHUB_MATRIX_MAX   256
-#define BATCH_SIZE_DEFAULT  1000
+#define BATCH_SIZE_DEFAULT  256
 #define WORKER_NAME_MAX     128
 
 /* =========================================================================
