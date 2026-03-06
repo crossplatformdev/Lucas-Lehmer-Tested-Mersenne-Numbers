@@ -416,13 +416,12 @@ static BatchVec split_bucket_into_batches(int n, size_t batch_size,
 
     /* Remaining primes to test. */
     uint64_t *rem   = primes.data + skip;
-    size_t    rem_n = total - skip;
-    size_t    batch_count = (rem_n + batch_size - 1) / batch_size;
+    //size_t    rem_n = total;
+    size_t    batch_count = (total) / batch_size;
 
     for (size_t i = 0; i < batch_count; i++) {
         size_t start_in_rem = i * batch_size;
-        size_t chunk_size   = (start_in_rem + batch_size <= rem_n)
-                              ? batch_size : (rem_n - start_in_rem);
+        size_t chunk_size   = batch_size;
         size_t end_in_rem   = start_in_rem + chunk_size - 1;
 
         /* Absolute ordinals in the full bucket prime list (0-based). */
