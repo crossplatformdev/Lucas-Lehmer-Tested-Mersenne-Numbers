@@ -875,6 +875,10 @@ int main(int argc, char **argv)
     BatchVec filtered = apply_prime_half(&matrix, prime_half);
     free(matrix.data);
 
+    /* Hard cap: never expose more than the GitHub Actions matrix limit. */
+    if (filtered.size > GITHUB_MATRIX_MAX)
+        filtered.size = GITHUB_MATRIX_MAX;
+
     /* --count-only: print filtered batch count and exit. */
     if (count_only) {
         printf("%zu\n", filtered.size);
