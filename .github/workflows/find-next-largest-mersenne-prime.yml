@@ -1,0 +1,693 @@
+name: Find Next Largest Mersenne Prime
+
+# Self-chaining workflow that searches for the next unknown Mersenne prime.
+#
+# Default behavior: ONE compute job, ONE exponent per run.
+# The workflow is designed so that workers > 1 or exponents_per_run > 1 is
+# purely a config change — no structural redesign required.
+#
+# Exit codes emitted by ./bin/bignum in discover mode:
+#   0  – completed normally  (composite)
+#   3  – new Mersenne prime found
+#   4  – soft stop; checkpoint written (resume same exponent)
+#
+# Chain status values:
+#   pending                  – not yet started
+#   running                  – currently in progress
+#   timed_out_resume_needed  – soft-stopped mid-exponent
+#   completed_composite      – exponent is composite; move to next
+#   completed_prime          – new Mersenne prime discovered; stop chain
+#   failed                   – unrecoverable error
+#   cancelled                – chain manually cancelled
+
+on:
+  workflow_dispatch:
+    inputs:
+      chain_id:
+        description: "Unique identifier for this search chain"
+        required: false
+        default: "largest-mersenne-search"
+        type: string
+      start_exponent:
+        description: "First exponent to test (0 = auto-detect after last known prime)"
+        required: false
+        default: "0"
+        type: string
+      max_runtime_seconds:
+        description: "Soft stop threshold in seconds (leave ~5 min margin)"
+        required: false
+        default: "21000"
+        type: string
+      workers:
+        description: "Number of parallel workers (1 for initial single-job mode)"
+        required: false
+        default: "1"
+        type: string
+      exponents_per_run:
+        description: "Exponents to test per run (1 for initial single-exponent mode)"
+        required: false
+        default: "1"
+        type: string
+      ll_threads_per_worker:
+        description: "LL outer threads per worker job"
+        required: false
+        default: "4"
+        type: string
+      fft_threads:
+        description: "Intra-FFT threads per worker (LL_FFT_THREADS)"
+        required: false
+        default: "2"
+        type: string
+      fft_allow_nested:
+        description: "Allow nested FFT threading (LL_FFT_ALLOW_NESTED)"
+        required: false
+        default: true
+        type: boolean
+      dry_run:
+        description: "Print plan without running LL tests"
+        required: false
+        default: false
+        type: boolean
+      force_resume_same_exponent:
+        description: "Force resume of the same exponent (ignores normal scheduling)"
+        required: false
+        default: false
+        type: boolean
+
+# ── Concurrency: one active run per chain_id at a time. ────────────────────
+# cancel-in-progress = false ensures new triggers queue rather than corrupt state.
+concurrency:
+  group: mersenne-chain-${{ inputs.chain_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # required to dispatch the next run via workflow_dispatch
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════════
+  # Single compute job: validate → restore state → build → run → persist → dispatch
+  # ══════════════════════════════════════════════════════════════════════════
+  compute:
+    name: "Search (${{ inputs.chain_id }})"
+    runs-on: ubuntu-24.04
+    # No timeout-minutes: the LL test must run to its soft-stop, which is
+    # enforced internally.  GitHub-hosted runners hard-cap at 6 hours.
+    env:
+      CHAIN_ID:           ${{ inputs.chain_id }}
+      START_EXPONENT:     ${{ inputs.start_exponent }}
+      MAX_RUNTIME_SEC:    ${{ inputs.max_runtime_seconds }}
+      WORKERS:            ${{ inputs.workers }}
+      EXPS_PER_RUN:       ${{ inputs.exponents_per_run }}
+      LL_THREADS:         ${{ inputs.ll_threads_per_worker }}
+      FFT_THREADS:        ${{ inputs.fft_threads }}
+      FFT_ALLOW_NESTED:   ${{ inputs.fft_allow_nested && '1' || '0' }}
+      DRY_RUN:            ${{ inputs.dry_run && '1' || '0' }}
+      FORCE_RESUME:       ${{ inputs.force_resume_same_exponent && '1' || '0' }}
+      WORKFLOW_FILE:      "find-next-largest-mersenne-prime.yml"
+
+    steps:
+      # ── 0. Print workflow identity ──────────────────────────────────────
+      - name: Print run identity
+        run: |
+          set -Eeuo pipefail
+          echo "=== Find Next Largest Mersenne Prime ==="
+          echo "Chain ID        : ${CHAIN_ID}"
+          echo "Workflow run    : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "Job             : compute"
+          echo "Runner          : ${RUNNER_NAME:-unknown}"
+          echo "Start exponent  : ${START_EXPONENT}"
+          echo "Max runtime (s) : ${MAX_RUNTIME_SEC}"
+          echo "Workers         : ${WORKERS}"
+          echo "Exps/run        : ${EXPS_PER_RUN}"
+          echo "LL threads      : ${LL_THREADS}"
+          echo "FFT threads     : ${FFT_THREADS}"
+          echo "FFT nested      : ${FFT_ALLOW_NESTED}"
+          echo "Dry run         : ${DRY_RUN}"
+          echo "Force resume    : ${FORCE_RESUME}"
+
+      # ── 1. Validate inputs ──────────────────────────────────────────────
+      - name: Validate inputs
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! "${CHAIN_ID}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "::error::chain_id must contain only [a-zA-Z0-9_-], got '${CHAIN_ID}'"
+            exit 1
+          fi
+
+          for VAR_NAME in START_EXPONENT MAX_RUNTIME_SEC WORKERS EXPS_PER_RUN LL_THREADS FFT_THREADS; do
+            VAL="${!VAR_NAME}"
+            if ! [[ "${VAL}" =~ ^[0-9]+$ ]]; then
+              echo "::error::${VAR_NAME} must be a non-negative integer, got '${VAL}'"
+              exit 1
+            fi
+          done
+
+          if (( MAX_RUNTIME_SEC < 60 )); then
+            echo "::error::max_runtime_seconds must be >= 60, got ${MAX_RUNTIME_SEC}"
+            exit 1
+          fi
+          if (( WORKERS < 1 || WORKERS > 256 )); then
+            echo "::error::workers must be 1–256, got ${WORKERS}"
+            exit 1
+          fi
+          if (( EXPS_PER_RUN < 1 || EXPS_PER_RUN > 1000 )); then
+            echo "::error::exponents_per_run must be 1–1000, got ${EXPS_PER_RUN}"
+            exit 1
+          fi
+          if (( LL_THREADS < 1 || LL_THREADS > 64 )); then
+            echo "::error::ll_threads_per_worker must be 1–64, got ${LL_THREADS}"
+            exit 1
+          fi
+          if (( FFT_THREADS < 1 || FFT_THREADS > 4096 )); then
+            echo "::error::fft_threads must be 1–4096, got ${FFT_THREADS}"
+            exit 1
+          fi
+
+          echo "All inputs validated."
+
+      # ── 2. Checkout ─────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 3. Install toolchain ─────────────────────────────────────────────
+      - name: Install toolchain
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++ make libboost-dev pkg-config jq python3
+
+      # ── 4. Build binary ──────────────────────────────────────────────────
+      - name: Build bignum binary
+        run: |
+          set -Eeuo pipefail
+          make all
+          echo "Binary size: $(du -sh bin/bignum | cut -f1)"
+
+      # ── 5. Restore chain state from artifact ────────────────────────────
+      # Uses the GitHub REST API to find the most recent artifact whose name
+      # matches chain-state-{chain_id}.  Artifacts are uploaded at the end of
+      # each run (step 11), so the most-recently-created one is the latest state.
+      - name: Restore chain state
+        id: restore_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p run_artifacts chain_state_in
+
+          ARTIFACT_NAME="chain-state-${CHAIN_ID}"
+          echo "Looking for artifact: ${ARTIFACT_NAME}"
+
+          # List artifacts by name (sorted newest-first by GitHub's API default).
+          ARTIFACT_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=5" \
+            --jq '.artifacts | sort_by(.created_at) | reverse | .[0].id // empty' \
+            2>/dev/null || true)
+
+          if [[ -z "${ARTIFACT_ID}" ]]; then
+            echo "No prior chain state found – this is a fresh start."
+            echo "found_state=false" >> "$GITHUB_OUTPUT"
+            # Write an empty state placeholder so downstream steps have a file.
+            echo '{}' > chain_state_in/chain_state.json
+          else
+            echo "Found artifact id=${ARTIFACT_ID}; downloading..."
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+              -H "Accept: application/vnd.github+json" \
+              > chain_state_in/state.zip
+            unzip -q chain_state_in/state.zip -d chain_state_in/
+            rm -f chain_state_in/state.zip
+            echo "found_state=true" >> "$GITHUB_OUTPUT"
+            echo "State file contents:"
+            cat chain_state_in/chain_state.json || true
+          fi
+
+      # ── 6. Determine current exponent ───────────────────────────────────
+      - name: Determine exponent to test
+        id: plan
+        run: |
+          set -Eeuo pipefail
+          STATE_FILE="chain_state_in/chain_state.json"
+
+          # Read existing state fields.
+          PREV_STATUS=$(python3 -c "
+          import json, sys
+          try:
+            s = json.load(open('${STATE_FILE}'))
+            print(s.get('status', ''))
+          except: print('')
+          " 2>/dev/null || true)
+
+          PREV_EXPONENT=$(python3 -c "
+          import json, sys
+          try:
+            s = json.load(open('${STATE_FILE}'))
+            print(s.get('current_exponent', 0))
+          except: print(0)
+          " 2>/dev/null || true)
+
+          CHK_ARTIFACT=$(python3 -c "
+          import json, sys
+          try:
+            s = json.load(open('${STATE_FILE}'))
+            print(s.get('checkpoint_artifact_name', '') or '')
+          except: print('')
+          " 2>/dev/null || true)
+
+          ITER_REACHED=$(python3 -c "
+          import json, sys
+          try:
+            s = json.load(open('${STATE_FILE}'))
+            print(s.get('iter_reached', 0))
+          except: print(0)
+          " 2>/dev/null || true)
+
+          echo "Previous status   : '${PREV_STATUS}'"
+          echo "Previous exponent : '${PREV_EXPONENT}'"
+          echo "Checkpoint artifact: '${CHK_ARTIFACT}'"
+          echo "Iteration reached : '${ITER_REACHED}'"
+
+          RESUME_EXPONENT=0
+          IS_RESUME=false
+
+          # Decision logic matching the problem statement's scheduling rules:
+          if [[ "${FORCE_RESUME}" == "1" && -n "${PREV_EXPONENT}" && "${PREV_EXPONENT}" != "0" ]]; then
+            # Caller explicitly requested resume of the same exponent.
+            RESUME_EXPONENT="${PREV_EXPONENT}"
+            IS_RESUME=true
+            echo "force_resume_same_exponent=true → resuming p=${RESUME_EXPONENT}"
+
+          elif [[ "${PREV_STATUS}" == "timed_out_resume_needed" && -n "${PREV_EXPONENT}" && "${PREV_EXPONENT}" != "0" ]]; then
+            # Prior run soft-stopped mid-exponent; resume same exponent.
+            RESUME_EXPONENT="${PREV_EXPONENT}"
+            IS_RESUME=true
+            echo "Prior run timed out → resuming p=${RESUME_EXPONENT}"
+
+          else
+            # Fresh exponent: compute the next prime after the last known.
+            IS_RESUME=false
+            if [[ "${START_EXPONENT}" != "0" ]]; then
+              NEXT_EXP=$(python3 scripts/ll_chain.py next-exponent \
+                --start "${START_EXPONENT}" \
+                --state-file "${STATE_FILE}")
+            else
+              NEXT_EXP=$(python3 scripts/ll_chain.py next-exponent \
+                --state-file "${STATE_FILE}")
+            fi
+            RESUME_EXPONENT="${NEXT_EXP}"
+            echo "Next prime exponent to test: p=${RESUME_EXPONENT}"
+          fi
+
+          echo "current_exponent=${RESUME_EXPONENT}" >> "$GITHUB_OUTPUT"
+          echo "is_resume=${IS_RESUME}"              >> "$GITHUB_OUTPUT"
+          echo "iter_reached=${ITER_REACHED}"        >> "$GITHUB_OUTPUT"
+          echo "checkpoint_artifact=${CHK_ARTIFACT}" >> "$GITHUB_OUTPUT"
+          echo "prev_status=${PREV_STATUS}"          >> "$GITHUB_OUTPUT"
+
+      # ── 7. Download checkpoint artifact (resume path only) ───────────────
+      - name: Download checkpoint artifact
+        id: download_chk
+        if: steps.plan.outputs.is_resume == 'true' && steps.plan.outputs.checkpoint_artifact != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHK_ARTIFACT_NAME: ${{ steps.plan.outputs.checkpoint_artifact }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p checkpoint_in
+
+          echo "Downloading checkpoint artifact: ${CHK_ARTIFACT_NAME}"
+          ARTIFACT_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${CHK_ARTIFACT_NAME}&per_page=5" \
+            --jq '.artifacts | sort_by(.created_at) | reverse | .[0].id // empty' \
+            2>/dev/null || true)
+
+          if [[ -z "${ARTIFACT_ID}" ]]; then
+            echo "::warning::Checkpoint artifact '${CHK_ARTIFACT_NAME}' not found; will restart exponent from iter 0."
+            echo "chk_file=" >> "$GITHUB_OUTPUT"
+          else
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+              -H "Accept: application/vnd.github+json" \
+              > checkpoint_in/chk.zip
+            unzip -q checkpoint_in/chk.zip -d checkpoint_in/
+            rm -f checkpoint_in/chk.zip
+            CHK_FILE=$(find checkpoint_in -name "ll_chk_*.bin" | head -1)
+            if [[ -n "${CHK_FILE}" ]]; then
+              echo "Checkpoint file restored: ${CHK_FILE}"
+              echo "chk_file=${CHK_FILE}" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::No .bin file found in checkpoint artifact; restarting from iter 0."
+              echo "chk_file=" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      # ── 8. Run LL test with soft stop ────────────────────────────────────
+      - name: Run Lucas-Lehmer test
+        id: ll_run
+        env:
+          CURRENT_EXPONENT:  ${{ steps.plan.outputs.current_exponent }}
+          IS_RESUME:         ${{ steps.plan.outputs.is_resume }}
+          RESUME_CHK_FILE:   ${{ steps.download_chk.outputs.chk_file || '' }}
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p discover_out checkpoint_out
+
+          # Compute soft-stop Unix timestamp = now + max_runtime_seconds - 5 min buffer.
+          # The buffer gives the workflow enough time to save state and dispatch.
+          BUFFER_SEC=300
+          SOFT_STOP_EPOCH=$(( $(date +%s) + MAX_RUNTIME_SEC - BUFFER_SEC ))
+          echo "Soft stop epoch : ${SOFT_STOP_EPOCH} ($(date -d @${SOFT_STOP_EPOCH} -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -r ${SOFT_STOP_EPOCH} '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo 'N/A'))"
+          echo "Current exponent: p=${CURRENT_EXPONENT}"
+          echo "Is resume       : ${IS_RESUME}"
+          echo "Resume chk file : '${RESUME_CHK_FILE}'"
+
+          RESUME_FLAG=""
+          if [[ "${IS_RESUME}" == "true" && -n "${RESUME_CHK_FILE}" && -f "${RESUME_CHK_FILE}" ]]; then
+            RESUME_FLAG="LL_RESUME_CHECKPOINT_FILE=${RESUME_CHK_FILE}"
+          fi
+
+          # Run the binary.  Exit code 4 = soft stop.
+          set +e
+          LL_SWEEP_MODE=discover \
+          LL_SINGLE_EXPONENT="${CURRENT_EXPONENT}" \
+          LL_STOP_AFTER_N_CASES="${EXPS_PER_RUN}" \
+          LL_MAX_EXPONENT="${CURRENT_EXPONENT}" \
+          LL_MIN_EXPONENT="${CURRENT_EXPONENT}" \
+          LL_CHECKPOINT_DIR="$(pwd)/checkpoint_out" \
+          LL_CHECKPOINT_INTERVAL_ITERS=500000 \
+          LL_SOFT_STOP_EPOCH_SECS="${SOFT_STOP_EPOCH}" \
+          LL_DRY_RUN="${DRY_RUN}" \
+          LL_PROGRESS=0 \
+          LL_FFT_THREADS="${FFT_THREADS}" \
+          LL_FFT_ALLOW_NESTED="${FFT_ALLOW_NESTED}" \
+          LL_OUTPUT_DIR="discover_out/" \
+          ${RESUME_FLAG} \
+          GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY}" \
+          ./bin/bignum 0 "${LL_THREADS}" 2>&1 | tee discover_out/run.log
+          LL_EXIT=$?
+          set -e
+
+          echo "Binary exit code: ${LL_EXIT}"
+          echo "ll_exit=${LL_EXIT}" >> "$GITHUB_OUTPUT"
+
+          # Determine result status from exit code.
+          case "${LL_EXIT}" in
+            0) RUN_STATUS="completed_composite" ;;
+            3) RUN_STATUS="completed_prime"     ;;
+            4) RUN_STATUS="timed_out_resume_needed" ;;
+            *) RUN_STATUS="failed"              ;;
+          esac
+          echo "run_status=${RUN_STATUS}" >> "$GITHUB_OUTPUT"
+
+          # Extract checkpoint path from log (emitted as CHECKPOINT_FILE=…).
+          CHK_OUT=$(grep '^CHECKPOINT_FILE=' discover_out/run.log | head -1 | sed 's/^CHECKPOINT_FILE=//' || true)
+          echo "chk_out=${CHK_OUT}" >> "$GITHUB_OUTPUT"
+
+          # Extract iteration reached from log.
+          ITER_DONE=$(grep -oP 'soft stop at iter \K[0-9]+' discover_out/run.log | tail -1 || echo 0)
+          echo "iter_reached=${ITER_DONE}" >> "$GITHUB_OUTPUT"
+
+          echo "Run status  : ${RUN_STATUS}"
+          echo "Checkpoint  : '${CHK_OUT}'"
+          echo "Iter reached: ${ITER_DONE}"
+
+      # ── 9. Save chain state ──────────────────────────────────────────────
+      - name: Save chain state
+        id: save_state
+        env:
+          CURRENT_EXPONENT: ${{ steps.plan.outputs.current_exponent }}
+          RUN_STATUS:       ${{ steps.ll_run.outputs.run_status }}
+          ITER_REACHED:     ${{ steps.ll_run.outputs.iter_reached }}
+          CHK_OUT:          ${{ steps.ll_run.outputs.chk_out }}
+          PREV_STATUS:      ${{ steps.plan.outputs.prev_status }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p chain_state_out
+
+          # Compute next exponent for the dispatch step.
+          if [[ "${RUN_STATUS}" == "timed_out_resume_needed" ]]; then
+            NEXT_EXP="${CURRENT_EXPONENT}"
+          elif [[ "${RUN_STATUS}" == "completed_composite" ]]; then
+            NEXT_EXP=$(python3 scripts/ll_chain.py next-exponent \
+              --start "$(( CURRENT_EXPONENT + 1 ))" \
+              --state-file "chain_state_in/chain_state.json")
+          else
+            NEXT_EXP=0  # prime found or failed – no next dispatch
+          fi
+          echo "next_exponent=${NEXT_EXP}" >> "$GITHUB_OUTPUT"
+
+          # Build the checkpoint artifact name (deterministic, stable per exponent).
+          CHK_ARTIFACT_NAME=""
+          if [[ "${RUN_STATUS}" == "timed_out_resume_needed" && -n "${CHK_OUT}" ]]; then
+            CHK_ARTIFACT_NAME="checkpoint-${CHAIN_ID}-p${CURRENT_EXPONENT}"
+          fi
+          echo "chk_artifact_name=${CHK_ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+
+          # Accumulate completed exponents list from prior state.
+          COMPLETED_JSON=$(python3 -c "
+          import json, sys
+          try:
+            s = json.load(open('chain_state_in/chain_state.json'))
+            done = s.get('completed_exponents', [])
+          except: done = []
+          exp = int('${CURRENT_EXPONENT}')
+          status = '${RUN_STATUS}'
+          if status in ('completed_composite', 'completed_prime') and exp not in done:
+            done.append(exp)
+          print(json.dumps(done))
+          " 2>/dev/null || echo '[]')
+
+          # Write chain state JSON using python3 to ensure valid JSON.
+          python3 - <<'PYEOF'
+          import json, hashlib, os, sys
+          state = {
+            "schema_version": 1,
+            "chain_id":        os.environ["CHAIN_ID"],
+            "status":          os.environ["RUN_STATUS"],
+            "current_exponent": int(os.environ["CURRENT_EXPONENT"]),
+            "next_exponent_candidate": int(os.environ.get("NEXT_EXP", 0)),
+            "is_partial": os.environ["RUN_STATUS"] == "timed_out_resume_needed",
+            "iter_reached": int(os.environ.get("ITER_REACHED", 0)),
+            "checkpoint_artifact_name": os.environ.get("CHK_ARTIFACT_NAME", ""),
+            "completed_exponents": json.loads(os.environ.get("COMPLETED_JSON", "[]")),
+            "config": {
+              "start_exponent":     os.environ["START_EXPONENT"],
+              "max_runtime_seconds": os.environ["MAX_RUNTIME_SEC"],
+              "workers":            os.environ["WORKERS"],
+              "exponents_per_run":  os.environ["EXPS_PER_RUN"],
+              "ll_threads":         os.environ["LL_THREADS"],
+              "fft_threads":        os.environ["FFT_THREADS"],
+              "fft_allow_nested":   os.environ["FFT_ALLOW_NESTED"],
+            },
+            "workflow": {
+              "file":       os.environ["WORKFLOW_FILE"],
+              "run_id":     os.environ["GITHUB_RUN_ID"],
+              "run_url":    "{}/{}/actions/runs/{}".format(
+                              os.environ["GITHUB_SERVER_URL"],
+                              os.environ["GITHUB_REPOSITORY"],
+                              os.environ["GITHUB_RUN_ID"]),
+              "job":        "compute",
+              "commit_sha": os.environ.get("GITHUB_SHA", ""),
+              "repository": os.environ["GITHUB_REPOSITORY"],
+            },
+            "updated_at": __import__('datetime').datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          # Simple integrity field: SHA-256 of a canonical subset.
+          integrity_src = json.dumps({
+            k: state[k] for k in
+            ("chain_id","status","current_exponent","iter_reached","updated_at")
+          }, sort_keys=True)
+          state["checksum"] = hashlib.sha256(integrity_src.encode()).hexdigest()[:16]
+
+          with open("chain_state_out/chain_state.json", "w") as f:
+            json.dump(state, f, indent=2)
+          print("Chain state written.")
+          print(json.dumps(state, indent=2))
+          PYEOF
+
+      # ── 10. Upload checkpoint artifact (soft-stop path) ───────────────────
+      - name: Upload checkpoint artifact
+        if: steps.ll_run.outputs.run_status == 'timed_out_resume_needed' && steps.ll_run.outputs.chk_out != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.save_state.outputs.chk_artifact_name }}
+          path: checkpoint_out/ll_chk_*.bin
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── 11. Upload chain state artifact ──────────────────────────────────
+      - name: Upload chain state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chain-state-${{ inputs.chain_id }}
+          path: chain_state_out/chain_state.json
+          retention-days: 90
+          overwrite: true
+
+      # ── 12. Upload per-run artifacts ──────────────────────────────────────
+      - name: Upload per-run results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "run-results-${{ inputs.chain_id }}-p${{ steps.plan.outputs.current_exponent }}-${{ steps.ll_run.outputs.run_status }}-${{ github.run_id }}"
+          path: |
+            discover_out/
+            chain_state_out/
+          retention-days: 90
+          if-no-files-found: warn
+
+      # ── 13. Write step summary ────────────────────────────────────────────
+      - name: Write step summary
+        if: always()
+        env:
+          CURRENT_EXPONENT: ${{ steps.plan.outputs.current_exponent }}
+          IS_RESUME:        ${{ steps.plan.outputs.is_resume }}
+          ITER_REACHED:     ${{ steps.ll_run.outputs.iter_reached || '0' }}
+          RUN_STATUS:       ${{ steps.ll_run.outputs.run_status || 'unknown' }}
+          NEXT_EXP:         ${{ steps.save_state.outputs.next_exponent || '0' }}
+        run: |
+          set -Eeuo pipefail
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Map status to human-readable description and next-action label.
+          case "${RUN_STATUS}" in
+            completed_prime)         STATUS_LABEL="🎉 **NEW MERSENNE PRIME FOUND**" ; NEXT_ACTION="Stop chain – new prime discovered" ;;
+            completed_composite)     STATUS_LABEL="composite" ; NEXT_ACTION="Dispatch next prime exponent: p=${NEXT_EXP}" ;;
+            timed_out_resume_needed) STATUS_LABEL="⏱ timed out (checkpoint saved)" ; NEXT_ACTION="Resume same exponent: p=${CURRENT_EXPONENT} from iter ${ITER_REACHED}" ;;
+            failed)                  STATUS_LABEL="❌ failed" ; NEXT_ACTION="Manual investigation required" ;;
+            *)                       STATUS_LABEL="${RUN_STATUS}" ; NEXT_ACTION="unknown" ;;
+          esac
+
+          {
+            echo "## Mersenne Search – ${CHAIN_ID}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Chain ID | \`${CHAIN_ID}\` |"
+            echo "| Exponent | p = ${CURRENT_EXPONENT} |"
+            echo "| Resumed from checkpoint? | ${IS_RESUME} |"
+            echo "| Iteration reached | ${ITER_REACHED} |"
+            echo "| Result | ${STATUS_LABEL} |"
+            echo "| Next action | ${NEXT_ACTION} |"
+            echo "| Workflow run | [${GITHUB_RUN_ID}](${RUN_URL}) |"
+            echo "| Job | compute |"
+            echo ""
+            echo "**Artifacts:**"
+            echo "- \`chain-state-${CHAIN_ID}\` – chain state JSON"
+            if [[ "${RUN_STATUS}" == "timed_out_resume_needed" ]]; then
+              echo "- \`checkpoint-${CHAIN_ID}-p${CURRENT_EXPONENT}\` – LL state checkpoint"
+            fi
+            echo "- \`run-results-${CHAIN_ID}-p${CURRENT_EXPONENT}-${RUN_STATUS}-${GITHUB_RUN_ID}\` – logs and JSON"
+            echo ""
+            if [[ "${RUN_STATUS}" == "completed_prime" ]]; then
+              echo "## 🚨 NEW MERSENNE PRIME DISCOVERED"
+              echo ""
+              echo "**M_${CURRENT_EXPONENT} = 2^${CURRENT_EXPONENT} − 1 is PRIME!**"
+              echo ""
+              if [[ -f discover_out/discovery_event.json ]]; then
+                echo '```json'
+                cat discover_out/discovery_event.json
+                echo '```'
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 14. Dispatch next run ─────────────────────────────────────────────
+      - name: Dispatch next run
+        if: |
+          steps.ll_run.outputs.run_status == 'completed_composite' ||
+          steps.ll_run.outputs.run_status == 'timed_out_resume_needed'
+        env:
+          GH_TOKEN:           ${{ github.token }}
+          RUN_STATUS:         ${{ steps.ll_run.outputs.run_status }}
+          CURRENT_EXPONENT:   ${{ steps.plan.outputs.current_exponent }}
+          NEXT_EXP:           ${{ steps.save_state.outputs.next_exponent }}
+          ITER_REACHED:       ${{ steps.ll_run.outputs.iter_reached || '0' }}
+        run: |
+          set -Eeuo pipefail
+
+          # Do not dispatch if dry_run is enabled.
+          if [[ "${DRY_RUN}" == "1" ]]; then
+            echo "dry_run=true: skipping dispatch of next run."
+            exit 0
+          fi
+
+          # Determine dispatch parameters.
+          if [[ "${RUN_STATUS}" == "timed_out_resume_needed" ]]; then
+            # Resume same exponent.
+            DISPATCH_START="${CURRENT_EXPONENT}"
+            DISPATCH_FORCE_RESUME="true"
+            ACTION_DESC="Resume p=${CURRENT_EXPONENT} from iter ${ITER_REACHED}"
+          else
+            # Move to next exponent.
+            DISPATCH_START="${NEXT_EXP}"
+            DISPATCH_FORCE_RESUME="false"
+            ACTION_DESC="Continue with next prime: p=${NEXT_EXP}"
+          fi
+
+          echo "Next action: ${ACTION_DESC}"
+
+          # Build the dispatch payload using python3 to avoid shell quoting issues.
+          python3 - <<PYEOF
+          import json, subprocess, os, sys
+
+          payload = {
+            "ref": os.environ["GITHUB_REF_NAME"],
+            "inputs": {
+              "chain_id":                   os.environ["CHAIN_ID"],
+              "start_exponent":             os.environ["DISPATCH_START"],
+              "max_runtime_seconds":        os.environ["MAX_RUNTIME_SEC"],
+              "workers":                    os.environ["WORKERS"],
+              "exponents_per_run":          os.environ["EXPS_PER_RUN"],
+              "ll_threads_per_worker":      os.environ["LL_THREADS"],
+              "fft_threads":                os.environ["FFT_THREADS"],
+              "fft_allow_nested":           os.environ["FFT_ALLOW_NESTED"] == "1",
+              "dry_run":                    False,
+              "force_resume_same_exponent": os.environ["DISPATCH_FORCE_RESUME"] == "true",
+            }
+          }
+          payload_json = json.dumps(payload)
+          print("Dispatch payload:")
+          print(payload_json)
+
+          result = subprocess.run(
+            ["gh", "api",
+             "--method", "POST",
+             f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/workflows/{os.environ['WORKFLOW_FILE']}/dispatches",
+             "--input", "-"],
+            input=payload_json,
+            capture_output=True,
+            text=True,
+          )
+          if result.returncode != 0:
+            print(f"::error::Dispatch failed (exit {result.returncode}):", file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            sys.exit(result.returncode)
+          else:
+            print("Dispatch succeeded.")
+            if result.stdout.strip():
+              print(result.stdout)
+          PYEOF
+
+      # ── 15. Announce new prime (if discovered) ────────────────────────────
+      - name: Announce new Mersenne prime
+        if: steps.ll_run.outputs.run_status == 'completed_prime'
+        run: |
+          set -Eeuo pipefail
+          CURRENT_EXPONENT="${{ steps.plan.outputs.current_exponent }}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          echo "::error title=🎉 NEW MERSENNE PRIME FOUND::M_${CURRENT_EXPONENT} = 2^${CURRENT_EXPONENT} - 1 is prime! See artifacts."
+          echo ""
+          echo "========================================="
+          echo " NEW MERSENNE PRIME FOUND"
+          echo "  M_${CURRENT_EXPONENT} = 2^${CURRENT_EXPONENT} - 1"
+          echo "  Workflow: ${RUN_URL}"
+          echo "========================================="
+
+          # Chain stopped – no next dispatch for primes.
+          echo "Chain terminated: new Mersenne prime found. No further dispatch."
