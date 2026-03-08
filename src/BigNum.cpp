@@ -487,6 +487,149 @@ struct LLResult {
 };
 
 // ============================================================
+// Checkpoint / resume support
+//
+// File format (binary, little-endian integers):
+//   [4]  magic "LLCK"
+//   [1]  version = 1
+//   [1]  backend_id (0=generic  1=limb  2=fft)
+//   [2]  padding = 0
+//   [4]  exponent p (uint32_t LE)
+//   [4]  iterations completed i (uint32_t LE)
+//   [4]  data_size (uint32_t LE)
+//   [N]  backend state blob
+//   [4]  additive checksum (uint32_t LE, sum of all preceding bytes)
+// ============================================================
+
+static constexpr uint8_t kChkVersion   = 1u;
+static constexpr uint8_t kChkBkGeneric = 0u;
+static constexpr uint8_t kChkBkLimb    = 1u;
+static constexpr uint8_t kChkBkFft     = 2u;
+
+struct LoadedCheckpoint {
+    uint8_t  backend_id{0};
+    uint32_t p{0};
+    uint32_t iter{0};          // iterations already completed
+    std::vector<uint8_t> data; // serialized backend state
+    bool valid{false};
+};
+
+// Simple additive checksum: sufficient to detect file truncation/corruption.
+static uint32_t chk_addsum(const uint8_t* buf, size_t len) noexcept {
+    uint32_t s = 0u;
+    for (size_t i = 0u; i < len; ++i) s += buf[i];
+    return s;
+}
+
+// Append a 32-bit unsigned integer v as four consecutive little-endian bytes to buf.
+static void push_le32(std::vector<uint8_t>& buf, uint32_t v) {
+    buf.push_back(static_cast<uint8_t>(v));
+    buf.push_back(static_cast<uint8_t>(v >>  8));
+    buf.push_back(static_cast<uint8_t>(v >> 16));
+    buf.push_back(static_cast<uint8_t>(v >> 24));
+}
+
+// Read a 32-bit unsigned integer from four consecutive little-endian bytes at buf[0..3].
+static uint32_t read_le32(const uint8_t* buf) noexcept {
+    return static_cast<uint32_t>(buf[0])
+         | (static_cast<uint32_t>(buf[1]) <<  8)
+         | (static_cast<uint32_t>(buf[2]) << 16)
+         | (static_cast<uint32_t>(buf[3]) << 24);
+}
+
+// Atomically write a checkpoint file (write to .tmp then rename).
+static bool save_checkpoint_file(
+    const std::string& path,
+    uint8_t            backend_id,
+    uint32_t           p,
+    uint32_t           iter,
+    const std::vector<uint8_t>& data)
+{
+    std::vector<uint8_t> buf;
+    buf.reserve(24u + data.size() + 4u);
+
+    buf.push_back('L'); buf.push_back('L'); buf.push_back('C'); buf.push_back('K');
+    buf.push_back(kChkVersion);
+    buf.push_back(backend_id);
+    buf.push_back(0u); buf.push_back(0u);  // padding
+    push_le32(buf, p);
+    push_le32(buf, iter);
+    push_le32(buf, static_cast<uint32_t>(data.size()));
+    buf.insert(buf.end(), data.begin(), data.end());
+    push_le32(buf, chk_addsum(buf.data(), buf.size()));
+
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "checkpoint: cannot open '%s': %s\n",
+                     tmp.c_str(), std::strerror(errno));
+        return false;
+    }
+    const size_t written = std::fwrite(buf.data(), 1u, buf.size(), f);
+    std::fflush(f);
+    std::fclose(f);
+    if (written != buf.size()) {
+        std::fprintf(stderr, "checkpoint: short write to '%s'\n", tmp.c_str());
+        std::remove(tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::fprintf(stderr, "checkpoint: rename failed '%s' -> '%s': %s\n",
+                     tmp.c_str(), path.c_str(), std::strerror(errno));
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// Load and validate a checkpoint file.  Returns an invalid checkpoint on error.
+static LoadedCheckpoint load_checkpoint_file(const std::string& path) {
+    LoadedCheckpoint out;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return out;
+    std::fseek(f, 0, SEEK_END);
+    const long flen = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (flen < 28) { std::fclose(f); return out; }  // minimum: 24 hdr + 0 data + 4 sum
+
+    std::vector<uint8_t> buf(static_cast<size_t>(flen));
+    const size_t n = std::fread(buf.data(), 1u, buf.size(), f);
+    std::fclose(f);
+    if (n != buf.size()) return out;
+
+    // Verify checksum (last 4 bytes).
+    const size_t cs_off = buf.size() - 4u;
+    const uint32_t stored  = read_le32(buf.data() + cs_off);
+    const uint32_t computed = chk_addsum(buf.data(), cs_off);
+    if (stored != computed) {
+        std::fprintf(stderr,
+            "checkpoint: checksum mismatch in '%s' (stored=%u computed=%u)\n",
+            path.c_str(), stored, computed);
+        return out;
+    }
+    if (buf[0] != 'L' || buf[1] != 'L' || buf[2] != 'C' || buf[3] != 'K') {
+        std::fprintf(stderr, "checkpoint: bad magic in '%s'\n", path.c_str());
+        return out;
+    }
+    if (buf[4] != kChkVersion) {
+        std::fprintf(stderr, "checkpoint: unsupported version %u in '%s'\n",
+                     static_cast<unsigned>(buf[4]), path.c_str());
+        return out;
+    }
+    out.backend_id = buf[5];
+    out.p    = read_le32(buf.data() + 8);
+    out.iter = read_le32(buf.data() + 12);
+    const uint32_t dsz = read_le32(buf.data() + 16);
+    if (20u + static_cast<size_t>(dsz) + 4u != buf.size()) {
+        std::fprintf(stderr, "checkpoint: size mismatch in '%s'\n", path.c_str());
+        return out;
+    }
+    out.data.assign(buf.begin() + 20, buf.begin() + 20 + dsz);
+    out.valid = true;
+    return out;
+}
+
+// ============================================================
 // namespace backend
 // ============================================================
 namespace backend {
@@ -559,6 +702,27 @@ struct GenericBackend {
         char buf[17];
         std::snprintf(buf, sizeof(buf), "%016" PRIx64, low64);
         return std::string(buf);
+    }
+
+    // Checkpoint serialization: export s as little-endian byte array.
+    static constexpr uint8_t backend_id() noexcept { return kChkBkGeneric; }
+    static void serialize_state(const State& st, std::vector<uint8_t>& out) {
+        using boost::multiprecision::cpp_int;
+        cpp_int val = st.s;
+        if (val == 0) { out.push_back(0u); return; }
+        while (val > 0) {
+            out.push_back(static_cast<uint8_t>(static_cast<unsigned>(val & 0xFF)));
+            val >>= 8;
+        }
+    }
+    static bool deserialize_state(State& st, const uint8_t* data, size_t len) {
+        using boost::multiprecision::cpp_int;
+        if (len == 0u) { st.s = 0; return true; }
+        cpp_int val = 0;
+        for (size_t i = len; i > 0u; --i)
+            val = (val << 8) | cpp_int(data[i - 1u]);
+        st.s = val;
+        return true;
     }
 };
 
@@ -958,6 +1122,20 @@ struct LimbBackend {
         char buf[17];
         std::snprintf(buf, sizeof(buf), "%016" PRIx64, low64);
         return std::string(buf);
+    }
+
+    // Checkpoint serialization: export limb array as raw bytes.
+    static constexpr uint8_t backend_id() noexcept { return kChkBkLimb; }
+    static void serialize_state(const State& st, std::vector<uint8_t>& out) {
+        const size_t n_bytes = static_cast<size_t>(st.nlimbs) * sizeof(uint64_t);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(st.s.data());
+        out.insert(out.end(), p, p + n_bytes);
+    }
+    static bool deserialize_state(State& st, const uint8_t* data, size_t len) {
+        const size_t expected = static_cast<size_t>(st.nlimbs) * sizeof(uint64_t);
+        if (len != expected) return false;
+        std::memcpy(st.s.data(), data, len);
+        return true;
     }
 };
 
@@ -1941,9 +2119,41 @@ struct FftMersenneBackend {
         std::snprintf(buf, sizeof(buf), "%016" PRIx64, low64);
         return std::string(buf);
     }
+
+    // Checkpoint serialization: export the DWT digit array as raw double bytes.
+    // All precomputed tables (twiddles, weights, etc.) are reconstructed from p
+    // via init(), so only the digits need to be saved.
+    static constexpr uint8_t backend_id() noexcept { return kChkBkFft; }
+    static void serialize_state(const State& st, std::vector<uint8_t>& out) {
+        const size_t n_bytes = st.digits.size() * sizeof(double);
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(st.digits.data());
+        out.insert(out.end(), p, p + n_bytes);
+    }
+    static bool deserialize_state(State& st, const uint8_t* data, size_t len) {
+        const size_t expected = st.digits.size() * sizeof(double);
+        if (len != expected) return false;
+        std::memcpy(st.digits.data(), data, len);
+        return true;
+    }
 };
 
 }  // namespace backend
+
+// ============================================================
+// Checkpoint run support types
+// ============================================================
+enum class CheckpointStatus {
+    completed_prime,
+    completed_composite,
+    soft_stopped   // iteration limit reached; checkpoint written
+};
+
+struct CheckpointRunResult {
+    CheckpointStatus status{CheckpointStatus::completed_composite};
+    uint32_t iters_done{0};      // iterations completed before stop/end
+    std::string residue_hex;     // empty if soft_stopped
+    std::string chk_file;        // path of last checkpoint written (empty if none)
+};
 
 // ============================================================
 // LucasLehmerEngine – drives the hot loop with a chosen backend.
@@ -2060,6 +2270,142 @@ public:
 
     double max_roundoff() const { return Backend::max_roundoff(state_); }
 
+    // run_checkpointed: like run() but with mid-exponent checkpoint/resume
+    // and optional soft-stop.
+    //
+    //   resume_iter        – iterations already completed (0 = fresh start).
+    //   resume_data/len    – serialized backend state to restore (nullptr = fresh).
+    //   chk_dir            – directory for checkpoint files ("" = no checkpointing).
+    //   chk_interval       – write checkpoint every N iterations (0 → 500 000).
+    //   soft_stop_epoch    – stop if time(nullptr) >= this value (0 = no soft stop).
+    //
+    // Returns CheckpointRunResult with status, iters_done, and checkpoint path.
+    CheckpointRunResult run_checkpointed(
+        bool           progress,
+        uint32_t       resume_iter,
+        const uint8_t* resume_data,
+        size_t         resume_data_len,
+        const std::string& chk_dir,
+        uint32_t       chk_interval,
+        int64_t        soft_stop_epoch)
+    {
+        CheckpointRunResult result;
+
+        if (p_ < 2u) return result;
+        if (p_ == 2u) {
+            result.status = CheckpointStatus::completed_prime;
+            result.residue_hex = "0000000000000000";
+            return result;
+        }
+        if ((p_ & 1u) == 0u) return result;
+        if (!benchmark_mode_ && !mersenne::is_prime_exponent(p_)) return result;
+
+        // Restore state from checkpoint if provided.
+        if (resume_iter > 0u && resume_data && resume_data_len > 0u) {
+            if (!Backend::deserialize_state(state_, resume_data, resume_data_len)) {
+                std::fprintf(stderr,
+                    "checkpoint: deserialize failed for p=%u; restarting from iteration 0\n",
+                    p_);
+                state_ = Backend::init(p_);
+                resume_iter = 0u;
+            }
+        }
+
+        const uint32_t total_iters = p_ - 2u;
+        const uint32_t start = (resume_iter < total_iters) ? resume_iter : total_iters;
+
+        if (start >= total_iters) {
+            result.iters_done = total_iters;
+            const bool ip = Backend::is_zero(state_);
+            result.status = ip ? CheckpointStatus::completed_prime
+                               : CheckpointStatus::completed_composite;
+            result.residue_hex = ip ? "0000000000000000"
+                                    : Backend::residue_hex(state_);
+            return result;
+        }
+
+        // Build checkpoint path (empty = no checkpointing).
+        std::string chk_path;
+        if (!chk_dir.empty()) {
+            char fname[64];
+            // Zero-pad exponent to 10 digits for lexicographic sort.
+            std::snprintf(fname, sizeof(fname), "/ll_chk_%010u.bin", p_);
+            chk_path = chk_dir + fname;
+        }
+
+        const uint32_t eff_interval = (chk_interval > 0u) ? chk_interval : 500000u;
+        uint32_t next_chk_iter = start + eff_interval;
+
+        const auto t_start  = std::chrono::steady_clock::now();
+        uint32_t   countdown = 10000u;
+        double     ema_avg   = 0.0;
+
+        for (uint32_t i = start; i < total_iters; ++i) {
+            Backend::step(state_);
+
+            if (progress && --countdown == 0u) {
+                countdown = 10000u;
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsed =
+                    std::chrono::duration<double>(now - t_start).count();
+                const double avg_i = elapsed / static_cast<double>(i - start + 1u);
+                ema_avg = (ema_avg == 0.0) ? avg_i : (0.3 * avg_i + 0.7 * ema_avg);
+                const double rem = ema_avg * static_cast<double>(total_iters - (i + 1u));
+                const double pct = 100.0 * static_cast<double>(i + 1u)
+                                         / static_cast<double>(total_iters);
+                std::printf("  iter %u/%u (%.1f%%)  elapsed %.1fs  ETA %.1fs"
+                            "  avg %.3fus/iter  max_err %.4f\n",
+                            i + 1u, total_iters, pct, elapsed, rem,
+                            avg_i * 1e6, Backend::max_roundoff(state_));
+                std::fflush(stdout);
+            }
+
+            // Soft-stop check every 10 000 iterations to amortize time() overhead.
+            if (soft_stop_epoch != 0 && (i + 1u) % 10000u == 0u) {
+                if (static_cast<int64_t>(std::time(nullptr)) >= soft_stop_epoch) {
+                    // Save checkpoint and exit with soft_stopped status.
+                    if (!chk_path.empty()) {
+                        std::vector<uint8_t> data;
+                        Backend::serialize_state(state_, data);
+                        if (save_checkpoint_file(chk_path, Backend::backend_id(),
+                                                 p_, i + 1u, data))
+                            result.chk_file = chk_path;
+                    }
+                    result.status     = CheckpointStatus::soft_stopped;
+                    result.iters_done = i + 1u;
+                    return result;
+                }
+            }
+
+            // Periodic checkpoint.
+            if (!chk_path.empty() && (i + 1u) >= next_chk_iter) {
+                std::vector<uint8_t> data;
+                Backend::serialize_state(state_, data);
+                if (save_checkpoint_file(chk_path, Backend::backend_id(),
+                                         p_, i + 1u, data))
+                    result.chk_file = chk_path;
+                next_chk_iter += eff_interval;
+            }
+        }
+
+        result.iters_done = total_iters;
+        const bool ip = Backend::is_zero(state_);
+        result.status     = ip ? CheckpointStatus::completed_prime
+                               : CheckpointStatus::completed_composite;
+        result.residue_hex = ip ? "0000000000000000"
+                                : Backend::residue_hex(state_);
+
+        // Write final checkpoint (marks completion).
+        if (!chk_path.empty()) {
+            std::vector<uint8_t> data;
+            Backend::serialize_state(state_, data);
+            if (save_checkpoint_file(chk_path, Backend::backend_id(),
+                                     p_, total_iters, data))
+                result.chk_file = chk_path;
+        }
+        return result;
+    }
+
 private:
     uint32_t p_;
     bool     benchmark_mode_;
@@ -2147,6 +2493,52 @@ LLResult lucas_lehmer_ex(uint32_t p, bool progress, bool benchmark_mode,
     }
     LucasLehmerEngine<backend::FftMersenneBackend> eng(p, /*benchmark_mode=*/true);
     return eng.run_ex(progress, ctx);
+}
+
+// lucas_lehmer_checkpointed: like lucas_lehmer() but with checkpoint/resume
+// support.  Backend is auto-selected by exponent size.
+//
+// resume_iter/resume_data – loaded from a prior checkpoint (0/nullptr = fresh).
+// chk_dir                 – directory for checkpoint files ("" = no checkpointing).
+// chk_interval            – write checkpoint every N iterations (0 → 500 000).
+// soft_stop_epoch         – stop if time(nullptr) >= this Unix timestamp (0 = no stop).
+CheckpointRunResult lucas_lehmer_checkpointed(
+    uint32_t p, bool progress, bool benchmark_mode,
+    uint32_t resume_iter, const uint8_t* resume_data, size_t resume_data_len,
+    const std::string& chk_dir, uint32_t chk_interval, int64_t soft_stop_epoch)
+{
+    if (p < 2u || (p > 2u && (p & 1u) == 0u))
+        return CheckpointRunResult{};
+
+    if (p < 128u) {
+        LucasLehmerEngine<backend::GenericBackend> eng(p, benchmark_mode);
+        return eng.run_checkpointed(progress, resume_iter, resume_data,
+                                    resume_data_len, chk_dir, chk_interval,
+                                    soft_stop_epoch);
+    }
+
+    // Reuse same crossover threshold as lucas_lehmer().
+    static const uint32_t kCrossoverChk = []() -> uint32_t {
+        const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
+        if (env && *env) {
+            char* end = nullptr;
+            const long v = std::strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v > 0 && v < 1000000L)
+                return static_cast<uint32_t>(v);
+        }
+        return 4000u;
+    }();
+
+    if (p < kCrossoverChk) {
+        LucasLehmerEngine<backend::LimbBackend> eng(p, benchmark_mode);
+        return eng.run_checkpointed(progress, resume_iter, resume_data,
+                                    resume_data_len, chk_dir, chk_interval,
+                                    soft_stop_epoch);
+    }
+    LucasLehmerEngine<backend::FftMersenneBackend> eng(p, benchmark_mode);
+    return eng.run_checkpointed(progress, resume_iter, resume_data,
+                                resume_data_len, chk_dir, chk_interval,
+                                soft_stop_epoch);
 }
 
 }  // namespace mersenne
@@ -2420,6 +2812,27 @@ static bool env_bool(const char* name, bool def = false) {
            std::strcmp(s, "yes") == 0;
 }
 
+// Parse a signed 64-bit integer from an environment variable (used for epoch timestamps).
+static int64_t env_int64(const char* name, int64_t def) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return def;
+    char* end = nullptr;
+    errno = 0;
+    const long long v = std::strtoll(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') {
+        std::fprintf(stderr, "Invalid %s='%s'; using default %" PRId64 "\n",
+                     name, s, def);
+        return def;
+    }
+    return static_cast<int64_t>(v);
+}
+
+// Parse a string environment variable.
+static std::string env_string(const char* name, const char* def = "") {
+    const char* s = std::getenv(name);
+    return (s && *s) ? std::string(s) : std::string(def);
+}
+
 // Discover-mode entry point (called from main when LL_SWEEP_MODE=discover).
 static int run_discover_mode(int argc, char** argv) {
     const unsigned maxCores = runtime::detect_available_cores();
@@ -2434,6 +2847,12 @@ static int run_discover_mode(int argc, char** argv) {
     const bool reverse_order    = env_bool("LL_REVERSE_ORDER");
     const bool dry_run          = env_bool("LL_DRY_RUN");
     const bool progress         = env_bool("LL_PROGRESS");
+
+    // Checkpoint / soft-stop parameters (ignored unless LL_CHECKPOINT_DIR is set).
+    const std::string chk_dir       = env_string("LL_CHECKPOINT_DIR");
+    const uint32_t    chk_interval  = env_uint32("LL_CHECKPOINT_INTERVAL_ITERS", 0u);
+    const int64_t     soft_stop_epoch = env_int64("LL_SOFT_STOP_EPOCH_SECS", 0);
+    const std::string resume_chk_file = env_string("LL_RESUME_CHECKPOINT_FILE");
 
     unsigned threads = maxCores;
     if (argc >= 3 && argv[2] && argv[2][0] != '\0') {
@@ -2492,6 +2911,12 @@ static int run_discover_mode(int argc, char** argv) {
     std::printf("  exponents_in_list: %zu\n", exps.size());
     std::printf("  threads          : %u / %u available\n", threads, maxCores);
     std::printf("  dry_run          : %s\n", dry_run ? "yes" : "no");
+    if (!chk_dir.empty())
+        std::printf("  checkpoint_dir   : %s\n", chk_dir.c_str());
+    if (!resume_chk_file.empty())
+        std::printf("  resume_checkpoint: %s\n", resume_chk_file.c_str());
+    if (soft_stop_epoch != 0)
+        std::printf("  soft_stop_epoch  : %" PRId64 "\n", soft_stop_epoch);
     if (!run_url.empty())
         std::printf("  workflow_run     : %s\n", run_url.c_str());
     std::printf("\n");
@@ -2519,6 +2944,7 @@ static int run_discover_mode(int argc, char** argv) {
     results.reserve(exps.size());
 
     bool any_new_discovery = false;
+    bool any_soft_stopped  = false;
     uint64_t tested = 0u;
 
     for (size_t i = 0; i < exps.size(); ++i) {
@@ -2552,10 +2978,80 @@ static int run_discover_mode(int argc, char** argv) {
         }
         const uint32_t p32 = static_cast<uint32_t>(p);
 
-        const auto t0     = std::chrono::steady_clock::now();
-        const bool isPrime = mersenne::lucas_lehmer(p32, progress, /*benchmark_mode=*/false);
-        const auto t1     = std::chrono::steady_clock::now();
-        const double elapsed = std::chrono::duration<double>(t1 - t0).count();
+        // Load checkpoint for resume if one was specified (only applies to the
+        // first/single exponent when force-resuming from a prior partial run).
+        uint32_t resume_iter = 0u;
+        std::vector<uint8_t> resume_data;
+        if (!resume_chk_file.empty() && i == 0u) {
+            LoadedCheckpoint lc = load_checkpoint_file(resume_chk_file);
+            if (lc.valid && lc.p == p32) {
+                resume_iter = lc.iter;
+                resume_data = std::move(lc.data);
+                std::printf("  Resuming M_%" PRIu64 " from checkpoint: iter=%u\n",
+                            p, resume_iter);
+            } else if (lc.valid) {
+                std::fprintf(stderr,
+                    "Warning: checkpoint exponent %u != current exponent %" PRIu64
+                    "; ignoring checkpoint\n", lc.p, p);
+            }
+        }
+
+        bool isPrime = false;
+        double elapsed = 0.0;
+        std::string chk_written;
+
+        // Use checkpointed path when checkpoint dir is configured.
+        if (!chk_dir.empty() || soft_stop_epoch != 0) {
+            // Ensure checkpoint directory exists.
+            if (!chk_dir.empty()) {
+                if (ll_mkdir(chk_dir.c_str(), 0755) != 0 && errno != EEXIST)
+                    std::fprintf(stderr, "Warning: cannot create checkpoint dir '%s': %s\n",
+                                 chk_dir.c_str(), std::strerror(errno));
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            CheckpointRunResult chk = mersenne::lucas_lehmer_checkpointed(
+                p32, progress, /*benchmark_mode=*/false,
+                resume_iter,
+                resume_data.empty() ? nullptr : resume_data.data(),
+                resume_data.size(),
+                chk_dir, chk_interval, soft_stop_epoch);
+            const auto t1 = std::chrono::steady_clock::now();
+            elapsed = std::chrono::duration<double>(t1 - t0).count();
+            chk_written = chk.chk_file;
+
+            if (chk.status == CheckpointStatus::soft_stopped) {
+                any_soft_stopped = true;
+                std::printf("M_%" PRIu64 ": soft stop at iter %u (checkpoint: %s)\n",
+                            p, chk.iters_done,
+                            chk_written.empty() ? "(none)" : chk_written.c_str());
+
+                // Write a partial DiscoverResult so the result files are still useful.
+                DiscoverResult r;
+                r.exponent          = p;
+                r.is_prime          = false;  // unknown until completed
+                r.is_known          = mersenne::is_known_mersenne_prime(p);
+                r.is_new_discovery  = false;
+                r.is_explicit_first = is_first;
+                r.elapsed_sec       = elapsed;
+                r.threads           = threads;
+                r.shard_index       = shard_index;
+                r.shard_count       = shard_count;
+                r.backend_name      = discover_backend_name(p) + "_partial";
+                results.push_back(r);
+                ++tested;
+
+                // Print checkpoint path for the workflow to pick up.
+                if (!chk_written.empty())
+                    std::printf("CHECKPOINT_FILE=%s\n", chk_written.c_str());
+                break;  // stop processing further exponents
+            }
+            isPrime = (chk.status == CheckpointStatus::completed_prime);
+        } else {
+            const auto t0 = std::chrono::steady_clock::now();
+            isPrime = mersenne::lucas_lehmer(p32, progress, /*benchmark_mode=*/false);
+            const auto t1 = std::chrono::steady_clock::now();
+            elapsed = std::chrono::duration<double>(t1 - t0).count();
+        }
 
         const bool is_known = mersenne::is_known_mersenne_prime(p);
         const bool is_new   = isPrime && !is_known;
@@ -2659,6 +3155,10 @@ static int run_discover_mode(int argc, char** argv) {
     if (any_new_discovery) {
         std::printf("NEW DISCOVERIES FOUND — see discovery_event.json and discover_results.json\n");
         return 3;  // distinct exit code for discovery
+    }
+    if (any_soft_stopped) {
+        std::printf("SOFT STOP — checkpoint written; dispatch resume run.\n");
+        return 4;  // exit code 4 = soft stop with checkpoint
     }
     return 0;
 }
