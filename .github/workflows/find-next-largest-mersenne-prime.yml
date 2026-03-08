@@ -367,12 +367,22 @@ jobs:
           echo "Is resume       : ${IS_RESUME}"
           echo "Resume chk file : '${RESUME_CHK_FILE}'"
 
-          RESUME_FLAG=""
+          # Determine the resume checkpoint path (empty string when not resuming).
+          # Using an always-present LL_RESUME_CHECKPOINT_FILE avoids a bash
+          # assignment-chain parsing bug: an unquoted ${RESUME_FLAG} that
+          # expands to the empty string in the middle of a VAR=val chain causes
+          # bash to treat all preceding assignments as standalone shell
+          # assignments rather than env-var prefixes for the command, which in
+          # turn makes the next VAR=val token the "command" being executed,
+          # yielding exit code 127 and "No such file or directory".
+          RESUME_CHK_PATH=""
           if [[ "${IS_RESUME}" == "true" && -n "${RESUME_CHK_FILE}" && -f "${RESUME_CHK_FILE}" ]]; then
-            RESUME_FLAG="LL_RESUME_CHECKPOINT_FILE=${RESUME_CHK_FILE}"
+            RESUME_CHK_PATH="${RESUME_CHK_FILE}"
           fi
 
           # Run the binary.  Exit code 4 = soft stop.
+          # GITHUB_STEP_SUMMARY is already present in the inherited environment
+          # (set by the GitHub Actions runner); no need to re-export it here.
           set +e
           LL_SWEEP_MODE=discover \
           LL_SINGLE_EXPONENT="${CURRENT_EXPONENT}" \
@@ -387,8 +397,7 @@ jobs:
           LL_FFT_THREADS="${FFT_THREADS}" \
           LL_FFT_ALLOW_NESTED="${FFT_ALLOW_NESTED}" \
           LL_OUTPUT_DIR="discover_out/" \
-          ${RESUME_FLAG} \
-          GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY}" \
+          LL_RESUME_CHECKPOINT_FILE="${RESUME_CHK_PATH}" \
           ./bin/bignum 0 "${LL_THREADS}" 2>&1 | tee discover_out/run.log
           LL_EXIT=$?
           set -e
