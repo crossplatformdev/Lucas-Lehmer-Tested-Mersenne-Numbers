@@ -65,7 +65,21 @@
 #include <ctime>
 #include <fstream>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#include <direct.h>
+#include <windows.h>
+#else
 #include <sched.h>
+#endif
+
+static inline int ll_mkdir(const char* path, int mode) {
+#if defined(_WIN32)
+    (void)mode;
+    return _mkdir(path);
+#else
+    return ::mkdir(path, mode);
+#endif
+}
 
 // ============================================================
 // namespace runtime
@@ -73,12 +87,17 @@
 namespace runtime {
 
 unsigned detect_available_cores() {
+#if defined(__linux__)
     cpu_set_t set;
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof(set), &set) == 0) {
         const int count = CPU_COUNT(&set);
         if (count > 0) return static_cast<unsigned>(count);
     }
+#elif defined(_WIN32)
+    const DWORD count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    if (count > 0u) return static_cast<unsigned>(count);
+#endif
     const unsigned hc = std::thread::hardware_concurrency();
     return hc == 0u ? 1u : hc;
 }
@@ -796,82 +815,99 @@ struct LimbBackend {
             karatsuba_sq(st.s.data(), n, st.sq.data(), st.scratch.data());
         }
 
-        // 2. Mersenne fold: s = (sq mod 2^p) + (sq >> p)
+        // 2. Mersenne fold: only if sq > M_p, skip reduction otherwise.
+        //    This avoids unnecessary modulo work when the squared value is already in range.
         {
-            const int    limb_shift = st.limb_shift;  // precomputed in init()
-            const int    bit_shift  = st.partial;     // p % 64
-
-            if (bit_shift == 0) {
-                // p is limb-aligned
-                uint64_t carry = 0;
-                for (int i = 0; i < n; ++i) {
-                    u128_t t =
-                        (u128_t)st.sq[i] + st.sq[i + n] + carry;
-                    st.s[i] = (uint64_t)t;
-                    carry    = (uint64_t)(t >> 64);
-                }
-                if (carry) {
-                    uint64_t c2 = carry;
-                    for (int i = 0; c2 && i < n; ++i) {
-                        u128_t t = (u128_t)st.s[i] + c2;
-                        st.s[i] = (uint64_t)t;
-                        c2       = (uint64_t)(t >> 64);
-                    }
-                }
-            } else {
-                uint64_t carry = 0;
-                for (int i = 0; i < n; ++i) {
-                    const uint64_t lo_i = (i < limb_shift)    ? st.sq[i]
-                                        : (i == limb_shift) ? (st.sq[i] & st.top_mask)
-                                                             : uint64_t(0);
-                    const int src = limb_shift + i;
-                    const uint64_t hi_lo = (src < 2 * n) ? (st.sq[src] >> bit_shift) : uint64_t(0);
-                    const uint64_t hi_hi = (src + 1 < 2 * n)
-                        ? (st.sq[src + 1] << (64 - bit_shift))
-                        : uint64_t(0);
-                    const uint64_t hi_i  = hi_lo | hi_hi;
-
-                    u128_t t = (u128_t)lo_i + hi_i + carry;
-                    st.s[i] = (uint64_t)t;
-                    carry    = (uint64_t)(t >> 64);
-                }
-                // For non-limb-aligned p: n*64 - p = 64 - partial > 0, so the
-                // n-limb addition result fits in n*64 bits (lo+hi < 2^{p+1} < 2^{n*64}).
-                // carry must be 0: lo+hi < 2^p + 2^p = 2^{p+1} ≤ 2^{n*64-1} < 2^{n*64}.
-                assert(carry == 0);
-                // Extract overflow bits above bit position (partial-1) from the top limb
-                // and fold back: 2^p ≡ 1 mod M_p.
-                uint64_t overflow = st.s[n - 1] >> bit_shift;
-                st.s[n - 1] &= st.top_mask;
-                if (overflow) {
-                    uint64_t c2 = overflow;
-                    for (int i = 0; c2 && i < n; ++i) {
-                        u128_t t = (u128_t)st.s[i] + c2;
-                        st.s[i] = (uint64_t)t;
-                        c2       = (uint64_t)(t >> 64);
-                    }
-                    // Re-mask after potential carry into top limb.
-                    overflow = st.s[n - 1] >> bit_shift;
-                    if (overflow) {
-                        st.s[n - 1] &= st.top_mask;
-                        uint64_t c3 = overflow;
-                        for (int i = 0; c3 && i < n; ++i) {
-                            u128_t t = (u128_t)st.s[i] + c3;
-                            st.s[i] = (uint64_t)t;
-                            c3       = (uint64_t)(t >> 64);
-                        }
-                        st.s[n - 1] &= st.top_mask;
-                    }
+            bool needs_fold = false;
+            for (int i = n; i < 2 * n; ++i) {
+                if (st.sq[i] != 0u) {
+                    needs_fold = true;
+                    break;
                 }
             }
+            if (!needs_fold && (st.sq[n - 1] & ~st.top_mask) != 0u) {
+                needs_fold = true;
+            }
 
-            // Normalize M_p (= 2^p - 1) to 0.
-            bool all_ones = ((st.s[n - 1] & st.top_mask) == st.top_mask);
-            if (all_ones) {
-                for (int i = 0; i < n - 1 && all_ones; ++i)
-                    if (st.s[i] != ~uint64_t(0)) all_ones = false;
-                if (all_ones)
-                    std::fill(st.s.begin(), st.s.end(), uint64_t(0));
+            if (!needs_fold) {
+                std::copy_n(st.sq.data(), static_cast<size_t>(n), st.s.data());
+                st.s[n - 1] &= st.top_mask;
+            } else {
+                const int    limb_shift = st.limb_shift;  // precomputed in init()
+                const int    bit_shift  = st.partial;     // p % 64
+
+                if (bit_shift == 0) {
+                    // p is limb-aligned
+                    uint64_t carry = 0;
+                    for (int i = 0; i < n; ++i) {
+                        u128_t t =
+                            (u128_t)st.sq[i] + st.sq[i + n] + carry;
+                        st.s[i] = (uint64_t)t;
+                        carry    = (uint64_t)(t >> 64);
+                    }
+                    if (carry) {
+                        uint64_t c2 = carry;
+                        for (int i = 0; c2 && i < n; ++i) {
+                            u128_t t = (u128_t)st.s[i] + c2;
+                            st.s[i] = (uint64_t)t;
+                            c2       = (uint64_t)(t >> 64);
+                        }
+                    }
+                } else {
+                    uint64_t carry = 0;
+                    for (int i = 0; i < n; ++i) {
+                        const uint64_t lo_i = (i < limb_shift)    ? st.sq[i]
+                                            : (i == limb_shift) ? (st.sq[i] & st.top_mask)
+                                                                 : uint64_t(0);
+                        const int src = limb_shift + i;
+                        const uint64_t hi_lo = (src < 2 * n) ? (st.sq[src] >> bit_shift) : uint64_t(0);
+                        const uint64_t hi_hi = (src + 1 < 2 * n)
+                            ? (st.sq[src + 1] << (64 - bit_shift))
+                            : uint64_t(0);
+                        const uint64_t hi_i  = hi_lo | hi_hi;
+
+                        u128_t t = (u128_t)lo_i + hi_i + carry;
+                        st.s[i] = (uint64_t)t;
+                        carry    = (uint64_t)(t >> 64);
+                    }
+                    // For non-limb-aligned p: n*64 - p = 64 - partial > 0, so the
+                    // n-limb addition result fits in n*64 bits (lo+hi < 2^{p+1} < 2^{n*64}).
+                    // carry must be 0: lo+hi < 2^p + 2^p = 2^{p+1} ≤ 2^{n*64-1} < 2^{n*64}.
+                    assert(carry == 0);
+                    // Extract overflow bits above bit position (partial-1) from the top limb
+                    // and fold back: 2^p ≡ 1 mod M_p.
+                    uint64_t overflow = st.s[n - 1] >> bit_shift;
+                    st.s[n - 1] &= st.top_mask;
+                    if (overflow) {
+                        uint64_t c2 = overflow;
+                        for (int i = 0; c2 && i < n; ++i) {
+                            u128_t t = (u128_t)st.s[i] + c2;
+                            st.s[i] = (uint64_t)t;
+                            c2       = (uint64_t)(t >> 64);
+                        }
+                        // Re-mask after potential carry into top limb.
+                        overflow = st.s[n - 1] >> bit_shift;
+                        if (overflow) {
+                            st.s[n - 1] &= st.top_mask;
+                            uint64_t c3 = overflow;
+                            for (int i = 0; c3 && i < n; ++i) {
+                                u128_t t = (u128_t)st.s[i] + c3;
+                                st.s[i] = (uint64_t)t;
+                                c3       = (uint64_t)(t >> 64);
+                            }
+                            st.s[n - 1] &= st.top_mask;
+                        }
+                    }
+                }
+
+                // Normalize M_p (= 2^p - 1) to 0.
+                bool all_ones = ((st.s[n - 1] & st.top_mask) == st.top_mask);
+                if (all_ones) {
+                    for (int i = 0; i < n - 1 && all_ones; ++i)
+                        if (st.s[i] != ~uint64_t(0)) all_ones = false;
+                    if (all_ones)
+                        std::fill(st.s.begin(), st.s.end(), uint64_t(0));
+                }
             }
         }
 
@@ -1282,11 +1318,12 @@ private:
             break;
         }
 
-        // Step 3: fused post-process + pointwise square + pre-process, k=1..M/2.
-        // (k=0 DC+Nyquist case is handled sequentially by main before dispatch.)
+        // Step 3: fused post-process + pointwise square + pre-process, k=1..(M/2-1).
+        // (k=0 DC+Nyquist and k=M/2 are handled sequentially by main.)
         case WorkPhase::Kind::POST_SQ_PRE: {
             const size_t M       = p.n;
-            const size_t total_k = M / 2u;
+            const size_t total_k = (M >= 2u) ? (M / 2u - 1u) : 0u;
+            if (total_k == 0u) break;
             const size_t kchunk  = (total_k + total - 1u) / total;
             const size_t k_lo    = 1u + static_cast<size_t>(tid) * kchunk;
             const size_t k_hi    = std::min(k_lo + kchunk, 1u + total_k);
@@ -1304,25 +1341,20 @@ private:
                 const double xk_im = pi + wr * qi + wi * qr;
                 const double yk_re = xk_re * xk_re - xk_im * xk_im;
                 const double yk_im = xk_re * xk_im * 2.0;
-                if (mk == k) {
-                    p.re[k] = yk_re;
-                    p.im[k] = -yk_im;
-                } else {
-                    const double xm_re = pr - (wr * qr - wi * qi);
-                    const double xm_im = -pi + (wr * qi + wi * qr);
-                    const double ym_re = xm_re * xm_re - xm_im * xm_im;
-                    const double ym_im = xm_re * xm_im * 2.0;
-                    const double ep_re = (yk_re + ym_re) * 0.5;
-                    const double ep_im = (yk_im - ym_im) * 0.5;
-                    const double vk_re = yk_re - ym_re;
-                    const double vk_im = yk_im + ym_im;
-                    const double t1    = (wi * vk_re - wr * vk_im) * 0.5;
-                    const double t2    = (wr * vk_re + wi * vk_im) * 0.5;
-                    p.re[k]  = ep_re + t1;
-                    p.im[k]  = ep_im + t2;
-                    p.re[mk] = ep_re - t1;
-                    p.im[mk] = -ep_im + t2;
-                }
+                const double xm_re = pr - (wr * qr - wi * qi);
+                const double xm_im = -pi + (wr * qi + wi * qr);
+                const double ym_re = xm_re * xm_re - xm_im * xm_im;
+                const double ym_im = xm_re * xm_im * 2.0;
+                const double ep_re = (yk_re + ym_re) * 0.5;
+                const double ep_im = (yk_im - ym_im) * 0.5;
+                const double vk_re = yk_re - ym_re;
+                const double vk_im = yk_im + ym_im;
+                const double t1    = (wi * vk_re - wr * vk_im) * 0.5;
+                const double t2    = (wr * vk_re + wi * vk_im) * 0.5;
+                p.re[k]  = ep_re + t1;
+                p.im[k]  = ep_im + t2;
+                p.re[mk] = ep_re - t1;
+                p.im[mk] = -ep_im + t2;
             }
             break;
         }
@@ -1725,7 +1757,7 @@ static void fft_square(FftMersenneState& st) {
                 st.tw_re_half.data(), st.tw_im_half.data(),
                 M, team);
 
-    // ---- Step 3: fused postprocess + pointwise square + preprocess ----
+    // Step 3: fused postprocess + pointwise square + preprocess ----
     // k=0 (DC + Nyquist): always on main thread.
     {
         const double a = hr[0], b = hi[0];
@@ -1734,7 +1766,7 @@ static void fft_square(FftMersenneState& st) {
         hr[0] = (y0 + ym) * 0.5;
         hi[0] = (y0 - ym) * 0.5;
     }
-    // k=1..M/2: parallel when team available.
+    // k=1..(M/2-1): parallel when team available.
     if (team) {
         FftTeam::WorkPhase p;
         p.kind  = FftTeam::WorkPhase::Kind::POST_SQ_PRE;
@@ -1743,7 +1775,7 @@ static void fft_square(FftMersenneState& st) {
         p.n     = M;
         team->dispatch(p);
     } else {
-        for (size_t k = 1; k <= M / 2; ++k) {
+        for (size_t k = 1; k < M / 2; ++k) {
             const size_t mk    = M - k;
             const double zk_re = hr[k],  zk_im = hi[k];
             const double zm_re = hr[mk], zm_im = hi[mk];
@@ -1757,26 +1789,35 @@ static void fft_square(FftMersenneState& st) {
             const double xk_im = pi_ + wr * qi + wi * qr;
             const double yk_re = xk_re * xk_re - xk_im * xk_im;
             const double yk_im = xk_re * xk_im * 2.0;
-            if (mk == k) {
-                hr[k] = yk_re;
-                hi[k] = -yk_im;
-            } else {
-                const double xm_re = pr - (wr * qr - wi * qi);
-                const double xm_im = -pi_ + (wr * qi + wi * qr);
-                const double ym_re = xm_re * xm_re - xm_im * xm_im;
-                const double ym_im = xm_re * xm_im * 2.0;
-                const double ep_re = (yk_re + ym_re) * 0.5;
-                const double ep_im = (yk_im - ym_im) * 0.5;
-                const double vk_re = yk_re - ym_re;
-                const double vk_im = yk_im + ym_im;
-                const double t1    = (wi * vk_re - wr * vk_im) * 0.5;
-                const double t2    = (wr * vk_re + wi * vk_im) * 0.5;
-                hr[k]  = ep_re + t1;
-                hi[k]  = ep_im + t2;
-                hr[mk] = ep_re - t1;
-                hi[mk] = -ep_im + t2;
-            }
+            const double xm_re = pr - (wr * qr - wi * qi);
+            const double xm_im = -pi_ + (wr * qi + wi * qr);
+            const double ym_re = xm_re * xm_re - xm_im * xm_im;
+            const double ym_im = xm_re * xm_im * 2.0;
+            const double ep_re = (yk_re + ym_re) * 0.5;
+            const double ep_im = (yk_im - ym_im) * 0.5;
+            const double vk_re = yk_re - ym_re;
+            const double vk_im = yk_im + ym_im;
+            const double t1    = (wi * vk_re - wr * vk_im) * 0.5;
+            const double t2    = (wr * vk_re + wi * vk_im) * 0.5;
+            hr[k]  = ep_re + t1;
+            hi[k]  = ep_im + t2;
+            hr[mk] = ep_re - t1;
+            hi[mk] = -ep_im + t2;
         }
+    }
+
+    // k=M/2 (self-conjugate center bin): always on main thread.
+    if (M >= 2u) {
+        const size_t k = M / 2u;
+        const double zk_re = hr[k], zk_im = hi[k];
+        const double wr    = twr[k];
+        const double wi    = twi[k];
+        const double xk_re = zk_re + wr * zk_im;
+        const double xk_im = wi * zk_im;
+        const double yk_re = xk_re * xk_re - xk_im * xk_im;
+        const double yk_im = xk_re * xk_im * 2.0;
+        hr[k] = yk_re;
+        hi[k] = -yk_im;
     }
 
     // ---- Step 4: n/2-point inverse FFT ----
@@ -2429,7 +2470,7 @@ static int run_discover_mode(int argc, char** argv) {
         // Ensure trailing slash.
         if (out_dir.back() != '/') out_dir += '/';
         // Create directory; ignore EEXIST, warn on other errors.
-        if (::mkdir(out_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        if (ll_mkdir(out_dir.c_str(), 0755) != 0 && errno != EEXIST) {
             std::fprintf(stderr,
                 "Warning: cannot create output directory '%s': %s\n",
                 out_dir.c_str(), std::strerror(errno));
@@ -2786,7 +2827,7 @@ static int run_power_bucket_mode(int argc, char** argv) {
     if (out_dir_env && *out_dir_env) {
         out_dir = out_dir_env;
         if (out_dir.back() != '/') out_dir += '/';
-        if (::mkdir(out_dir.c_str(), 0755) != 0 && errno != EEXIST)
+        if (ll_mkdir(out_dir.c_str(), 0755) != 0 && errno != EEXIST)
             std::fprintf(stderr, "Warning: cannot create output directory '%s': %s\n",
                          out_dir.c_str(), std::strerror(errno));
     }
@@ -2842,7 +2883,7 @@ static int run_power_bucket_mode(int argc, char** argv) {
         std::string bdir;
         if (!out_dir.empty()) {
             bdir = out_dir + "bucket_" + std::to_string(n) + "/";
-            if (::mkdir(bdir.c_str(), 0755) != 0 && errno != EEXIST)
+            if (ll_mkdir(bdir.c_str(), 0755) != 0 && errno != EEXIST)
                 std::fprintf(stderr, "Warning: cannot create bucket dir '%s': %s\n",
                              bdir.c_str(), std::strerror(errno));
         }
