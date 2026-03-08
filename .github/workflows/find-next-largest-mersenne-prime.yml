@@ -355,8 +355,11 @@ jobs:
 
           mkdir -p discover_out checkpoint_out
 
-          # Compute soft-stop Unix timestamp = now + max_runtime_seconds - 5 min buffer.
-          # The buffer gives the workflow enough time to save state and dispatch.
+          # Compute soft-stop Unix timestamp = now + max_runtime_seconds - buffer.
+          # BUFFER_SEC (300 s = 5 min) gives the workflow enough time after the
+          # binary stops to: save artifacts, write the step summary, and dispatch
+          # the next workflow_dispatch run before GitHub's own 6-hour hard cap fires.
+          # Increase if large checkpoints (multi-GB FFT state) need more upload time.
           BUFFER_SEC=300
           SOFT_STOP_EPOCH=$(( $(date +%s) + MAX_RUNTIME_SEC - BUFFER_SEC ))
           echo "Soft stop epoch : ${SOFT_STOP_EPOCH} ($(date -d @${SOFT_STOP_EPOCH} -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -r ${SOFT_STOP_EPOCH} '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo 'N/A'))"

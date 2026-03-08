@@ -136,9 +136,12 @@ def is_prime(n: int) -> bool:
 
 def next_prime_after(n: int) -> int:
     """Return the smallest prime strictly greater than n."""
-    candidate = n + 1 if n < 2 else (n + 1 if n % 2 == 0 else n + 2)
-    if candidate < 2:
+    if n < 2:
         candidate = 2
+    elif n % 2 == 0:
+        candidate = n + 1   # n is even: n+1 is odd
+    else:
+        candidate = n + 2   # n is odd: skip next even
     while not is_prime(candidate):
         candidate += 1 if candidate == 2 else 2
     return candidate

@@ -521,7 +521,7 @@ static uint32_t chk_addsum(const uint8_t* buf, size_t len) noexcept {
     return s;
 }
 
-// Write p as four LE bytes into buf.
+// Append a 32-bit unsigned integer v as four consecutive little-endian bytes to buf.
 static void push_le32(std::vector<uint8_t>& buf, uint32_t v) {
     buf.push_back(static_cast<uint8_t>(v));
     buf.push_back(static_cast<uint8_t>(v >>  8));
@@ -529,7 +529,7 @@ static void push_le32(std::vector<uint8_t>& buf, uint32_t v) {
     buf.push_back(static_cast<uint8_t>(v >> 24));
 }
 
-// Read four LE bytes from buf[offset].
+// Read a 32-bit unsigned integer from four consecutive little-endian bytes at buf[0..3].
 static uint32_t read_le32(const uint8_t* buf) noexcept {
     return static_cast<uint32_t>(buf[0])
          | (static_cast<uint32_t>(buf[1]) <<  8)
