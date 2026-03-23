@@ -284,8 +284,153 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libgmp10
 
+      - name: Warmup probe – estimate batch duration
+        id: warmup
+        run: |
+          set -uo pipefail
+
+          PROBE_START="${{ matrix.worker_start_n }}"
+          PROBE_END="${{ matrix.worker_end_n }}"
+          TIME_LIMIT="${{ inputs.time_limit_seconds }}"
+          PROBE_THREADS="${{ inputs.threads }}"
+          WORKER_NAME="${{ matrix.worker_name }}"
+          PROBE_EPOCH="${{ matrix.epoch }}"
+
+          mkdir -p worker_out/
+          STATE_PATH="worker_out/${WORKER_NAME}_state.json"
+
+          echo "=== Warmup probe: ${WORKER_NAME} ==="
+          echo "Range: [${PROBE_START}, ${PROBE_END}], time_limit=${TIME_LIMIT}s"
+          echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Find first prime >= start_n, last prime <= end_n, and estimate prime count.
+          PROBE_INFO=$(PROBE_START="${PROBE_START}" PROBE_END="${PROBE_END}" python3 - <<'PYEOF'
+          import math, os
+
+          def is_prime(n):
+              if n < 2: return False
+              if n == 2: return True
+              if n % 2 == 0: return False
+              d = 3
+              while d * d <= n:
+                  if n % d == 0: return False
+                  d += 2
+              return True
+
+          start_n = int(os.environ["PROBE_START"])
+          end_n   = int(os.environ["PROBE_END"])
+
+          first = 0
+          n = start_n
+          while n <= end_n:
+              if is_prime(n):
+                  first = n
+                  break
+              n += 1
+
+          last = 0
+          n = end_n
+          while n >= start_n:
+              if is_prime(n):
+                  last = n
+                  break
+              n -= 1
+
+          li = lambda x: x / math.log(x) if x > 2 else 1.0
+          num_primes = max(1, int(li(end_n) - li(max(start_n, 3)) + 1))
+
+          print(first, last, num_primes)
+          PYEOF
+          )
+
+          read -r FIRST_PRIME LAST_PRIME NUM_PRIMES <<< "${PROBE_INFO}"
+          echo "Warmup: first_prime=${FIRST_PRIME}, last_prime=${LAST_PRIME}, est_primes=${NUM_PRIMES}"
+
+          SPLIT_NEEDED="false"
+
+          if [ "${FIRST_PRIME}" -eq 0 ] || [ "${LAST_PRIME}" -eq 0 ]; then
+            echo "Warmup: no prime exponents found in range – skipping probe"
+            echo "split_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Per-probe budget: each prime exponent gets its fair share of the total
+          # time limit.  If the last (hardest) prime cannot finish within this budget,
+          # the full batch would exceed the time limit and must be split proactively.
+          PER_PROBE=$(python3 -c "import math; print(max(1, math.ceil(${TIME_LIMIT} / ${NUM_PRIMES})))")
+          echo "Warmup: per-probe timeout = ${PER_PROBE}s  (${TIME_LIMIT}s / ${NUM_PRIMES} primes)"
+
+          # --- Probe the first (smallest/fastest) prime ---
+          echo "Warmup: probing first prime n=${FIRST_PRIME} ..."
+          T0=$(date +%s)
+          set +e
+          SEQMOD_TIME_LIMIT_SECS="${PER_PROBE}" \
+            ./bin/sequence_powermod 1 "${FIRST_PRIME}" "${PROBE_THREADS}"
+          EXIT_FIRST=$?
+          set -e
+          T1=$(date +%s)
+          TIME_FIRST=$(( T1 - T0 ))
+          echo "Warmup: first prime n=${FIRST_PRIME} → ${TIME_FIRST}s  exit=${EXIT_FIRST}"
+
+          if [ "${EXIT_FIRST}" -eq 42 ]; then
+            echo "Warmup: first prime exceeded per-probe budget (${PER_PROBE}s) – split needed"
+            SPLIT_NEEDED="true"
+          else
+            # --- Probe the last (largest/slowest) prime ---
+            echo "Warmup: probing last prime n=${LAST_PRIME} ..."
+            T0=$(date +%s)
+            set +e
+            SEQMOD_TIME_LIMIT_SECS="${PER_PROBE}" \
+              ./bin/sequence_powermod 1 "${LAST_PRIME}" "${PROBE_THREADS}"
+            EXIT_LAST=$?
+            set -e
+            T1=$(date +%s)
+            TIME_LAST=$(( T1 - T0 ))
+            echo "Warmup: last prime n=${LAST_PRIME} → ${TIME_LAST}s  exit=${EXIT_LAST}"
+
+            if [ "${EXIT_LAST}" -eq 42 ]; then
+              echo "Warmup: last prime exceeded per-probe budget (${PER_PROBE}s) – split needed"
+              SPLIT_NEEDED="true"
+            else
+              # Estimate worst-case total: last-prime time × prime count.
+              ESTIMATED=$(( TIME_LAST * NUM_PRIMES ))
+              echo "Warmup: estimated total = ${TIME_LAST}s × ${NUM_PRIMES} = ${ESTIMATED}s  (limit=${TIME_LIMIT}s)"
+              if [ "${ESTIMATED}" -gt "${TIME_LIMIT}" ]; then
+                echo "Warmup: estimate exceeds time limit – split needed"
+                SPLIT_NEEDED="true"
+              else
+                echo "Warmup: estimate within time limit – proceeding with full batch"
+              fi
+            fi
+          fi
+
+          echo "split_needed=${SPLIT_NEEDED}" >> "$GITHUB_OUTPUT"
+
+          # Write a pre-split state file so the reschedule job can binary-split
+          # this range without waiting for the full time limit to expire.
+          if [ "${SPLIT_NEEDED}" = "true" ]; then
+            python3 -c "
+          import json
+          state = {
+              'exit_code':         42,
+              'worker_name':       '${WORKER_NAME}',
+              'start_n':           ${PROBE_START},
+              'end_n':             ${PROBE_END},
+              'epoch':             ${PROBE_EPOCH},
+              'run_id':            '${GITHUB_RUN_ID}',
+              'timed_out':         True,
+              'last_dispatched_n': ${PROBE_START} - 1,
+              'warmup_split':      True,
+          }
+          with open('${STATE_PATH}', 'w') as f:
+              json.dump(state, f, indent=2)
+          print('Warmup pre-split state written.')
+          "
+          fi
+
       - name: Run batch ${{ matrix.worker_name }}
         id: run_batch
+        if: steps.warmup.outputs.split_needed != 'true'
         run: |
           set -uo pipefail
 
@@ -379,13 +524,18 @@ jobs:
       - name: Write step summary
         if: always()
         run: |
+          WARMUP_SPLIT="${{ steps.warmup.outputs.split_needed }}"
           EXIT="${{ steps.run_batch.outputs.exit_code }}"
-          STATUS_LABEL="unknown"
-          case "${EXIT}" in
-            0)  STATUS_LABEL="✅ completed" ;;
-            42) STATUS_LABEL="⏱ timed out (soft stop)" ;;
-            *)  STATUS_LABEL="❌ error (exit ${EXIT})" ;;
-          esac
+          if [ "${WARMUP_SPLIT}" = "true" ]; then
+            STATUS_LABEL="🔀 pre-split by warmup probe (rescheduled)"
+          else
+            case "${EXIT}" in
+              0)  STATUS_LABEL="✅ completed" ;;
+              42) STATUS_LABEL="⏱ timed out (soft stop)" ;;
+              "")  STATUS_LABEL="⏭ skipped" ;;
+              *)  STATUS_LABEL="❌ error (exit ${EXIT})" ;;
+            esac
+          fi
           {
             echo "## Worker: ${{ matrix.worker_name }}"
             echo ""
@@ -394,6 +544,7 @@ jobs:
             echo "| Range | [${{ matrix.worker_start_n }}, ${{ matrix.worker_end_n }}] |"
             echo "| Epoch | ${{ matrix.epoch }} |"
             echo "| Status | ${STATUS_LABEL} |"
+            echo "| Warmup split | ${WARMUP_SPLIT:-false} |"
             echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
