@@ -579,11 +579,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          WORKERS_USED="${{ inputs.workers_used }}"
-          MAX_WORKERS="${{ inputs.max_workers }}"
-          EPOCH="${{ inputs.run_epoch }}"
-          DRY="${{ inputs.dry_run }}"
-          WORKFLOW_FILE="sequence-powermod-sweep.yml"
+          export WORKERS_USED="${{ inputs.workers_used }}"
+          export MAX_WORKERS="${{ inputs.max_workers }}"
+          export EPOCH="${{ inputs.run_epoch }}"
+          export DRY="${{ inputs.dry_run }}"
+          export WORKFLOW_FILE="sequence-powermod-sweep.yml"
 
           echo "=== Reschedule Analysis ==="
           echo "Workers used so far : ${WORKERS_USED}"
