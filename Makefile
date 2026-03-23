@@ -14,6 +14,12 @@ CALLGRIND_BIN := bin/bignum_callgrind
 PLAN_BIN := bin/split_bucket_batches
 PLAN_SRC := src/split_bucket_batches.c
 
+# sequence_powermod: GMP-based Mersenne sequence search binary.
+SEQMOD_SRC  := src/sequence_powermod.cpp
+SEQMOD_BIN  := bin/sequence_powermod
+SEQMOD_CXXFLAGS := -std=c++17 -O3 -march=native -mtune=native -pthread -Wall -Wextra
+SEQMOD_LDFLAGS  := -pthread -lgmp -lgmpxx
+
 # Profiling build uses -O2 (keeps enough optimization to be representative
 # while preserving function call structure for gprof) and -pg.
 PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
@@ -40,7 +46,7 @@ PERF_LDFLAGS  := -pthread
 CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
 CALLGRIND_LDFLAGS  := -pthread
 
-.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool
+.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod
 
 BENCH_START_INDEX ?= 14
 
@@ -56,6 +62,13 @@ $(PLAN_BIN): $(PLAN_SRC)
 
 # plan-tool: build the C plan tool (replaces scripts/split_bucket_batches.py).
 plan-tool: $(PLAN_BIN)
+
+$(SEQMOD_BIN): $(SEQMOD_SRC)
+	@mkdir -p bin
+	$(CXX) $(SEQMOD_CXXFLAGS) $< -o $@ $(SEQMOD_LDFLAGS)
+
+# seqmod: build the GMP-based sequence_powermod binary.
+seqmod: $(SEQMOD_BIN)
 
 $(TEST_BIN): tests/test_bignum.cpp $(SRC)
 	@mkdir -p bin
@@ -236,7 +249,7 @@ callgrind-run: $(CALLGRIND_BIN)
 	    ./$(CALLGRIND_BIN) $(BENCH_START_INDEX) 1
 
 clean:
-	rm -rf bin prof_report.txt gmon.out perf.data callgrind.out discover_out
+	rm -rf bin prof_report.txt gmon.out perf.data callgrind.out discover_out seqmod_out
 
 # ---------------------------------------------------------------------------
 # microbench: FFT Lucas–Lehmer microbenchmark for a single large exponent.

@@ -1,0 +1,733 @@
+name: Sequence Powermod Sweep
+
+# Distributed CI/CD sweep for the GMP-based sequence_powermod algorithm.
+#
+# This workflow tests all prime exponents n in a given [start_n, end_n] range,
+# checking whether M(n) = 2^n − 1 is prime using the algebraic criterion
+# implemented in src/sequence_powermod.cpp.
+#
+# Architecture:
+#   1. validate   – reject invalid inputs early
+#   2. build      – compile bin/sequence_powermod (with GMP)
+#   3. plan       – divide [start_n, end_n] across up to 20 parallel workers
+#   4. worker     – one job per batch (matrix), 4 threads each, 5.95-hour soft stop
+#   5. reschedule – detect timed-out workers; split each range in two and dispatch
+#                   new workflow runs; when the 256-worker budget is exhausted,
+#                   queue another full epoch instead
+#   6. merge      – aggregate all worker CSVs and write the final markdown report
+#
+# Worker exit codes:
+#   0   – completed; all candidates in the batch were tested
+#   42  – soft stop (≥ SEQMOD_TIME_LIMIT_SECS elapsed); partial CSV written
+#   1   – unexpected error
+#
+# Self-chaining:
+#   When a worker exits with code 42 the reschedule job dispatches two new
+#   workflow_dispatch calls — one for each half of the timed-out range.
+#   Each new dispatch is a fully independent run with its own 20-worker matrix.
+#   workers_used is incremented by 2 per split and passed as an input so the
+#   budget is preserved across generations.  When workers_used + 2 > max_workers,
+#   all remaining work is packed into a single new "epoch" dispatch instead.
+#
+# Inputs:
+#   start_n            – first candidate exponent to test (default: 1)
+#   end_n              – last  candidate exponent to test (default: 136279842)
+#   workers            – parallel jobs per run (1–20, default: 20)
+#   threads            – LL threads per worker (1–4, default: 4)
+#   time_limit_seconds – per-worker soft stop in seconds (default: 21420 = 5.95 h)
+#   max_workers        – lifetime worker budget across all chained runs (default: 256)
+#   workers_used       – workers already consumed by prior runs (default: 0)
+#   run_epoch          – generation counter (for artifact naming; default: 1)
+#   dry_run            – if true, print the plan but do not run any tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_n:
+        description: "First candidate exponent to test (≥ 1)"
+        required: false
+        type: string
+        default: "1"
+      end_n:
+        description: "Last candidate exponent to test (default: 136279842)"
+        required: false
+        type: string
+        default: "136279842"
+      workers:
+        description: "Parallel worker jobs per run (1–20)"
+        required: false
+        type: string
+        default: "20"
+      threads:
+        description: "Threads per worker (1–4)"
+        required: false
+        type: string
+        default: "4"
+      time_limit_seconds:
+        description: "Per-worker soft-stop threshold in seconds (5.95 h = 21420)"
+        required: false
+        type: string
+        default: "21420"
+      max_workers:
+        description: "Total worker budget across all chained runs (default: 256)"
+        required: false
+        type: string
+        default: "256"
+      workers_used:
+        description: "Workers already consumed by prior runs (internal; default: 0)"
+        required: false
+        type: string
+        default: "0"
+      run_epoch:
+        description: "Generation counter (internal; default: 1)"
+        required: false
+        type: string
+        default: "1"
+      dry_run:
+        description: "Print the worker plan only – do not run tests"
+        required: false
+        type: boolean
+        default: false
+
+# Allow at most one active run per [start_n, end_n] range so that
+# chained dispatches do not race with each other.
+concurrency:
+  group: seqmod-sweep-${{ inputs.start_n }}-${{ inputs.end_n }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # required for workflow_dispatch reschedule calls
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1: Validate – reject bad inputs before allocating any resources.
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Validate
+        run: |
+          set -euo pipefail
+
+          START="${{ inputs.start_n }}"
+          END="${{ inputs.end_n }}"
+          WORKERS="${{ inputs.workers }}"
+          THREADS="${{ inputs.threads }}"
+          TL="${{ inputs.time_limit_seconds }}"
+          MAX_W="${{ inputs.max_workers }}"
+          USED="${{ inputs.workers_used }}"
+          EPOCH="${{ inputs.run_epoch }}"
+
+          for VAR in START END WORKERS THREADS TL MAX_W USED EPOCH; do
+            VAL="${!VAR}"
+            if ! [[ "$VAL" =~ ^[0-9]+$ ]]; then
+              echo "::error::${VAR} must be a non-negative integer, got '${VAL}'"
+              exit 1
+            fi
+          done
+
+          (( START >= 1 )) || { echo "::error::start_n must be ≥ 1"; exit 1; }
+          (( END >= START )) || { echo "::error::end_n must be ≥ start_n"; exit 1; }
+          (( WORKERS >= 1 && WORKERS <= 20 )) || { echo "::error::workers must be 1–20"; exit 1; }
+          (( THREADS >= 1 && THREADS <= 4  )) || { echo "::error::threads must be 1–4";  exit 1; }
+          (( TL >= 60 )) || { echo "::error::time_limit_seconds must be ≥ 60"; exit 1; }
+          (( MAX_W >= 1 && MAX_W <= 256 )) || { echo "::error::max_workers must be 1–256"; exit 1; }
+          (( EPOCH >= 1 )) || { echo "::error::run_epoch must be ≥ 1"; exit 1; }
+
+          echo "Validated: range=[${START}, ${END}], workers=${WORKERS}, threads=${THREADS}"
+          echo "           time_limit=${TL}s, budget=${MAX_W}, used_so_far=${USED}, epoch=${EPOCH}"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Stage 2: Build – compile the binary and upload it as an artifact.
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build binary
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain + GMP
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++ make libgmp-dev
+
+      - name: Build sequence_powermod
+        run: make seqmod
+
+      - name: Verify binary
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: build | epoch=${{ inputs.run_epoch }}"
+          ./bin/sequence_powermod 20 1 1
+          echo "Binary OK."
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seqmod-binary-epoch${{ inputs.run_epoch }}
+          path: bin/sequence_powermod
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Stage 3: Plan – divide [start_n, end_n] into worker batches.
+  # ─────────────────────────────────────────────────────────────────────────────
+  plan:
+    name: Build worker batch matrix
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      batch_matrix: ${{ steps.make-matrix.outputs.batch_matrix }}
+      batch_count:  ${{ steps.make-matrix.outputs.batch_count }}
+    steps:
+      - name: Generate batch matrix
+        id: make-matrix
+        run: |
+          set -euo pipefail
+
+          START="${{ inputs.start_n }}"
+          END="${{ inputs.end_n }}"
+          WORKERS="${{ inputs.workers }}"
+          DRY="${{ inputs.dry_run }}"
+          EPOCH="${{ inputs.run_epoch }}"
+
+          echo "=== Sequence Powermod Sweep – Planning ==="
+          echo "Range  : [${START}, ${END}]"
+          echo "Workers: ${WORKERS}"
+          echo "Epoch  : ${EPOCH}"
+          echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          python3 - <<'PYEOF'
+          import json, math, os, sys
+
+          start_n  = int(os.environ["START"])
+          end_n    = int(os.environ["END"])
+          workers  = int(os.environ["WORKERS"])
+          epoch    = int(os.environ["EPOCH"])
+
+          total = end_n - start_n + 1
+          batch_size = math.ceil(total / workers)
+
+          batches = []
+          idx = 0
+          n = start_n
+          while n <= end_n:
+            bn_start = n
+            bn_end   = min(n + batch_size - 1, end_n)
+            name     = f"seqmod-e{epoch:02d}-w{idx:03d}-{bn_start}-{bn_end}"
+            batches.append({
+              "worker_name":    name,
+              "worker_start_n": bn_start,
+              "worker_end_n":   bn_end,
+              "worker_index":   idx,
+              "epoch":          epoch,
+            })
+            idx += 1
+            n    = bn_end + 1
+
+          print(f"batch_size   : {batch_size}", file=sys.stderr)
+          print(f"total batches: {len(batches)}", file=sys.stderr)
+          for b in batches:
+              print(f"  [{b['worker_index']:3d}] {b['worker_name']}  "
+                    f"[{b['worker_start_n']}, {b['worker_end_n']}]", file=sys.stderr)
+
+          matrix_json = json.dumps(batches)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
+              gh_out.write(f"batch_matrix={matrix_json}\n")
+              gh_out.write(f"batch_count={len(batches)}\n")
+          PYEOF
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Stage 4: Workers – one job per batch.
+  #
+  # Each worker:
+  #  • Downloads the pre-built binary.
+  #  • Runs sequence_powermod on its [worker_start_n, worker_end_n] slice.
+  #  • Uploads a results CSV and a JSON state file as artifacts.
+  #  • Exits normally (0) or with soft-stop code 42.
+  #  • continue-on-error: true so that a timeout (code 42) does not fail the
+  #    whole workflow matrix.
+  # ─────────────────────────────────────────────────────────────────────────────
+  worker:
+    name: "Worker ${{ matrix.worker_name }}"
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    # No timeout-minutes: the binary enforces the soft stop internally.
+    # GitHub-hosted runners impose a hard 6-hour cap regardless.
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.batch_matrix) }}
+    continue-on-error: true
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: seqmod-binary-epoch${{ matrix.epoch }}
+          path: bin/
+
+      - name: Make binary executable
+        run: chmod +x bin/sequence_powermod
+
+      - name: Install GMP runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp10
+
+      - name: Run batch ${{ matrix.worker_name }}
+        id: run_batch
+        run: |
+          set -uo pipefail
+
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job   : worker"
+          echo "Name  : ${{ matrix.worker_name }}"
+          echo "Range : [${{ matrix.worker_start_n }}, ${{ matrix.worker_end_n }}]"
+          echo "Epoch : ${{ matrix.epoch }}"
+
+          mkdir -p worker_out/
+
+          ITERS=$(( ${{ matrix.worker_end_n }} - ${{ matrix.worker_start_n }} + 1 ))
+          CSV_PATH="worker_out/${{ matrix.worker_name }}.csv"
+          STATE_PATH="worker_out/${{ matrix.worker_name }}_state.json"
+
+          set +e
+          SEQMOD_TIME_LIMIT_SECS="${{ inputs.time_limit_seconds }}" \
+          SEQMOD_OUTPUT_CSV="${CSV_PATH}" \
+          SEQMOD_STATE_FILE="${STATE_PATH}" \
+          ./bin/sequence_powermod \
+            "${ITERS}" \
+            "${{ matrix.worker_start_n }}" \
+            "${{ inputs.threads }}"
+          EXIT_CODE=$?
+          set -e
+
+          echo "Binary exit code: ${EXIT_CODE}"
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+
+          # Augment state JSON with the exit code so the reschedule job can
+          # detect timeouts without parsing binary output.
+          if [ -f "${STATE_PATH}" ]; then
+            python3 - <<PYEOF
+          import json, sys
+          try:
+            with open("${STATE_PATH}") as f:
+              state = json.load(f)
+          except Exception:
+            state = {}
+          state["exit_code"]    = ${EXIT_CODE}
+          state["worker_name"]  = "${{ matrix.worker_name }}"
+          state["start_n"]      = ${{ matrix.worker_start_n }}
+          state["end_n"]        = ${{ matrix.worker_end_n }}
+          state["epoch"]        = ${{ matrix.epoch }}
+          state["run_id"]       = "${GITHUB_RUN_ID}"
+          with open("${STATE_PATH}", "w") as f:
+            json.dump(state, f, indent=2)
+          print("State written:", json.dumps(state, indent=2))
+          PYEOF
+          else
+            # No state file: create a minimal one so the reschedule job can act.
+            python3 -c "
+          import json
+          state = {
+            'exit_code':    ${EXIT_CODE},
+            'worker_name':  '${{ matrix.worker_name }}',
+            'start_n':      ${{ matrix.worker_start_n }},
+            'end_n':        ${{ matrix.worker_end_n }},
+            'epoch':        ${{ matrix.epoch }},
+            'run_id':       '${GITHUB_RUN_ID}',
+            'timed_out':    ${EXIT_CODE} == 42,
+            'last_dispatched_n': ${{ matrix.worker_start_n }} - 1,
+          }
+          with open('${STATE_PATH}', 'w') as f:
+            json.dump(state, f, indent=2)
+          "
+          fi
+
+          # For soft-stop, exit 0 so this step (and the job) succeeds and the
+          # reschedule job can inspect the state artifact.
+          exit 0
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seqmod-results-${{ matrix.worker_name }}
+          path: worker_out/${{ matrix.worker_name }}.csv
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seqmod-state-${{ matrix.worker_name }}
+          path: worker_out/${{ matrix.worker_name }}_state.json
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Write step summary
+        if: always()
+        run: |
+          EXIT="${{ steps.run_batch.outputs.exit_code }}"
+          STATUS_LABEL="unknown"
+          case "${EXIT}" in
+            0)  STATUS_LABEL="✅ completed" ;;
+            42) STATUS_LABEL="⏱ timed out (soft stop)" ;;
+            *)  STATUS_LABEL="❌ error (exit ${EXIT})" ;;
+          esac
+          {
+            echo "## Worker: ${{ matrix.worker_name }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Range | [${{ matrix.worker_start_n }}, ${{ matrix.worker_end_n }}] |"
+            echo "| Epoch | ${{ matrix.epoch }} |"
+            echo "| Status | ${STATUS_LABEL} |"
+            echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Stage 5: Reschedule – detect timed-out workers and dispatch child runs.
+  #
+  # For each worker that exited with code 42:
+  #   • If workers_used + 2 ≤ max_workers:
+  #       dispatch two new workflow_dispatch calls (binary split of the range)
+  #   • Otherwise (budget exhausted):
+  #       pack all remaining un-tested sub-ranges into a single new-epoch dispatch
+  #
+  # The new dispatch inherits all configuration inputs and increments workers_used.
+  # ─────────────────────────────────────────────────────────────────────────────
+  reschedule:
+    name: Reschedule timed-out batches
+    needs: worker
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download all state artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: seqmod-state-*
+          path: states/
+          merge-multiple: true
+
+      - name: Analyse timeouts and dispatch child runs
+        run: |
+          set -euo pipefail
+
+          WORKERS_USED="${{ inputs.workers_used }}"
+          MAX_WORKERS="${{ inputs.max_workers }}"
+          EPOCH="${{ inputs.run_epoch }}"
+          DRY="${{ inputs.dry_run }}"
+          WORKFLOW_FILE="sequence-powermod-sweep.yml"
+
+          echo "=== Reschedule Analysis ==="
+          echo "Workers used so far : ${WORKERS_USED}"
+          echo "Max workers budget  : ${MAX_WORKERS}"
+          echo "Current epoch       : ${EPOCH}"
+          echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo ""
+
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys, pathlib
+
+          states_dir     = pathlib.Path("states")
+          workers_used   = int(os.environ["WORKERS_USED"])
+          max_workers    = int(os.environ["MAX_WORKERS"])
+          epoch          = int(os.environ["EPOCH"])
+          dry_run        = os.environ["DRY"] == "true"
+          repo           = os.environ["GITHUB_REPOSITORY"]
+          ref_name       = os.environ["GITHUB_REF_NAME"]
+          workflow_file  = os.environ["WORKFLOW_FILE"]
+
+          # Shared inputs carried forward to every child dispatch.
+          BASE_INPUTS = {
+            "threads":            "${{ inputs.threads }}",
+            "time_limit_seconds": "${{ inputs.time_limit_seconds }}",
+            "max_workers":        str(max_workers),
+            "dry_run":            False,
+          }
+
+          # Load all state files.
+          timed_out = []  # dicts with start_n, end_n, last_dispatched_n
+          for sf in sorted(states_dir.glob("*.json")):
+            try:
+              state = json.loads(sf.read_text())
+            except Exception as exc:
+              print(f"  WARNING: could not parse {sf}: {exc}", file=sys.stderr)
+              continue
+            if state.get("timed_out") or state.get("exit_code") == 42:
+              timed_out.append(state)
+              print(f"  Timed-out: {state.get('worker_name')} "
+                    f"[{state['start_n']}, {state['end_n']}] "
+                    f"last_dispatched_n={state.get('last_dispatched_n', state['start_n'])}")
+
+          if not timed_out:
+            print("No timed-out workers. Nothing to reschedule.")
+            sys.exit(0)
+
+          print(f"\n{len(timed_out)} timed-out worker(s) to reschedule.")
+          print(f"Budget remaining: {max_workers - workers_used} workers\n")
+
+          # Remaining un-tested sub-ranges to dispatch.
+          pending_ranges = []   # list of (start_n, end_n) tuples
+
+          for state in timed_out:
+            s  = state["start_n"]
+            e  = state["end_n"]
+            # Re-test the complete original range [s, e] rather than resuming
+            # from last_dispatched_n.  last_dispatched_n tracks the last value
+            # *dispatched* to a worker thread, not the last value *recorded* in
+            # the CSV; a thread may have been mid-computation when g_stop fired
+            # and its result was therefore not written.  Re-testing the whole
+            # range guarantees correctness at the cost of some duplicate work.
+            # The binary split will halve the range on each retry, quickly
+            # converging to sub-ranges that complete within the time limit.
+            pending_ranges.append((s, e))
+
+          dispatched = 0
+
+          # Budget check: can we dispatch two workers per timed-out batch?
+          for (s, e) in pending_ranges:
+            budget_left = max_workers - workers_used
+
+            if e == s:
+              # Single-element range; cannot split further.  Skip with a warning.
+              print(f"  WARNING: range [{s}, {e}] is a single element and still"
+                    " timed out – skipping (manual investigation required).",
+                    file=sys.stderr)
+              continue
+
+            mid = (s + e) // 2
+            halves = [(s, mid), (mid + 1, e)]
+
+            if budget_left >= 2:
+              # Dispatch two child runs (binary split).
+              for (hs, he) in halves:
+                workers_used += 1
+                new_epoch = epoch  # same epoch, different sub-range
+                inputs = dict(BASE_INPUTS)
+                inputs.update({
+                  "start_n":     str(hs),
+                  "end_n":       str(he),
+                  "workers":     "${{ inputs.workers }}",
+                  "workers_used": str(workers_used),
+                  "run_epoch":   str(new_epoch),
+                })
+                payload = json.dumps({"ref": ref_name, "inputs": inputs})
+                print(f"  Dispatching child run: [{hs}, {he}]  "
+                      f"workers_used={workers_used}/{max_workers}")
+                if not dry_run:
+                  result = subprocess.run(
+                    ["gh", "api",
+                     "--method", "POST",
+                     f"repos/{repo}/actions/workflows/{workflow_file}/dispatches",
+                     "--input", "-"],
+                    input=payload,
+                    capture_output=True, text=True,
+                  )
+                  if result.returncode != 0:
+                    print(f"  ERROR dispatching [{hs},{he}]: {result.stderr}",
+                          file=sys.stderr)
+                  else:
+                    print(f"    → dispatched OK")
+                else:
+                  print(f"    (dry_run: would dispatch)")
+                dispatched += 1
+            else:
+              # Budget exhausted – pack remaining ranges into a new epoch.
+              next_epoch = epoch + 1
+              # Use the smaller of the two halves as start; this is conservative.
+              workers_used += 1
+              inputs = dict(BASE_INPUTS)
+              inputs.update({
+                "start_n":      str(s),
+                "end_n":        str(e),
+                "workers":      "${{ inputs.workers }}",
+                "workers_used": "0",   # reset counter for new epoch
+                "run_epoch":    str(next_epoch),
+              })
+              payload = json.dumps({"ref": ref_name, "inputs": inputs})
+              print(f"  Budget exhausted (used={workers_used}/{max_workers}). "
+                    f"Queuing new epoch={next_epoch} for remaining range [{s},{e}].")
+              if not dry_run:
+                result = subprocess.run(
+                  ["gh", "api",
+                   "--method", "POST",
+                   f"repos/{repo}/actions/workflows/{workflow_file}/dispatches",
+                   "--input", "-"],
+                  input=payload,
+                  capture_output=True, text=True,
+                )
+                if result.returncode != 0:
+                  print(f"  ERROR queuing new epoch: {result.stderr}",
+                        file=sys.stderr)
+                else:
+                  print(f"    → new epoch queued OK")
+              else:
+                print(f"    (dry_run: would queue new epoch)")
+              dispatched += 1
+
+          print(f"\nReschedule summary: {dispatched} dispatch(es) issued, "
+                f"total workers used={workers_used}/{max_workers}.")
+          PYEOF
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Stage 6: Merge – aggregate all worker CSVs and write the final report.
+  # ─────────────────────────────────────────────────────────────────────────────
+  merge:
+    name: Merge results and write report
+    needs: [worker, reschedule]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download all results artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: seqmod-results-*
+          path: results/
+          merge-multiple: true
+
+      - name: Merge and sort CSVs
+        run: |
+          set -euo pipefail
+          mkdir -p merged_out/
+
+          echo "n,is_prime" > merged_out/merged_results.csv
+
+          for f in results/*.csv; do
+            [ -f "$f" ] && tail -n +2 "$f" >> merged_out/merged_results.csv || true
+          done
+
+          # Sort by n (numeric ascending), keeping header.
+          {
+            head -1 merged_out/merged_results.csv
+            tail -n +2 merged_out/merged_results.csv | sort -t, -k1 -n
+          } > merged_out/sorted.csv
+          mv merged_out/sorted.csv merged_out/merged_results.csv
+
+          TOTAL=$(( $(wc -l < merged_out/merged_results.csv) - 1 ))
+          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv || echo 0)
+          echo "Total candidates tested : ${TOTAL}"
+          echo "Mersenne primes found   : ${PRIMES}"
+
+      - name: Download all state artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: seqmod-state-*
+          path: states/
+          merge-multiple: true
+
+      - name: Write markdown report
+        run: |
+          set -euo pipefail
+
+          TOTAL=$(( $(wc -l < merged_out/merged_results.csv 2>/dev/null || echo 1) - 1 ))
+          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv 2>/dev/null || echo 0)
+          TIMEOUTS=$(python3 - <<'PYEOF'
+          import json, pathlib, sys
+          states_dir = pathlib.Path("states")
+          n = 0
+          for f in states_dir.glob("*.json"):
+            try:
+              state = json.loads(f.read_text())
+              if state.get("timed_out", False):
+                n += 1
+            except Exception as exc:
+              print(f"WARNING: could not parse {f}: {exc}", file=sys.stderr)
+          print(n)
+          PYEOF
+          )
+
+          REPORT="merged_out/report.md"
+          {
+            echo "# Sequence Powermod Sweep – Final Report"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Range tested | [${{ inputs.start_n }}, ${{ inputs.end_n }}] |"
+            echo "| Workers per run | ${{ inputs.workers }} |"
+            echo "| Threads per worker | ${{ inputs.threads }} |"
+            echo "| Per-worker time limit | ${{ inputs.time_limit_seconds }} s |"
+            echo "| Workers budget | ${{ inputs.workers_used }}/${{ inputs.max_workers }} used |"
+            echo "| Run epoch | ${{ inputs.run_epoch }} |"
+            echo "| Total candidates tested | ${TOTAL} |"
+            echo "| Mersenne primes found | ${PRIMES} |"
+            echo "| Workers that timed out | ${TIMEOUTS} |"
+            echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+            echo "| Job | merge |"
+            echo ""
+            if [ "${PRIMES}" -gt 0 ]; then
+              echo "## 🎉 Mersenne Primes Found"
+              echo ""
+              echo "| Exponent p | M_p = 2^p − 1 |"
+              echo "|------------|---------------|"
+              grep ",true$" merged_out/merged_results.csv 2>/dev/null | \
+                while IFS=, read -r p _; do
+                  echo "| ${p} | M_${p} |"
+                done
+            fi
+            echo ""
+            echo "## Worker Summary"
+            echo ""
+            echo "| Worker | Range | Status |"
+            echo "|--------|-------|--------|"
+            python3 - <<'PYEOF'
+          import json, pathlib
+          states_dir = pathlib.Path("states")
+          rows = []
+          for sf in sorted(states_dir.glob("*.json")):
+            try:
+              s = json.loads(sf.read_text())
+            except Exception:
+              continue
+            ec    = s.get("exit_code", "?")
+            timed = s.get("timed_out", False)
+            if timed or ec == 42:
+              status = "⏱ timed out"
+            elif ec == 0:
+              status = "✅ completed"
+            else:
+              status = f"❌ error ({ec})"
+            rows.append((s.get("worker_name","?"), s.get("start_n","?"), s.get("end_n","?"), status))
+          for name, sn, en, st in rows:
+            print(f"| {name} | [{sn}, {en}] | {st} |")
+          PYEOF
+            echo ""
+            if [ "${TIMEOUTS}" -gt 0 ]; then
+              echo "## ⏱ Timed-Out Workers (rescheduled via binary split)"
+              echo ""
+              echo "These ranges were split in two and dispatched as new workflow runs."
+              echo "Check the Actions tab for child runs with the split sub-ranges."
+              echo ""
+            fi
+            echo "_Full results available in the \`seqmod-merged-results-epoch${{ inputs.run_epoch }}\` artifact._"
+          } > "${REPORT}"
+
+          cat "${REPORT}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Zip merged results
+        run: |
+          if [ -f merged_out/merged_results.csv ]; then
+            zip -9 merged_results.zip merged_out/merged_results.csv merged_out/report.md
+          fi
+
+      - name: Upload merged results artifact
+        if: hashFiles('merged_results.zip') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: seqmod-merged-results-epoch${{ inputs.run_epoch }}
+          path: merged_results.zip
+          retention-days: 90
+          compression-level: 9
