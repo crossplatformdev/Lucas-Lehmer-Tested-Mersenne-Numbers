@@ -191,11 +191,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          START="${{ inputs.start_n }}"
-          END="${{ inputs.end_n }}"
-          WORKERS="${{ inputs.workers }}"
-          DRY="${{ inputs.dry_run }}"
-          EPOCH="${{ inputs.run_epoch }}"
+          export START="${{ inputs.start_n }}"
+          export END="${{ inputs.end_n }}"
+          export WORKERS="${{ inputs.workers }}"
+          export DRY="${{ inputs.dry_run }}"
+          export EPOCH="${{ inputs.run_epoch }}"
 
           echo "=== Sequence Powermod Sweep – Planning ==="
           echo "Range  : [${START}, ${END}]"
