@@ -16,7 +16,9 @@
 // Environment variables:
 //   SEQMOD_TIME_LIMIT_SECS  – soft stop after N seconds; write state and
 //                             exit with code 42 (default: 0 = no limit)
-//   SEQMOD_OUTPUT_CSV       – write "n,is_prime" CSV to this path
+//   SEQMOD_OUTPUT_CSV       – write "n,is_prime,mod_result" CSV to this path
+//                             mod_result = (2·result_a−2) mod (2^n−1); empty
+//                             for composite n (not tested by the algorithm)
 //   SEQMOD_STATE_FILE       – write JSON state on exit to this path
 //                             (includes last_dispatched_n for safe resume)
 //
@@ -87,9 +89,11 @@ static void mul_mod_components(
     out_b = (la * rb + lb * ra)     % modulus;
 }
 
-// Returns true iff M_n = 2^n − 1 is prime using the algebraic identity.
-static bool is_sequence_zero(int n) {
-    if (n < 2) return false;
+// Returns {is_prime, mod_result} for M_n = 2^n − 1 using the algebraic
+// identity.  mod_result is lhs = (2·result_a − 2) mod (2^n − 1); it equals
+// 0 exactly when M_n is prime.
+static std::pair<bool, mpz_class> is_sequence_zero(int n) {
+    if (n < 2) return {false, mpz_class(0)};
 
     const mpz_class modulus  = (mpz_class(1) << n) - 1;   // 2^n − 1
     const mpz_class exponent =  mpz_class(1) << n;         // 2^n
@@ -120,17 +124,19 @@ static bool is_sequence_zero(int n) {
 
     mpz_class lhs = (2 * result_a - 2) % modulus;
     if (lhs < 0) lhs += modulus;
-    return lhs == 0;
+    return {lhs == 0, lhs};
 }
 
 // ─── Result accumulator (thread-safe) ─────────────────────────────────────────
 struct Results {
     std::mutex mu;
-    std::vector<std::pair<int, bool>> rows;   // (n, is_prime) in dispatch order
+    // (n, is_prime, mod_result) – mod_result is the decimal string of
+    // (2·result_a − 2) mod (2^n − 1); empty string for composite n.
+    std::vector<std::tuple<int, bool, std::string>> rows;
 
-    void add(int n, bool is_prime) {
+    void add(int n, bool is_prime, std::string mod_result = {}) {
         std::lock_guard<std::mutex> lock(mu);
-        rows.emplace_back(n, is_prime);
+        rows.emplace_back(n, is_prime, std::move(mod_result));
     }
 };
 
@@ -195,11 +201,12 @@ static std::vector<int> find_sequence(
                     // Re-check stop flag before the long is_sequence_zero() call.
                     if (g_stop.load(std::memory_order_relaxed)) break;
 
-                    const bool prime = is_sequence_zero(n);
-                    results.add(n, prime);
+                    const auto [prime, mod_val] = is_sequence_zero(n);
+                    results.add(n, prime, mod_val.get_str());
                     if (prime) local_hits.push_back(n);
                 } else {
-                    results.add(n, false);
+                    // mod_result not computed for composite n.
+                    results.add(n, false, "");
                 }
 
                 done_count.fetch_add(1, std::memory_order_relaxed);
@@ -266,16 +273,16 @@ static bool write_csv(const std::string& path, Results& results) {
         std::cerr << "SEQMOD: cannot open CSV output file: " << path << "\n";
         return false;
     }
-    f << "n,is_prime\n";
+    f << "n,is_prime,mod_result\n";
     // Sort by n before writing for reproducibility.
-    std::vector<std::pair<int, bool>> sorted;
+    std::vector<std::tuple<int, bool, std::string>> sorted;
     {
         std::lock_guard<std::mutex> lock(results.mu);
         sorted = results.rows;
     }
     std::sort(sorted.begin(), sorted.end());
-    for (const auto& [n, is_prime] : sorted)
-        f << n << ',' << (is_prime ? "true" : "false") << '\n';
+    for (const auto& [n, is_prime, mod_result] : sorted)
+        f << n << ',' << (is_prime ? "true" : "false") << ',' << mod_result << '\n';
     return true;
 }
 

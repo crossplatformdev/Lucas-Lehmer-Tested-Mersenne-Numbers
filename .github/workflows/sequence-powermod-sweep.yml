@@ -158,7 +158,7 @@ jobs:
           sudo apt-get install -y -qq g++ make libgmp-dev
 
       - name: Build sequence_powermod
-        run: make seqmod
+        run: make seqmod SEQMOD_CXXFLAGS="-std=c++17 -O3 -march=x86-64 -pthread -Wall -Wextra"
 
       - name: Verify binary
         run: |
