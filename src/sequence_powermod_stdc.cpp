@@ -135,6 +135,7 @@ static void sub_small_inplace(Limbs& a, uint64_t v) {
 static size_t bitlen(const Limbs& a) {
     if (a.empty() || (a.size() == 1 && a[0] == 0)) return 0;
     const uint64_t hi = a.back();
+    if (hi == 0) return (a.size() - 1) * 64;  // defensive: shouldn't happen after normalize
     return (a.size() - 1) * 64 + (64 - static_cast<size_t>(__builtin_clzll(hi)));
 }
 
@@ -197,9 +198,12 @@ static Limbs right_shift_bits(const Limbs& a, int shift) {
     for (size_t i = word_shift; i < a.size(); ++i) {
         const uint64_t v    = a[i];
         const uint64_t next = (i + 1 < a.size()) ? a[i + 1] : 0;
-        out[i - word_shift] = (bit_shift == 0)
-            ? v
-            : (v >> bit_shift) | (next << (64 - bit_shift));
+        if (bit_shift == 0) {
+            out[i - word_shift] = v;
+        } else {
+            // bit_shift in [1,63]: both operands are valid shift amounts.
+            out[i - word_shift] = (v >> bit_shift) | (next << (64 - bit_shift));
+        }
     }
     normalize(out);
     return out;
@@ -390,8 +394,17 @@ static std::vector<int> find_sequence(
     std::vector<int> hits;
     std::mutex       hits_mutex;
 
-    // fast_mode: no monitor thread for short runs with no time limit.
-    const bool     fast_mode    = (time_limit_secs <= 0 && iterations <= 2000);
+    // fast_mode: for short, time-unlimited runs skip the polling monitor to
+    // reduce latency.  Threshold: 2000 candidates fit comfortably within a
+    // sub-second wall time for the typical exponent range tested here.
+    static constexpr int  FAST_MODE_ITER_THRESHOLD  = 2000;
+    // Report progress every PROGRESS_REPORT_INTERVAL candidates processed.
+    static constexpr int  PROGRESS_REPORT_INTERVAL  = 1000;
+    // Polling period for the monitor thread (milliseconds).
+    static constexpr int  MONITOR_POLL_INTERVAL_MS  = 5;
+
+    const bool     fast_mode    = (time_limit_secs <= 0 &&
+                                   iterations <= FAST_MODE_ITER_THRESHOLD);
     const uint32_t worker_count = std::max<uint32_t>(1, parallel_threads);
 
     std::atomic<int> next_index{0};
@@ -458,7 +471,7 @@ static std::vector<int> find_sequence(
     }
 
     // Polling monitor: progress reporting + time-limit enforcement.
-    int next_progress_report = 1000;
+    int next_progress_report = PROGRESS_REPORT_INTERVAL;
     while (true) {
         const int  done    = done_count.load(std::memory_order_relaxed);
         const auto now     = std::chrono::steady_clock::now();
@@ -486,11 +499,11 @@ static std::vector<int> find_sequence(
                       << " | ETA: "  << format_duration(eta)
                       << " | Progress: " << percent << "%" << std::endl;
             while (next_progress_report <= done)
-                next_progress_report += 1000;
+                next_progress_report += PROGRESS_REPORT_INTERVAL;
         }
 
         if (done >= iterations || g_stop.load(std::memory_order_relaxed)) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(MONITOR_POLL_INTERVAL_MS));
     }
 
     for (std::thread& w : workers) w.join();
