@@ -14,11 +14,13 @@ CALLGRIND_BIN := bin/bignum_callgrind
 PLAN_BIN := bin/split_bucket_batches
 PLAN_SRC := src/split_bucket_batches.c
 
-# sequence_powermod: GMP-based Mersenne sequence search binary.
-SEQMOD_SRC  := src/sequence_powermod.cpp
+# sequence_powermod: stdlib-only Mersenne sequence search binary (no GMP).
+# Source: src/sequence_powermod_stdc.cpp
+# The GMP-based predecessor lives in src/sequence_powermod.cpp for reference.
+SEQMOD_SRC  := src/sequence_powermod_stdc.cpp
 SEQMOD_BIN  := bin/sequence_powermod
 SEQMOD_CXXFLAGS := -std=c++17 -O3 -march=native -mtune=native -pthread -Wall -Wextra
-SEQMOD_LDFLAGS  := -pthread -lgmp -lgmpxx
+SEQMOD_LDFLAGS  := -pthread
 
 # Profiling build uses -O2 (keeps enough optimization to be representative
 # while preserving function call structure for gprof) and -pg.
@@ -67,7 +69,7 @@ $(SEQMOD_BIN): $(SEQMOD_SRC)
 	@mkdir -p bin
 	$(CXX) $(SEQMOD_CXXFLAGS) $< -o $@ $(SEQMOD_LDFLAGS)
 
-# seqmod: build the GMP-based sequence_powermod binary.
+# seqmod: build the stdlib-only sequence_powermod binary (no GMP).
 seqmod: $(SEQMOD_BIN)
 
 $(TEST_BIN): tests/test_bignum.cpp $(SRC)

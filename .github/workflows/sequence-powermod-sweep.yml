@@ -1,14 +1,14 @@
 name: Sequence Powermod Sweep
 
-# Distributed CI/CD sweep for the GMP-based sequence_powermod algorithm.
+# Distributed CI/CD sweep for the stdlib-only sequence_powermod algorithm.
 #
 # This workflow tests all prime exponents n in a given [start_n, end_n] range,
 # checking whether M(n) = 2^n − 1 is prime using the algebraic criterion
-# implemented in src/sequence_powermod.cpp.
+# implemented in src/sequence_powermod_stdc.cpp (no GMP required).
 #
 # Architecture:
 #   1. validate   – reject invalid inputs early
-#   2. build      – compile bin/sequence_powermod (with GMP)
+#   2. build      – compile bin/sequence_powermod (stdlib-only, no GMP)
 #   3. plan       – divide [start_n, end_n] across up to 20 parallel workers
 #   4. worker     – one job per batch (matrix), 4 threads each, 5.95-hour soft stop
 #   5. reschedule – detect timed-out workers; split each range in two and dispatch
@@ -152,10 +152,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install toolchain + GMP
+      - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq g++ make libgmp-dev
+          sudo apt-get install -y -qq g++ make
 
       - name: Build sequence_powermod
         run: make seqmod SEQMOD_CXXFLAGS="-std=c++17 -O3 -march=x86-64 -pthread -Wall -Wextra"
@@ -278,11 +278,6 @@ jobs:
 
       - name: Make binary executable
         run: gunzip bin/sequence_powermod.gz && chmod +x bin/sequence_powermod
-
-      - name: Install GMP runtime
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libgmp10
 
       - name: Warmup probe – estimate batch duration
         id: warmup
