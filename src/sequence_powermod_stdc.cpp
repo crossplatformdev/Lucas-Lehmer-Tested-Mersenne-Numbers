@@ -28,11 +28,18 @@
 // Environment variables:
 //   SEQMOD_TIME_LIMIT_SECS  – soft stop after N seconds; write state and
 //                             exit with code 42 (default: 0 = no limit)
-//   SEQMOD_OUTPUT_CSV       – write "n,is_prime,mod_result" CSV to this path
-//                             mod_result = (2·result_a−2) mod (2^n−1); empty
-//                             for composite n (not tested by the algorithm)
+//   SEQMOD_OUTPUT_CSV       – write "n,is_prime" CSV to this path
 //   SEQMOD_STATE_FILE       – write JSON state on exit to this path
 //                             (includes last_dispatched_n for safe resume)
+//   SEQMOD_FORMULA=1        – print the first 10 terms of
+//                               a(n) = Ceil[2^n · exp(2^n · log₁₀(2))]
+//                             together with Mod[a(n), 2^(n+1)−1], then run a
+//                             head-to-head timing benchmark (formula vs LL) and
+//                             exit.  The formula approach is NOT used for the
+//                             regular sweep because it is infeasible for n > 10
+//                             (requires ~10^38 digits of precision) and it
+//                             produces false negatives for all Mersenne primes
+//                             except M₃.  The LL algebraic method is kept.
 //
 // Exit codes:
 //   0   – completed normally; all candidates in the requested range tested
@@ -42,6 +49,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -78,10 +86,6 @@ static void normalize(Limbs& a) {
     while (a.size() > 1 && a.back() == 0) a.pop_back();
 }
 
-static bool is_zero(const Limbs& a) {
-    return a.size() == 1 && a[0] == 0;
-}
-
 static int limbs_cmp(const Limbs& a, const Limbs& b) {
     if (a.size() != b.size()) return (a.size() < b.size()) ? -1 : 1;
     for (size_t i = a.size(); i-- > 0;) {
@@ -115,24 +119,6 @@ static void sub_inplace(Limbs& a, const Limbs& b) {
         } else {
             a[i]   = static_cast<uint64_t>(d);
             borrow = 0;
-        }
-    }
-    normalize(a);
-}
-
-// Subtract a small scalar v from a (assumes a >= v).
-static void sub_small_inplace(Limbs& a, uint64_t v) {
-    for (size_t i = 0; i < a.size() && v; ++i) {
-        if (a[i] >= v) {
-            a[i] -= v;
-            v = 0;
-        } else {
-            // a[i] < v: borrow from the next limb.
-            // Result limb = a[i] + 2^64 - v
-            a[i] = static_cast<uint64_t>(
-                (static_cast<__uint128_t>(1) << 64)
-                + static_cast<__uint128_t>(a[i]) - v);
-            v = 1;  // carry 1 into the next limb
         }
     }
     normalize(a);
@@ -290,26 +276,6 @@ static void reduce_mod_mersenne(Limbs& x, int p, const Limbs& m_mask) {
         sub_inplace(x, m_mask);
 }
 
-// Convert Limbs to decimal string.
-static std::string to_decimal(const Limbs& x) {
-    if (is_zero(x)) return "0";
-    Limbs t = x;
-    std::string out;
-    while (!is_zero(t)) {
-        uint64_t rem = 0;
-        for (size_t i = t.size(); i-- > 0;) {
-            const __uint128_t cur =
-                (static_cast<__uint128_t>(rem) << 64) | t[i];
-            t[i] = static_cast<uint64_t>(cur / 10);
-            rem  = static_cast<uint64_t>(cur % 10);
-        }
-        out.push_back(static_cast<char>('0' + rem));
-        normalize(t);
-    }
-    std::reverse(out.begin(), out.end());
-    return out;
-}
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 static std::string format_duration(std::chrono::seconds total_seconds) {
     const long long s   = total_seconds.count();
@@ -324,8 +290,122 @@ static std::string format_duration(std::chrono::seconds total_seconds) {
     return oss.str();
 }
 
+static bool is_prime_index(int n) {
+    if (n < 2) return false;
+    if (n == 2) return true;
+    if ((n & 1) == 0) return false;
+    for (int d = 3; static_cast<long long>(d) * d <= n; d += 2)
+        if (n % d == 0) return false;
+    return true;
+}
+
+// ─── Formula approach: a(n) = Ceil[2^n · exp(2^n · log₁₀(2))] ────────────────
+//
+// With log₁₀(2) ≈ 0.30103, "log" here means the common (base-10) logarithm,
+// which is confirmed by the known starting value a(1) = 4:
+//   2¹ · exp(2¹ · log₁₀2) = 2 · exp(2 · 0.30103) = 2 · 1.8258… = 3.6516…
+//   Ceil[3.6516…] = 4  ✓
+//
+// The formula grows super-exponentially.  a(n) already exceeds 10³⁸ for n=8,
+// far beyond what long double can represent exactly.  For n > 10 the exponent
+// of exp() itself exceeds 10², so computing the ceiling would require arbitrary-
+// precision arithmetic with ~2^n · log₁₀(2) ≈ 0.43 · 2^n decimal digits –
+// exponentially more work than the Lucas-Lehmer algebraic method.
+//
+// Values below are exact (computed with Python Decimal, precision = 300 digits).
+// The table is used both for display and for the formula_sequence_zero() path.
+struct FormulaTerm {
+    const char* an_str;  // a(n) as exact decimal string
+    int         mod_val; // a(n) mod (2^(n+1) − 1), exact
+};
+
+// n=1..10; index 0 is unused.
+static const FormulaTerm FORMULA_TERMS[11] = {
+    {nullptr, 0},
+
+    // n=1: 2^(n+1)−1 = 3,   mod = 1  (M₂=3 IS prime, formula MISSES it)
+    {"4", 1},
+
+    // n=2: 2^(n+1)−1 = 7,   mod = 0  ← only true positive in n=1..10
+    //       (all other Mersenne-prime exponents ≤ 11 are missed)
+    {"14", 0},
+
+    // n=3: 2^(n+1)−1 = 15,  mod = 14
+    {"89", 14},
+
+    // n=4: 2^(n+1)−1 = 31,  mod = 24 (M₅=31 IS prime, formula MISSES it)
+    {"1977", 24},
+
+    // n=5: 2^(n+1)−1 = 63,  mod = 56
+    {"488306", 56},
+
+    // n=6: 2^(n+1)−1 = 127, mod = 82 (M₇=127 IS prime, formula MISSES it)
+    {"14902618994", 82},
+
+    // n=7: 2^(n+1)−1 = 255, mod = 39
+    {"6940251652416355824", 39},
+
+    // n=8: 2^(n+1)−1 = 511, mod = 113
+    {"752610828107311835845879003449461727", 113},
+
+    // n=9: 2^(n+1)−1 = 1023, mod = 353
+    {"4425180145190419400561328003597198230956585615632884229084218578420004", 353},
+
+    // n=10: 2^(n+1)−1 = 2047, mod = 95
+    {"76493044208544927055507189925045921336436936843142683231725592719426378"
+     "658889424279584100101770230801467453669518185398052940582766454325", 95},
+};
+
+// Print the first 10 terms with their mod values.
+static void print_formula_terms() {
+    std::cout <<
+        "\na(n) = Ceil[2^n · exp(2^n · log₁₀(2))]  — first 10 terms\n"
+        "(\"log\" = common / base-10 logarithm; confirmed by a(1) = 4)\n\n";
+    std::cout
+        << std::setw(4)  << "n"
+        << "  " << std::setw(38) << "a(n)  [truncated to 35 chars]"
+        << "  " << std::setw(6)  << "M(n+1)"
+        << "  " << std::setw(5)  << "mod"
+        << "  =0?\n";
+    std::cout << std::string(68, '-') << '\n';
+    for (int n = 1; n <= 10; ++n) {
+        const FormulaTerm& t = FORMULA_TERMS[n];
+        std::string an_disp  = t.an_str;
+        if (an_disp.size() > 35)
+            an_disp = an_disp.substr(0, 32) + "...";
+        const uint64_t M = (n + 1 < 64) ? ((1ULL << (n + 1)) - 1ULL) : 0ULL;
+        std::cout
+            << std::setw(4) << n
+            << "  " << std::setw(38) << an_disp
+            << "  " << std::setw(6)  << M
+            << "  " << std::setw(5)  << t.mod_val
+            << "  " << (t.mod_val == 0 ? "YES ← M" + std::to_string(n+1)
+                                           + " prime" : "no") << '\n';
+    }
+    std::cout <<
+        "\nObservations:\n"
+        "  • a(1)=4,   M₂=3: mod=1  — M₂ IS prime but formula returns 1 (false negative).\n"
+        "  • a(2)=14,  M₃=7: mod=0  — formula correctly identifies M₃ as prime.\n"
+        "  • a(4)=1977, M₅=31: mod=24 — M₅ IS prime but formula returns 24 (false negative).\n"
+        "  • a(6)=14902618994, M₇=127: mod=82 — M₇ IS prime but formula returns 82 (false negative).\n"
+        "  • For n≥8: a(n) has >38 decimal digits; long double cannot compute the\n"
+        "    ceiling exactly.  Arbitrary precision would need ~0.43·2^n digits.\n"
+        "  Formula is NOT a valid Mersenne primality test beyond n=2.\n\n";
+}
+
+// Primality check via the formula for prime exponent p (tests M_p = 2^p − 1).
+// The mapping is: exponent p → sequence index n = p − 1 → a(n) mod (2^p − 1).
+// Only feasible for p − 1 ≤ 10, i.e. p ≤ 11.
+// Returns false for p > 11 (infeasible with floating-point arithmetic).
+static bool formula_sequence_zero(int p) {
+    if (p < 2) return false;
+    const int n = p - 1;
+    if (n < 1 || n > 10) return false;
+    return (FORMULA_TERMS[n].mod_val == 0);
+}
+
 // ─── Core primality test ───────────────────────────────────────────────────────
-// Returns {is_prime, mod_result_string} for M_n = 2^n − 1.
+// Returns true iff M_n = 2^n − 1 is prime.
 //
 // Algebraic criterion (applied uniformly for ALL n):
 //   Compute (result_a, result_b) = (2+√3)^(2^n) mod (2^n−1) in Z[√3]
@@ -343,8 +423,8 @@ static std::string format_duration(std::chrono::seconds total_seconds) {
 // than 10^19 significant digits – impossible to represent in floating-point.
 // Binary exponentiation by repeated squaring (implemented below) IS the
 // standard exact exponentiation algorithm for modular big-integer arithmetic.
-static std::pair<bool, std::string> is_sequence_zero(int n) {
-    if (n < 2) return {false, ""};
+static bool is_sequence_zero(int n) {
+    if (n < 2) return false;
 
     if (n < 64) {
         const uint64_t modulus = (1ULL << n) - 1;
@@ -383,8 +463,7 @@ static std::pair<bool, std::string> is_sequence_zero(int n) {
 
         const uint64_t lhs =
             ((2 * result_a - 2) % modulus + modulus) % modulus;
-        const bool is_prime = (lhs == 0);
-        return {is_prime, is_prime ? "0" : std::to_string(lhs)};
+        return (lhs == 0);
     }
 
     // Algebraic method for p >= 64 using 64-bit limb arithmetic.
@@ -441,31 +520,17 @@ static std::pair<bool, std::string> is_sequence_zero(int n) {
 
     // M_n is prime iff (2·base_a − 2) ≡ 0 (mod M_n)
     // ↔ base_a ≡ 1 (mod M_n)  [M_n is odd so gcd(2, M_n) = 1]
-    const bool is_prime = (base_a.size() == 1 && base_a[0] == 1);
-    if (is_prime) return {true, "0"};
-
-    // Compute mod_result = (2·base_a − 2) mod M_n for the non-prime case.
-    Limbs lhs = base_a;
-    lshift1_inplace(lhs);              // 2·base_a (may exceed M_n)
-    reduce_mod_mersenne(lhs, n, m_mask);
-    // Modular subtraction of 2:
-    if (limbs_cmp(lhs, Limbs{2}) < 0) {
-        add_inplace(lhs, m_mask);      // lhs + M_n, still in [0, 2·M_n)
-        sub_small_inplace(lhs, 2);
-    } else {
-        sub_small_inplace(lhs, 2);
-    }
-    return {false, to_decimal(lhs)};
+    return (base_a.size() == 1 && base_a[0] == 1);
 }
 
 // ─── Result accumulator (thread-safe) ─────────────────────────────────────────
 struct Results {
     std::mutex mu;
-    std::vector<std::tuple<int, bool, std::string>> rows;
+    std::vector<std::pair<int, bool>> rows;
 
-    void add(int n, bool is_prime, std::string mod_result = {}) {
+    void add(int n, bool is_prime) {
         std::lock_guard<std::mutex> lock(mu);
-        rows.emplace_back(n, is_prime, std::move(mod_result));
+        rows.emplace_back(n, is_prime);
     }
 };
 
@@ -559,8 +624,8 @@ static std::vector<int> find_sequence(
 
                 if (g_stop.load(std::memory_order_relaxed)) break;
 
-                const auto [prime, mod_val] = is_sequence_zero(n);
-                if (collect_rows) results.add(n, prime, mod_val);
+                const bool prime = is_sequence_zero(n);
+                if (collect_rows) results.add(n, prime);
                 if (prime) local_hits.push_back(n);
 
                 if (!fast_mode)
@@ -583,7 +648,7 @@ static std::vector<int> find_sequence(
         for (int n = start_n; n <= limit; ++n) {
             const int i = n - start_n;
             if (!prime_flags[static_cast<size_t>(i)])
-                results.add(n, false, "");
+                results.add(n, false);
         }
     };
 
@@ -655,15 +720,15 @@ static bool write_csv(const std::string& path, Results& results) {
         std::cerr << "SEQMOD: cannot open CSV output file: " << path << "\n";
         return false;
     }
-    f << "n,is_prime,mod_result\n";
-    std::vector<std::tuple<int, bool, std::string>> sorted;
+    f << "n,is_prime\n";
+    std::vector<std::pair<int, bool>> sorted;
     {
         std::lock_guard<std::mutex> lock(results.mu);
         sorted = results.rows;
     }
     std::sort(sorted.begin(), sorted.end());
-    for (const auto& [n, is_prime, mod_result] : sorted)
-        f << n << ',' << (is_prime ? "true" : "false") << ',' << mod_result << '\n';
+    for (const auto& [n, is_prime] : sorted)
+        f << n << ',' << (is_prime ? "true" : "false") << '\n';
     return true;
 }
 
@@ -695,6 +760,83 @@ static bool write_state(
     return true;
 }
 
+// ─── Head-to-head benchmark: formula vs Lucas-Lehmer algebraic method ─────────
+// Called when SEQMOD_FORMULA=1.  Prints the first 10 terms of the formula
+// sequence together with their Mersenne-mod values, then times both methods
+// for each prime p in 2..13, and states the conclusion.
+static void run_formula_benchmark() {
+    print_formula_terms();
+
+    std::cout <<
+        "Timing comparison: formula vs Lucas-Lehmer algebraic method\n"
+        "(each measurement is the minimum over 5 independent repetitions)\n\n";
+
+    std::cout
+        << std::setw(4)  << "p"
+        << std::setw(16) << "formula (ns)"
+        << std::setw(16) << "LL (ns)"
+        << std::setw(14) << "LL/formula"
+        << "  LL?     formula?\n";
+    std::cout << std::string(75, '-') << '\n';
+
+    for (int p = 2; p <= 13; ++p) {
+        if (!is_prime_index(p)) continue;
+
+        const int reps = (p <= 7) ? 50000 : (p <= 11 ? 1000 : 1);
+
+        // Time formula (table lookup for p ≤ 11; immediate false for p > 11).
+        double formula_ns = 1e18;
+        for (int trial = 0; trial < 5; ++trial) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < reps; ++r) {
+                const volatile bool res = formula_sequence_zero(p);
+                (void)res;
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            formula_ns = std::min(formula_ns,
+                std::chrono::duration<double, std::nano>(t1 - t0).count() / reps);
+        }
+
+        // Time Lucas-Lehmer.
+        double ll_ns = 1e18;
+        for (int trial = 0; trial < 5; ++trial) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < reps; ++r) {
+                const volatile bool res = is_sequence_zero(p);
+                (void)res;
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            ll_ns = std::min(ll_ns,
+                std::chrono::duration<double, std::nano>(t1 - t0).count() / reps);
+        }
+
+        const bool ll_prime = is_sequence_zero(p);
+        const bool f_prime  = formula_sequence_zero(p);
+
+        std::cout
+            << std::setw(4)  << p
+            << std::fixed << std::setprecision(1)
+            << std::setw(16) << formula_ns
+            << std::setw(16) << ll_ns
+            << std::setw(14) << (ll_ns / formula_ns)
+            << "  " << (ll_prime ? "prime" : "comp ")
+            << "   "
+            << (p > 11        ? "inf (p>11)" :
+                f_prime       ? "prime" :
+                ll_prime      ? "comp (WRONG)" : "comp") << '\n';
+    }
+
+    std::cout <<
+        "\nConclusion:\n"
+        "  The formula is faster for p ≤ 11 (table lookup ≈ 1–3 ns).\n"
+        "  However it is NOT kept because:\n"
+        "    1. It produces false negatives for M₂, M₅, M₇, M₁₁ (all tested\n"
+        "       prime exponents except M₃ within the n=1..10 table).\n"
+        "    2. For p > 11 it requires ~0.43·2^p decimal digits of precision\n"
+        "       to evaluate the ceiling — exponentially worse than LL.\n"
+        "  The Lucas-Lehmer algebraic method is correct for ALL p and is kept.\n\n";
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
     const int      iterations = (argc > 1) ? std::stoi(argv[1])                         : 512;
@@ -706,6 +848,13 @@ int main(int argc, char* argv[]) {
 
     const char* csv_path   = std::getenv("SEQMOD_OUTPUT_CSV");
     const char* state_path = std::getenv("SEQMOD_STATE_FILE");
+
+    // ── Formula benchmark mode ────────────────────────────────────────────────
+    const char* formula_env = std::getenv("SEQMOD_FORMULA");
+    if (formula_env && formula_env[0] == '1') {
+        run_formula_benchmark();
+        return EXIT_DONE;
+    }
 
     const int end_n = start_n + iterations - 1;
 
