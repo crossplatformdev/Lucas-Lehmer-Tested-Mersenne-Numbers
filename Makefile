@@ -14,6 +14,19 @@ CALLGRIND_BIN := bin/bignum_callgrind
 PLAN_BIN := bin/split_bucket_batches
 PLAN_SRC := src/split_bucket_batches.c
 
+# seqmod_assembler: BigNum-backed Mersenne primality tester.
+# Implements the a(n)=(2+√3)^(2^n) criterion (≡ Lucas–Lehmer for M_p).
+# Delegates ALL arithmetic to mersenne::lucas_lehmer() from BigNum.cpp
+# (auto-selects GenericBackend / LimbBackend / FftMersenneBackend).
+# BigNum.cpp is compiled with -DBIGNUM_NO_MAIN to suppress its own main().
+# No duplicate big-integer code; inherits all of BigNum's optimisations.
+SEQMOD_ASM_SRC          := src/seqmod_assembler.cpp
+SEQMOD_ASM_BIN          := bin/seqmod_assembler
+SEQMOD_ASM_PROF_BIN     := bin/seqmod_assembler_prof
+SEQMOD_ASM_CXXFLAGS     := -std=c++20 -O3 -march=native -mtune=native -flto -pthread -Wall -Wextra -Wpedantic
+SEQMOD_ASM_LDFLAGS      := -flto -pthread
+SEQMOD_ASM_PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
+
 # sequence_powermod: stdlib-only Mersenne sequence search binary (no GMP).
 # Benchmarked 2.57× slower than the GMP build; kept as reference only.
 # bin/bignum is the production binary used in all workflows.
@@ -55,7 +68,7 @@ PERF_LDFLAGS  := -pthread
 CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
 CALLGRIND_LDFLAGS  := -pthread
 
-.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-prof seqmod-bench
+.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-prof seqmod-bench seqmod-asm seqmod-asm-prof seqmod-asm-bench
 
 BENCH_START_INDEX ?= 14
 
@@ -132,6 +145,32 @@ seqmod-bench: $(SEQMOD_BIN)
 	 fi
 # seqmod-gmp: build the GMP-based comparison binary.
 seqmod-gmp: $(SEQMOD_GMP_BIN)
+
+$(SEQMOD_ASM_BIN): $(SEQMOD_ASM_SRC) $(SRC)
+	@mkdir -p bin
+	$(CXX) $(SEQMOD_ASM_CXXFLAGS) -DBIGNUM_NO_MAIN $(SRC) $(SEQMOD_ASM_SRC) -o $@ $(SEQMOD_ASM_LDFLAGS)
+
+$(SEQMOD_ASM_PROF_BIN): $(SEQMOD_ASM_SRC) $(SRC)
+	@mkdir -p bin
+	$(CXX) $(SEQMOD_ASM_PROF_CXXFLAGS) -DBIGNUM_NO_MAIN $(SRC) $(SEQMOD_ASM_SRC) -o $@
+
+# seqmod-asm: build the BigNum-backed seqmod_assembler binary.
+seqmod-asm: $(SEQMOD_ASM_BIN)
+
+# seqmod-asm-prof: build with -pg for gprof profiling.
+seqmod-asm-prof: $(SEQMOD_ASM_PROF_BIN)
+
+# seqmod-asm-bench: run a correctness smoke test + short benchmark.
+# Tests first 20 prime exponents (known results) then 64 primes from p=1000.
+seqmod-asm-bench: $(SEQMOD_ASM_BIN)
+	@echo "=== seqmod_assembler: correctness smoke (first 20 prime exponents) ==="
+	./$(SEQMOD_ASM_BIN) 20 2 1
+	@echo "=== seqmod_assembler: benchmark (64 primes, start=1000, 4 threads) ==="
+	@t0=$$(date +%s%N); \
+	 ./$(SEQMOD_ASM_BIN) 64 1000 4 2>/dev/null; \
+	 t1=$$(date +%s%N); \
+	 ms=$$(( (t1 - t0) / 1000000 )); \
+	 echo "Wall time: $${ms} ms  (64 prime exponents ≥ 1009, 4 threads)"
 
 $(TEST_BIN): tests/test_bignum.cpp $(SRC)
 	@mkdir -p bin

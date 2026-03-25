@@ -241,3 +241,55 @@ jobs:
           path: cluster_power_report.txt
           retention-days: 30
 
+  # ──────────────────────────────────────────────────────────
+  # Job 6: seqmod_assembler – build, smoke, gprof profile
+  # Builds the BigNum-backed seqmod_assembler (delegates all
+  # arithmetic to mersenne::lucas_lehmer() via -DBIGNUM_NO_MAIN).
+  # ──────────────────────────────────────────────────────────
+  seqmod-asm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config binutils
+
+      - name: Build seqmod_assembler (release)
+        run: make seqmod-asm
+
+      - name: Build seqmod_assembler (gprof)
+        run: make seqmod-asm-prof
+
+      - name: Smoke test – correctness (first 30 prime exponents, 1 thread)
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: seqmod-asm"
+          SEQMOD_OUTPUT_CSV=bin/seqmod_asm_smoke.csv ./bin/seqmod_assembler 30 2 1
+          echo "--- Mersenne primes found (must be exactly p=2,3,5,7,13,17,19,31,61,89,107) ---"
+          grep true bin/seqmod_asm_smoke.csv
+          # Assert exactly 11 primes
+          count=$(grep -c true bin/seqmod_asm_smoke.csv)
+          echo "Count: $count  (expected: 11)"
+          [ "$count" -eq 11 ] || { echo "FAIL: expected 11 Mersenne primes, got $count"; exit 1; }
+          echo "PASS"
+
+      - name: gprof profile (50 prime exponents ≥ 5003, 1 thread)
+        run: |
+          ./bin/seqmod_assembler_prof 50 5000 1 2>/dev/null
+          gprof bin/seqmod_assembler_prof gmon.out > bin/seqmod_asm_prof_report.txt
+          echo "--- gprof flat profile (top 20 lines) ---"
+          head -40 bin/seqmod_asm_prof_report.txt
+
+      - name: Upload seqmod_assembler artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: seqmod-asm-results
+          path: |
+            bin/seqmod_asm_smoke.csv
+            bin/seqmod_asm_prof_report.txt
+          retention-days: 14
+
