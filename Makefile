@@ -105,7 +105,7 @@ $(SEQMOD_ASM_BIN): $(SEQMOD_ASM_SRC) $(SRC)
 
 $(SEQMOD_ASM_PROF_BIN): $(SEQMOD_ASM_SRC) $(SRC)
 	@mkdir -p bin
-	$(CXX) $(SEQMOD_ASM_PROF_CXXFLAGS) -DBIGNUM_NO_MAIN $(SRC) $(SEQMOD_ASM_SRC) -o $@ -pthread -pg
+	$(CXX) $(SEQMOD_ASM_PROF_CXXFLAGS) -DBIGNUM_NO_MAIN $(SRC) $(SEQMOD_ASM_SRC) -o $@
 
 # seqmod-asm: build the BigNum-backed seqmod_assembler binary.
 seqmod-asm: $(SEQMOD_ASM_BIN)
