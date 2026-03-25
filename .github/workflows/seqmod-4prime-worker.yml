@@ -1,0 +1,232 @@
+name: LL 4-Prime Worker
+run-name: "LL · p=${{ inputs.p1 }}${{ inputs.p2 != '' && format(', {0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format(', {0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format(', {0}', inputs.p4) || '' }}"
+
+# Single-run Lucas-Lehmer test for a batch of up to 4 prime exponents.
+#
+# Dispatched by seqmod-range-matrix.yml (the coordinator). This workflow runs
+# a single GitHub Actions job that tests up to 4 prime exponents for Mersenne
+# primality. Each run is individually queryable by its name.
+#
+# If any exponent in the batch yields a Mersenne prime, the run name is
+# updated via the GitHub API to reflect the discovery, e.g.:
+#   "🎉 MERSENNE PRIME M_p · LL · p=p1, p2, p3, p4"
+#
+# Inputs:
+#   p1                 – first prime exponent (required)
+#   p2..p4             – additional prime exponents (optional; empty = skip)
+#   threads            – LL threads per worker (1–4, default 1)
+#   time_limit_seconds – per-worker soft-stop in seconds (default 21420 = 5.95 h)
+#   dry_run            – print plan only – do not run tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      p1:
+        description: "Prime exponent 1 (required)"
+        required: true
+        type: string
+      p2:
+        description: "Prime exponent 2 (optional)"
+        required: false
+        type: string
+        default: ""
+      p3:
+        description: "Prime exponent 3 (optional)"
+        required: false
+        type: string
+        default: ""
+      p4:
+        description: "Prime exponent 4 (optional)"
+        required: false
+        type: string
+        default: ""
+      threads:
+        description: "Threads per worker (1–4)"
+        required: false
+        type: string
+        default: "1"
+      time_limit_seconds:
+        description: "Per-worker soft-stop in seconds (default 21420 = 5.95 h)"
+        required: false
+        type: string
+        default: "21420"
+      dry_run:
+        description: "Print plan only – do not run tests"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  worker:
+    name: "LL p=${{ inputs.p1 }}${{ inputs.p2 != '' && format(', {0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format(', {0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format(', {0}', inputs.p4) || '' }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++ make
+
+      - name: Build sequence_powermod
+        run: make seqmod SEQMOD_CXXFLAGS="-std=c++17 -O3 -march=x86-64 -pthread -Wall -Wextra"
+
+      - name: Verify binary
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: worker"
+          ./bin/sequence_powermod 20 1 1
+          echo "Binary OK."
+
+      - name: Run Lucas-Lehmer test
+        id: run_ll
+        run: |
+          set -uo pipefail
+
+          # Collect non-empty prime inputs and compute the test range.
+          PRIMES=()
+          for P in "${{ inputs.p1 }}" "${{ inputs.p2 }}" "${{ inputs.p3 }}" "${{ inputs.p4 }}"; do
+            [ -n "$P" ] && PRIMES+=("$P")
+          done
+
+          if [ ${#PRIMES[@]} -eq 0 ]; then
+            echo "::error::No prime exponents provided."
+            exit 1
+          fi
+
+          IFS=$'\n' SORTED=($(printf '%s\n' "${PRIMES[@]}" | sort -n)); unset IFS
+          P_MIN="${SORTED[0]}"
+          P_MAX="${SORTED[${#SORTED[@]}-1]}"
+          ITERS=$(( P_MAX - P_MIN + 1 ))
+
+          # Filename-safe label built from the actual inputs (not SORTED).
+          LABEL="p${{ inputs.p1 }}${{ inputs.p2 != '' && format('-{0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format('-{0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format('-{0}', inputs.p4) || '' }}"
+          mkdir -p worker_out/
+          CSV_PATH="worker_out/${LABEL}.csv"
+          STATE_PATH="worker_out/${LABEL}_state.json"
+
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Primes : ${{ inputs.p1 }}, ${{ inputs.p2 }}, ${{ inputs.p3 }}, ${{ inputs.p4 }}"
+          echo "Range  : [${P_MIN}, ${P_MAX}]  (${ITERS} candidates)"
+
+          DRY_RUN="${{ inputs.dry_run }}"
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "DRY RUN: would run sequence_powermod on [${P_MIN}, ${P_MAX}] (${ITERS} candidates)"
+            echo "exit_code=0"    >> "$GITHUB_OUTPUT"
+            echo "elapsed_secs=0" >> "$GITHUB_OUTPUT"
+            echo "csv_path="      >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          START_SEC=$(date +%s)
+          set +e
+          SEQMOD_TIME_LIMIT_SECS="${{ inputs.time_limit_seconds }}" \
+          SEQMOD_OUTPUT_CSV="${CSV_PATH}" \
+          SEQMOD_STATE_FILE="${STATE_PATH}" \
+          ./bin/sequence_powermod "${ITERS}" "${P_MIN}" "${{ inputs.threads }}"
+          EXIT_CODE=$?
+          set -e
+          ELAPSED=$(( $(date +%s) - START_SEC ))
+
+          echo "Exit code : ${EXIT_CODE}"
+          echo "Elapsed   : ${ELAPSED}s"
+          echo "exit_code=${EXIT_CODE}"    >> "$GITHUB_OUTPUT"
+          echo "elapsed_secs=${ELAPSED}"  >> "$GITHUB_OUTPUT"
+          echo "csv_path=${CSV_PATH}"     >> "$GITHUB_OUTPUT"
+
+          # Always exit 0 here so subsequent steps (rename, upload) always run.
+          exit 0
+
+      - name: Rename run if Mersenne prime found
+        if: always() && !inputs.dry_run
+        env:
+          CSV_PATH: ${{ steps.run_ll.outputs.csv_path }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${CSV_PATH}" ] || [ ! -f "${CSV_PATH}" ]; then
+            echo "No CSV output found – skipping rename check."
+            exit 0
+          fi
+
+          # Collect all exponents whose is_prime column is "true".
+          MERSENNE_EXPS=$(grep -E "^[0-9]+,true$" "${CSV_PATH}" | cut -d, -f1 | tr '\n' ' ' | sed 's/ $//' || true)
+
+          if [ -z "${MERSENNE_EXPS}" ]; then
+            echo "No Mersenne primes found in this batch – run name unchanged."
+            exit 0
+          fi
+
+          echo "🎉 Mersenne prime exponent(s) found: ${MERSENNE_EXPS}"
+
+          # Build the M_p labels (e.g. "M_2, M_3, M_5").
+          M_LABELS=$(echo "${MERSENNE_EXPS}" | tr ' ' '\n' | awk '{printf "%sM_%s", (NR>1 ? ", " : ""), $1}' | tr -d '\n')
+
+          # Build the new display title for this action run.
+          PRIMES_PART="p=${{ inputs.p1 }}${{ inputs.p2 != '' && format(', {0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format(', {0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format(', {0}', inputs.p4) || '' }}"
+          NEW_TITLE="🎉 MERSENNE PRIME ${M_LABELS} · LL · ${PRIMES_PART}"
+
+          echo "Renaming run to: ${NEW_TITLE}"
+
+          gh api \
+            --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f "display_title=${NEW_TITLE}" \
+          && echo "Run renamed successfully." \
+          || echo "WARNING: failed to rename run (non-fatal)."
+
+      - name: Upload results
+        if: always() && !inputs.dry_run
+        uses: actions/upload-artifact@v6
+        with:
+          name: "ll-4prime-p${{ inputs.p1 }}${{ inputs.p2 != '' && format('-{0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format('-{0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format('-{0}', inputs.p4) || '' }}"
+          path: worker_out/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Write step summary
+        if: always()
+        run: |
+          EXIT="${{ steps.run_ll.outputs.exit_code }}"
+          ELAPSED="${{ steps.run_ll.outputs.elapsed_secs }}"
+          DRY_RUN="${{ inputs.dry_run }}"
+          if [ "${DRY_RUN}" = "true" ]; then
+            STATUS_LABEL="📋 dry run"
+            ELAPSED_FMT="n/a (dry run)"
+          else
+            case "${EXIT}" in
+              0)   STATUS_LABEL="✅ completed" ;;
+              42)  STATUS_LABEL="⏱ timed out (soft stop)" ;;
+              "")  STATUS_LABEL="⏭ skipped" ;;
+              *)   STATUS_LABEL="❌ error (exit ${EXIT})" ;;
+            esac
+            if [ -n "${ELAPSED}" ] && [ "${ELAPSED}" -ge 0 ] 2>/dev/null; then
+              H=$(( ELAPSED / 3600 ))
+              M=$(( (ELAPSED % 3600) / 60 ))
+              S=$(( ELAPSED % 60 ))
+              ELAPSED_FMT=$(printf "%02d:%02d:%02d" "${H}" "${M}" "${S}")
+            else
+              ELAPSED_FMT="n/a"
+            fi
+          fi
+          {
+            echo "## LL 4-Prime Worker"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Primes | p=${{ inputs.p1 }}${{ inputs.p2 != '' && format(', {0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format(', {0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format(', {0}', inputs.p4) || '' }} |"
+            echo "| Elapsed time | ${ELAPSED_FMT} |"
+            echo "| Status | ${STATUS_LABEL} |"
+            echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+          } >> "$GITHUB_STEP_SUMMARY"

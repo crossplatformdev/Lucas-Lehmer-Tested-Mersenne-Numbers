@@ -1,40 +1,29 @@
 name: Seqmod Range Matrix
 run-name: "Seqmod Range · ${{ inputs.low_cap }}..${{ inputs.high_cap }}"
 
-# Single-run matrix wrapper for sequence_powermod that distributes prime
-# exponents in [low_cap, high_cap] linearly across up to 256 parallel workers.
+# Coordinator workflow: enumerates all prime exponents in [low_cap, high_cap]
+# via a segmented sieve, groups them into batches of exactly 4, then creates a
+# new GitHub Actions run for every batch by dispatching seqmod-4prime-worker.yml.
 #
-# Unlike sequence-powermod-sweep.yml (which uses ≤ 20 workers + self-chaining
-# reschedule per run), this wrapper launches ALL workers in one GitHub Actions
-# matrix job – no rescheduling, no self-chaining.
+# For n primes in [low_cap, high_cap] this creates ceil(n / 4) new action runs,
+# each with a single worker.  The four exponents appear in every dispatched run's
+# name so they can be queried directly via the GitHub Actions UI or API.
 #
-# Use case: run this ONCE to verify all known Mersenne prime exponents, e.g.:
-#   low_cap = 2, high_cap = 82589933 (covers all 51 known Mersenne primes)
-#
-# Linear distribution: primes in [low_cap, high_cap] are enumerated with a
-# segmented sieve and split into groups of approximately equal prime count.
-# Each worker receives the integer range [first_prime, last_prime] of its
-# group and runs sequence_powermod internally filtering to primes only.
+# If a dispatched worker finds a Mersenne prime it additionally renames its own
+# run to "🎉 MERSENNE PRIME M_p · LL · p=p1, p2, p3, p4".
 #
 # Workflow stages:
-#   1. validate – reject invalid inputs early
-#   2. build    – compile sequence_powermod and upload as artifact
-#   3. plan     – sieve [low_cap, high_cap], build ≤ 256-entry matrix JSON
-#   4. worker   – up to 256 parallel jobs, each tests its prime slice
-#   5. merge    – aggregate CSVs, write markdown report, upload artifact
+#   1. validate          – reject invalid inputs early
+#   2. build             – compile sequence_powermod (sanity-check before dispatch)
+#   3. plan_and_dispatch – sieve [low_cap, high_cap], create batches of 4 primes,
+#                          call gh api to dispatch one new run per batch
 #
 # Inputs:
 #   low_cap            – lower bound of exponent range (inclusive, ≥ 2)
 #   high_cap           – upper bound of exponent range (inclusive, ≥ low_cap)
-#   workers            – parallel workers (1–256, default 256)
-#   threads            – threads per worker (1–4, default 4)
+#   threads            – threads per worker (1–4, default 1)
 #   time_limit_seconds – per-worker soft-stop in seconds (default 21420 = 5.95 h)
-#   dry_run            – print plan only – do not run tests
-#
-# Worker exit codes (from sequence_powermod):
-#   0  – completed; all prime candidates in the batch were tested
-#   42 – soft stop (≥ time_limit_seconds elapsed); partial CSV written
-#   1  – unexpected error
+#   dry_run            – print plan only – do not dispatch worker runs
 
 on:
   workflow_dispatch:
@@ -47,29 +36,25 @@ on:
         description: "Upper bound of exponent range (inclusive, ≥ low_cap)"
         required: true
         type: string
-      workers:
-        description: "Parallel workers (1–256)"
-        required: false
-        type: string
-        default: "256"
       threads:
         description: "Threads per worker (1–4)"
         required: false
         type: string
-        default: "4"
+        default: "1"
       time_limit_seconds:
         description: "Per-worker soft-stop in seconds (default 21420 = 5.95 h)"
         required: false
         type: string
         default: "21420"
       dry_run:
-        description: "Print plan only – do not run tests"
+        description: "Print plan only – do not dispatch worker runs"
         required: false
         type: boolean
         default: false
 
 permissions:
   contents: read
+  actions: write
 
 env:
   # Opt into Node.js 24 for all JavaScript actions (suppresses the Node 20
@@ -91,7 +76,6 @@ jobs:
 
           LOW="${{ inputs.low_cap }}"
           HIGH="${{ inputs.high_cap }}"
-          WORKERS="${{ inputs.workers }}"
           THREADS="${{ inputs.threads }}"
           TL="${{ inputs.time_limit_seconds }}"
 
@@ -111,10 +95,6 @@ jobs:
             echo "::error::high_cap (${HIGH}) must be >= low_cap (${LOW})."
             exit 1
           fi
-          if ! [[ "$WORKERS" =~ ^[0-9]+$ ]] || (( WORKERS < 1 || WORKERS > 256 )); then
-            echo "::error::workers must be an integer in [1, 256], got '${WORKERS}'."
-            exit 1
-          fi
           if ! [[ "$THREADS" =~ ^[0-9]+$ ]] || (( THREADS < 1 || THREADS > 4 )); then
             echo "::error::threads must be an integer in [1, 4], got '${THREADS}'."
             exit 1
@@ -124,14 +104,15 @@ jobs:
             exit 1
           fi
 
-          echo "Inputs validated: range=[${LOW}, ${HIGH}], workers=${WORKERS}, threads=${THREADS}, time_limit=${TL}s"
+          echo "Inputs validated: range=[${LOW}, ${HIGH}], threads=${THREADS}, time_limit=${TL}s"
           echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
   # ──────────────────────────────────────────────────────────
-  # Stage 2: Build – compile sequence_powermod and cache it.
+  # Stage 2: Build – compile sequence_powermod as a sanity
+  #           check before dispatching worker runs.
   # ──────────────────────────────────────────────────────────
   build:
-    name: Build binary
+    name: Build and verify binary
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -154,53 +135,49 @@ jobs:
           ./bin/sequence_powermod 20 1 1
           echo "Binary OK."
 
-      - name: Compress binary
-        run: gzip -9 bin/sequence_powermod
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: seqmod-range-binary
-          path: bin/sequence_powermod.gz
-          retention-days: 1
-
   # ──────────────────────────────────────────────────────────
-  # Stage 3: Plan – enumerate all prime exponents in
-  #           [low_cap, high_cap] via a segmented sieve,
-  #           then split them linearly across ≤ 256 workers.
+  # Stage 3: Plan and dispatch – enumerate all prime exponents
+  #           in [low_cap, high_cap], group into batches of 4,
+  #           and dispatch one new seqmod-4prime-worker.yml run
+  #           per batch.
   # ──────────────────────────────────────────────────────────
-  plan:
-    name: Build prime batch matrix
+  plan_and_dispatch:
+    name: Plan batches and dispatch worker runs
     needs: [validate, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      batch_matrix:     ${{ steps.make-matrix.outputs.batch_matrix }}
-      batch_count:      ${{ steps.make-matrix.outputs.batch_count }}
-      plan_elapsed_sec: ${{ steps.make-matrix.outputs.plan_elapsed_sec }}
+    # Allow up to 6 hours for large ranges
+    # (at ~1.4 dispatches/s: ~20 000 batches ≈ 4 h for 80 000 primes).
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Enumerate primes and build matrix
-        id: make-matrix
+      - name: Sieve primes and dispatch 4-prime worker runs
         run: |
           set -euo pipefail
 
           export LOW="${{ inputs.low_cap }}"
           export HIGH="${{ inputs.high_cap }}"
-          export WORKERS="${{ inputs.workers }}"
+          export DRY_RUN="${{ inputs.dry_run }}"
+          export THREADS="${{ inputs.threads }}"
+          export TIME_LIMIT="${{ inputs.time_limit_seconds }}"
 
-          echo "=== Seqmod Range Matrix – Planning ==="
-          echo "Range  : [${LOW}, ${HIGH}]"
-          echo "Workers: ${WORKERS}"
+          echo "=== Seqmod Range Matrix – Dispatch Phase ==="
+          echo "Range   : [${LOW}, ${HIGH}]"
+          echo "Threads : ${THREADS}"
+          echo "Dry run : ${DRY_RUN}"
           echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-
-          PLAN_START=$(date +%s)
+          echo ""
 
           python3 - <<'PYEOF'
-          import json, math, os, sys
+          import json, math, os, subprocess, sys, time
 
-          low_cap  = int(os.environ["LOW"])
-          high_cap = int(os.environ["HIGH"])
-          workers  = int(os.environ["WORKERS"])
+          low_cap    = int(os.environ["LOW"])
+          high_cap   = int(os.environ["HIGH"])
+          dry_run    = os.environ["DRY_RUN"] == "true"
+          threads    = os.environ["THREADS"]
+          time_limit = os.environ["TIME_LIMIT"]
+          repo       = os.environ["GITHUB_REPOSITORY"]
+          ref_name   = os.environ["GITHUB_REF_NAME"]
 
           # ── Segmented sieve to enumerate primes in [low_cap, high_cap] ──
           # Uses O(sqrt(high_cap)) memory for small primes plus one segment
@@ -216,9 +193,7 @@ jobs:
                       small[j] = 1
           small_primes = [i for i in range(2, sqrt_hi + 1) if not small[i]]
 
-          # Two-pass segmented sieve: first count, then split.
-          # This avoids storing the full prime list in RAM.
-          SEG = max(sqrt_hi, 1 << 17)   # 128 KiB per segment (131 072 bytes)
+          SEG = max(sqrt_hi, 1 << 17)   # 128 KiB per segment
 
           def iter_primes(lo_start, hi_end):
               """Yield all primes in [lo_start, hi_end]."""
@@ -237,425 +212,109 @@ jobs:
                           yield lo + i
                   lo = hi + 1
 
-          # Pass 1: count primes.
-          print("Counting primes in range...", file=sys.stderr)
-          total = sum(1 for _ in iter_primes(low_cap, high_cap))
-          print(f"Total prime exponents in [{low_cap}, {high_cap}]: {total}", file=sys.stderr)
+          def dispatch_batch(batch_index, primes):
+              """Dispatch one seqmod-4prime-worker.yml run for `primes` (1–4 elements)."""
+              padded = (primes + ["", "", "", ""])[:4]
+              p1, p2, p3, p4 = padded
+              label = ", ".join(str(p) for p in primes)
+              print(f"  Batch {batch_index:6d}: [{label}]")
+              inputs = {
+                  "p1": str(p1),
+                  "p2": str(p2),
+                  "p3": str(p3),
+                  "p4": str(p4),
+                  "threads":            threads,
+                  "time_limit_seconds": time_limit,
+                  "dry_run":            dry_run,
+              }
+              payload = json.dumps({"ref": ref_name, "inputs": inputs})
+              if dry_run:
+                  print(f"    (dry_run: would dispatch seqmod-4prime-worker.yml)")
+                  return True
+              result = subprocess.run(
+                  ["gh", "api",
+                   "--method", "POST",
+                   f"repos/{repo}/actions/workflows/seqmod-4prime-worker.yml/dispatches",
+                   "--input", "-"],
+                  input=payload,
+                  capture_output=True, text=True,
+              )
+              if result.returncode != 0:
+                  print(f"    ERROR: {result.stderr.strip()}", file=sys.stderr)
+                  return False
+              print(f"    → dispatched OK")
+              return True
 
-          if total == 0:
-              print("No prime exponents found in range – nothing to test.", file=sys.stderr)
-              with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
-                  gh_out.write("batch_matrix=[]\n")
-                  gh_out.write("batch_count=0\n")
+          # Count primes first so we can print a progress estimate.
+          print("Counting primes in range...", file=sys.stderr)
+          total_primes = sum(1 for _ in iter_primes(low_cap, high_cap))
+          total_batches = math.ceil(total_primes / 4)
+          print(
+              f"Total prime exponents in [{low_cap}, {high_cap}]: {total_primes}",
+              file=sys.stderr,
+          )
+          print(
+              f"Batches to dispatch (ceil({total_primes}/4)): {total_batches}",
+              file=sys.stderr,
+          )
+
+          if total_primes == 0:
+              print("No prime exponents found in range – nothing to dispatch.", file=sys.stderr)
               sys.exit(0)
 
-          # Cap effective workers to the number of available primes.
-          eff_workers = min(workers, total)
-          # Primes per batch (ceiling division so the last batch may be smaller).
-          batch_target = math.ceil(total / eff_workers)
-
-          # Pass 2: enumerate primes and split into batches.
-          batches         = []
-          batch_start     = None
-          batch_last      = None
-          batch_count_cur = 0
+          # Group primes into batches of 4 and dispatch each batch.
+          BATCH_SIZE = 4
+          batch       = []
+          batch_index = 0
+          total_ok    = 0
+          total_err   = 0
 
           for prime in iter_primes(low_cap, high_cap):
-              if batch_start is None:
-                  batch_start = prime
-              batch_last       = prime
-              batch_count_cur += 1
+              batch.append(prime)
+              if len(batch) == BATCH_SIZE:
+                  ok = dispatch_batch(batch_index, batch)
+                  total_ok   += ok
+                  total_err  += not ok
+                  batch       = []
+                  batch_index += 1
+                  if not dry_run:
+                      # DISPATCH_INTERVAL_SEC: 0.7 s → ~1.4 dispatches/s.
+                      # GitHub's secondary rate limit for workflow_dispatch is
+                      # roughly 1 000 requests/minute; 1.4/s is well within it.
+                      DISPATCH_INTERVAL_SEC = 0.7
+                      time.sleep(DISPATCH_INTERVAL_SEC)
 
-              # Flush when the batch is full AND we haven't yet created all
-              # workers (leave the last group to be flushed after the loop).
-              if batch_count_cur >= batch_target and len(batches) + 1 < eff_workers:
-                  idx  = len(batches)
-                  name = f"seqmod-range-w{idx:03d}-{batch_start}-{batch_last}"
-                  batches.append({
-                      "worker_name":    name,
-                      "worker_start_n": batch_start,
-                      "worker_end_n":   batch_last,
-                      "worker_index":   idx,
-                      "prime_count":    batch_count_cur,
-                  })
-                  batch_start     = None
-                  batch_last      = None
-                  batch_count_cur = 0
+          # Flush the final partial batch (1–3 primes).
+          if batch:
+              ok = dispatch_batch(batch_index, batch)
+              total_ok   += ok
+              total_err  += not ok
+              batch_index += 1
 
-          # Flush remaining primes as the final batch.
-          if batch_start is not None:
-              idx  = len(batches)
-              name = f"seqmod-range-w{idx:03d}-{batch_start}-{batch_last}"
-              batches.append({
-                  "worker_name":    name,
-                  "worker_start_n": batch_start,
-                  "worker_end_n":   batch_last,
-                  "worker_index":   idx,
-                  "prime_count":    batch_count_cur,
-              })
-
-          print(f"Effective workers: {len(batches)}  (target batch size: {batch_target} primes)", file=sys.stderr)
-          for b in batches:
-              print(
-                  f"  [{b['worker_index']:3d}] {b['worker_name']}"
-                  f"  [{b['worker_start_n']}, {b['worker_end_n']}]"
-                  f"  ({b['prime_count']} primes)",
-                  file=sys.stderr,
-              )
-
-          matrix_json = json.dumps(batches)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
-              gh_out.write(f"batch_matrix={matrix_json}\n")
-              gh_out.write(f"batch_count={len(batches)}\n")
+          print(f"\n{'─' * 60}")
+          print(f"Total batches dispatched : {batch_index}")
+          print(f"Succeeded                : {total_ok}")
+          if total_err:
+              print(f"Errors                   : {total_err}", file=sys.stderr)
+              sys.exit(1)
           PYEOF
 
-          PLAN_ELAPSED=$(( $(date +%s) - PLAN_START ))
-          echo "plan_elapsed_sec=${PLAN_ELAPSED}" >> "$GITHUB_OUTPUT"
-
-          # Write step summary showing plan duration (warm-up time).
-          # Visible in both dry_run (planning) and normal run modes.
-          {
-            echo "## 📋 Planning Summary"
-            echo ""
-            echo "| Field | Value |"
-            echo "|-------|-------|"
-            echo "| Range | [${LOW}, ${HIGH}] |"
-            echo "| Workers | ${WORKERS} |"
-            echo "| Dry run | ${{ inputs.dry_run }} |"
-            echo "| Planning time (warm-up) | ${PLAN_ELAPSED} s |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ──────────────────────────────────────────────────────────
-  # Stage 4: Workers – one job per batch (up to 256 parallel).
-  #
-  # Each worker:
-  #   • Downloads the pre-built binary.
-  #   • Runs sequence_powermod on its [worker_start_n, worker_end_n] slice.
-  #   • Uploads a results CSV and a JSON state file as artifacts.
-  #   • Exits normally (0) or with soft-stop code 42.
-  #   • continue-on-error: true so a timeout (code 42) does not fail the
-  #     whole matrix.
-  # ──────────────────────────────────────────────────────────
-  worker:
-    name: "Worker ${{ matrix.worker_name }} · n=${{ matrix.worker_start_n }}..${{ matrix.worker_end_n }}"
-    needs: [plan, build]
-    runs-on: ubuntu-24.04
-    # No timeout-minutes: the binary enforces the soft stop internally.
-    # GitHub-hosted runners impose a hard 6-hour cap regardless.
-    strategy:
-      fail-fast: false
-      max-parallel: 256
-      matrix:
-        include: ${{ fromJson(needs.plan.outputs.batch_matrix) }}
-    continue-on-error: true
-    steps:
-      - name: Download binary
-        uses: actions/download-artifact@v6
-        with:
-          name: seqmod-range-binary
-          path: bin/
-
-      - name: Make binary executable
-        run: gunzip bin/sequence_powermod.gz && chmod +x bin/sequence_powermod
-
-      - name: Run batch ${{ matrix.worker_name }}
-        id: run_batch
-        run: |
-          set -uo pipefail
-
-          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
-          echo "Job   : worker"
-          echo "Name  : ${{ matrix.worker_name }}"
-          echo "Range : [${{ matrix.worker_start_n }}, ${{ matrix.worker_end_n }}]"
-          echo "Primes: ${{ matrix.prime_count }}"
-
-          DRY_RUN="${{ inputs.dry_run }}"
-          if [ "${DRY_RUN}" = "true" ]; then
-            echo "DRY RUN: would run sequence_powermod on [${{ matrix.worker_start_n }}, ${{ matrix.worker_end_n }}] (${{ matrix.prime_count }} primes)"
-            echo "exit_code=0" >> "$GITHUB_OUTPUT"
-            echo "elapsed_secs=0" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          mkdir -p worker_out/
-
-          ITERS=$(( ${{ matrix.worker_end_n }} - ${{ matrix.worker_start_n }} + 1 ))
-          CSV_PATH="worker_out/${{ matrix.worker_name }}.csv"
-          STATE_PATH="worker_out/${{ matrix.worker_name }}_state.json"
-
-          START_SEC=$(date +%s)
-          set +e
-          SEQMOD_TIME_LIMIT_SECS="${{ inputs.time_limit_seconds }}" \
-          SEQMOD_OUTPUT_CSV="${CSV_PATH}" \
-          SEQMOD_STATE_FILE="${STATE_PATH}" \
-          ./bin/sequence_powermod \
-            "${ITERS}" \
-            "${{ matrix.worker_start_n }}" \
-            "${{ inputs.threads }}"
-          EXIT_CODE=$?
-          set -e
-          ELAPSED=$(( $(date +%s) - START_SEC ))
-
-          echo "Binary exit code: ${EXIT_CODE}"
-          echo "Elapsed time    : ${ELAPSED}s"
-          echo "exit_code=${EXIT_CODE}"    >> "$GITHUB_OUTPUT"
-          echo "elapsed_secs=${ELAPSED}"  >> "$GITHUB_OUTPUT"
-
-          # Write / augment state JSON so the merge stage can report status.
-          if [ -f "${STATE_PATH}" ]; then
-            python3 - <<PYEOF
-          import json, sys
-          try:
-            with open("${STATE_PATH}") as f:
-              state = json.load(f)
-          except Exception:
-            state = {}
-          state["exit_code"]    = ${EXIT_CODE}
-          state["worker_name"]  = "${{ matrix.worker_name }}"
-          state["start_n"]      = ${{ matrix.worker_start_n }}
-          state["end_n"]        = ${{ matrix.worker_end_n }}
-          state["prime_count"]  = ${{ matrix.prime_count }}
-          state["timed_out"]    = (${EXIT_CODE} == 42)
-          state["elapsed_secs"] = ${ELAPSED}
-          state["run_id"]       = "${GITHUB_RUN_ID}"
-          with open("${STATE_PATH}", "w") as f:
-            json.dump(state, f, indent=2)
-          print("State written:", json.dumps(state, indent=2))
-          PYEOF
-          else
-            # No state file written by the binary – create a minimal one.
-            python3 -c "
-          import json
-          state = {
-            'exit_code':    ${EXIT_CODE},
-            'worker_name':  '${{ matrix.worker_name }}',
-            'start_n':      ${{ matrix.worker_start_n }},
-            'end_n':        ${{ matrix.worker_end_n }},
-            'prime_count':  ${{ matrix.prime_count }},
-            'timed_out':    ${EXIT_CODE} == 42,
-            'elapsed_secs': ${ELAPSED},
-            'run_id':       '${GITHUB_RUN_ID}',
-          }
-          with open('${STATE_PATH}', 'w') as f:
-            json.dump(state, f, indent=2)
-          "
-          fi
-
-          # Always exit 0 from this step so the job succeeds; the binary's
-          # exit code is captured in the GITHUB_OUTPUT for the merge report.
-          exit 0
-
-      - name: Upload results artifact
-        if: always() && !inputs.dry_run
-        uses: actions/upload-artifact@v6
-        with:
-          name: seqmod-range-results-${{ matrix.worker_name }}
-          path: worker_out/${{ matrix.worker_name }}.csv
-          retention-days: 90
-          if-no-files-found: warn
-
-      - name: Upload state artifact
-        if: always() && !inputs.dry_run
-        uses: actions/upload-artifact@v6
-        with:
-          name: seqmod-range-state-${{ matrix.worker_name }}
-          path: worker_out/${{ matrix.worker_name }}_state.json
-          retention-days: 90
-          if-no-files-found: warn
+          echo ""
+          echo "Dispatch complete."
+          echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
       - name: Write step summary
         if: always()
         run: |
-          DRY_RUN="${{ inputs.dry_run }}"
-          EXIT="${{ steps.run_batch.outputs.exit_code }}"
-          ELAPSED="${{ steps.run_batch.outputs.elapsed_secs }}"
-          if [ "${DRY_RUN}" = "true" ]; then
-            STATUS_LABEL="📋 dry run"
-            ELAPSED_FMT="n/a (dry run)"
-          else
-            case "${EXIT}" in
-              0)  STATUS_LABEL="✅ completed" ;;
-              42) STATUS_LABEL="⏱ timed out (soft stop)" ;;
-              "")  STATUS_LABEL="⏭ skipped" ;;
-              *)  STATUS_LABEL="❌ error (exit ${EXIT})" ;;
-            esac
-            if [ -n "${ELAPSED}" ] && [ "${ELAPSED}" -ge 0 ] 2>/dev/null; then
-              H=$(( ELAPSED / 3600 ))
-              M=$(( (ELAPSED % 3600) / 60 ))
-              S=$(( ELAPSED % 60 ))
-              ELAPSED_FMT=$(printf "%02d:%02d:%02d" "${H}" "${M}" "${S}")
-            else
-              ELAPSED_FMT="n/a"
-            fi
-          fi
           {
-            echo "## Worker: ${{ matrix.worker_name }}"
+            echo "## 📋 Seqmod Range Matrix – Dispatch Summary"
             echo ""
             echo "| Field | Value |"
             echo "|-------|-------|"
-            echo "| Range | [${{ matrix.worker_start_n }}, ${{ matrix.worker_end_n }}] |"
-            echo "| Primes | ${{ matrix.prime_count }} |"
-            echo "| Elapsed time | ${ELAPSED_FMT} |"
-            echo "| Status | ${STATUS_LABEL} |"
-            echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ──────────────────────────────────────────────────────────
-  # Stage 5: Merge – aggregate all worker CSVs and write the
-  #           final report.
-  # ──────────────────────────────────────────────────────────
-  merge:
-    name: Merge results and write report
-    needs: [worker, plan]
-    if: always()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Download all results artifacts
-        uses: actions/download-artifact@v6
-        with:
-          pattern: seqmod-range-results-*
-          path: results/
-          merge-multiple: true
-
-      - name: Download all state artifacts
-        uses: actions/download-artifact@v6
-        with:
-          pattern: seqmod-range-state-*
-          path: states/
-          merge-multiple: true
-
-      - name: Merge and sort CSVs
-        run: |
-          set -euo pipefail
-          mkdir -p merged_out/
-
-          echo "n,is_prime" > merged_out/merged_results.csv
-          for f in results/*.csv; do
-            [ -f "$f" ] && tail -n +2 "$f" >> merged_out/merged_results.csv || true
-          done
-
-          {
-            head -1 merged_out/merged_results.csv
-            tail -n +2 merged_out/merged_results.csv | sort -t, -k1 -n
-          } > merged_out/sorted.csv
-          mv merged_out/sorted.csv merged_out/merged_results.csv
-
-          TOTAL=$(( $(wc -l < merged_out/merged_results.csv) - 1 ))
-          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv || echo 0)
-          echo "Total prime exponents tested : ${TOTAL}"
-          echo "Mersenne primes found        : ${PRIMES}"
-
-      - name: Write markdown report
-        run: |
-          set -euo pipefail
-
-          TOTAL=$(( $(wc -l < merged_out/merged_results.csv 2>/dev/null || echo 1) - 1 ))
-          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv 2>/dev/null || echo 0)
-          TIMEOUTS=$(python3 - <<'PYEOF'
-          import json, pathlib, sys
-          n = 0
-          for f in pathlib.Path("states").glob("*.json"):
-              try:
-                  state = json.loads(f.read_text())
-                  if state.get("timed_out", False) or state.get("exit_code") == 42:
-                      n += 1
-              except Exception as exc:
-                  print(f"WARNING: {f}: {exc}", file=sys.stderr)
-          print(n)
-          PYEOF
-          )
-
-          REPORT="merged_out/report.md"
-          {
-            echo "# Seqmod Range Matrix – Final Report"
-            echo ""
-            echo "| Field | Value |"
-            echo "|-------|-------|"
-            echo "| Range tested | [${{ inputs.low_cap }}, ${{ inputs.high_cap }}] |"
-            echo "| Workers requested | ${{ inputs.workers }} |"
+            echo "| Range | [${{ inputs.low_cap }}, ${{ inputs.high_cap }}] |"
             echo "| Threads per worker | ${{ inputs.threads }} |"
             echo "| Per-worker time limit | ${{ inputs.time_limit_seconds }} s |"
-            PLAN_SEC="${{ needs.plan.outputs.plan_elapsed_sec }}"
-            if [ -z "${PLAN_SEC}" ]; then PLAN_SEC="n/a"; fi
-            echo "| Planning time (warm-up) | ${PLAN_SEC} s |"
-            echo "| Total prime exponents tested | ${TOTAL} |"
-            echo "| Mersenne primes found | ${PRIMES} |"
-            echo "| Workers that timed out | ${TIMEOUTS} |"
+            echo "| Dry run | ${{ inputs.dry_run }} |"
+            echo "| Worker workflow | seqmod-4prime-worker.yml |"
             echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
-            echo ""
-            if [ "${PRIMES}" -gt 0 ]; then
-              echo "## 🎉 Mersenne Primes Found"
-              echo ""
-              echo "| Exponent p | M_p = 2^p − 1 |"
-              echo "|------------|---------------|"
-              grep ",true$" merged_out/merged_results.csv 2>/dev/null | \
-                while IFS=, read -r p _; do
-                  echo "| ${p} | M_${p} |"
-                done
-            fi
-            echo ""
-            echo "## Worker Summary"
-            echo ""
-            echo "| Worker | Range | Primes | Elapsed | Status |"
-            echo "|--------|-------|--------|---------|--------|"
-            python3 - <<'PYEOF'
-          import json, pathlib
-          rows = []
-          for sf in sorted(pathlib.Path("states").glob("*.json")):
-              try:
-                  s = json.loads(sf.read_text())
-              except Exception:
-                  continue
-              ec    = s.get("exit_code", "?")
-              timed = s.get("timed_out", False) or ec == 42
-              if timed:
-                  status = "⏱ timed out"
-              elif ec == 0:
-                  status = "✅ completed"
-              else:
-                  status = f"❌ error ({ec})"
-              elapsed_secs = s.get("elapsed_secs")
-              if elapsed_secs is not None:
-                  h = elapsed_secs // 3600
-                  m = (elapsed_secs % 3600) // 60
-                  sec = elapsed_secs % 60
-                  elapsed_fmt = f"{h:02d}:{m:02d}:{sec:02d}"
-              else:
-                  elapsed_fmt = "n/a"
-              rows.append((
-                  s.get("worker_name", "?"),
-                  s.get("start_n", "?"),
-                  s.get("end_n", "?"),
-                  s.get("prime_count", "?"),
-                  elapsed_fmt,
-                  status,
-              ))
-          for name, sn, en, pc, elapsed, st in rows:
-              print(f"| {name} | [{sn}, {en}] | {pc} | {elapsed} | {st} |")
-          PYEOF
-            echo ""
-            if [ "${TIMEOUTS}" -gt 0 ]; then
-              echo "> ⚠️ ${TIMEOUTS} worker(s) timed out. Re-run the timed-out ranges"
-              echo "> with \`sequence-powermod-sweep.yml\` for continued testing."
-            fi
-            echo ""
-            echo "_Full results available in the \`seqmod-range-merged-results\` artifact._"
-          } > "${REPORT}"
-
-          cat "${REPORT}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Zip merged results
-        run: |
-          if [ -f merged_out/merged_results.csv ]; then
-            zip -9 merged_results.zip merged_out/merged_results.csv merged_out/report.md
-          fi
-
-      - name: Upload merged results artifact
-        if: hashFiles('merged_results.zip') != ''
-        uses: actions/upload-artifact@v6
-        with:
-          name: seqmod-range-merged-results
-          path: merged_results.zip
-          retention-days: 90
-          compression-level: 9
+          } >> "$GITHUB_STEP_SUMMARY"
