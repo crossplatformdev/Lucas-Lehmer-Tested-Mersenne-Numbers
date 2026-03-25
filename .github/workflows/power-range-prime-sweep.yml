@@ -625,24 +625,24 @@ jobs:
           NEW_EXPS=""
           if [ -f bucket_out/merged_all_results.json ]; then
             KNOWN_EXPS=$(python3 - <<'PYEOF'
-import json
-with open("bucket_out/merged_all_results.json") as f:
-    data = json.load(f)
-exps = [str(r["exponent"]) for r in data.get("results", [])
-        if r.get("result") == "prime"
-        and r.get("is_known_mersenne_prime")]
-print(", ".join(f"M_{e}" for e in exps))
-PYEOF
-)
+          import json
+          with open("bucket_out/merged_all_results.json") as f:
+              data = json.load(f)
+          exps = [str(r["exponent"]) for r in data.get("results", [])
+                  if r.get("result") == "prime"
+                  and r.get("is_known_mersenne_prime")]
+          print(", ".join(f"M_{e}" for e in exps))
+          PYEOF
+          )
             NEW_EXPS=$(python3 - <<'PYEOF'
-import json
-with open("bucket_out/merged_all_results.json") as f:
-    data = json.load(f)
-exps = [str(r["exponent"]) for r in data.get("results", [])
-        if r.get("is_new_discovery")]
-print(", ".join(f"M_{e}" for e in exps))
-PYEOF
-)
+          import json
+          with open("bucket_out/merged_all_results.json") as f:
+              data = json.load(f)
+          exps = [str(r["exponent"]) for r in data.get("results", [])
+                  if r.get("is_new_discovery")]
+          print(", ".join(f"M_{e}" for e in exps))
+          PYEOF
+          )
           fi
 
           BUCKET_RANGE="${{ inputs.bucket_start }}..${{ inputs.bucket_end }}"
