@@ -15,12 +15,19 @@ PLAN_BIN := bin/split_bucket_batches
 PLAN_SRC := src/split_bucket_batches.c
 
 # sequence_powermod: stdlib-only Mersenne sequence search binary (no GMP).
-# Source: src/sequence_powermod_stdc.cpp
-# The GMP-based predecessor lives in src/sequence_powermod.cpp for reference.
+# Benchmarked 2.57× slower than the GMP build; kept as reference only.
+# bin/bignum is the production binary used in all workflows.
 SEQMOD_SRC  := src/sequence_powermod_stdc.cpp
 SEQMOD_BIN  := bin/sequence_powermod
 SEQMOD_CXXFLAGS := -std=c++17 -O3 -march=native -mtune=native -pthread -Wall -Wextra
 SEQMOD_LDFLAGS  := -pthread
+
+# sequence_powermod_gmp: GMP-based variant (~2.57× faster than stdc, ~1% off
+# bignum). Kept for comparison; bin/bignum is used in all workflows.
+SEQMOD_GMP_SRC      := src/sequence_powermod.cpp
+SEQMOD_GMP_BIN      := bin/sequence_powermod_gmp
+SEQMOD_GMP_CXXFLAGS := -std=c++17 -O3 -march=native -mtune=native -pthread -Wall -Wextra
+SEQMOD_GMP_LDFLAGS  := -pthread -lgmp -lgmpxx
 
 # Profiling build uses -O2 (keeps enough optimization to be representative
 # while preserving function call structure for gprof) and -pg.
@@ -69,7 +76,11 @@ $(SEQMOD_BIN): $(SEQMOD_SRC)
 	@mkdir -p bin
 	$(CXX) $(SEQMOD_CXXFLAGS) $< -o $@ $(SEQMOD_LDFLAGS)
 
-# seqmod: build the stdlib-only sequence_powermod binary (no GMP).
+$(SEQMOD_GMP_BIN): $(SEQMOD_GMP_SRC)
+	@mkdir -p bin
+	$(CXX) $(SEQMOD_GMP_CXXFLAGS) $< -o $@ $(SEQMOD_GMP_LDFLAGS)
+
+# seqmod: build the stdlib-only reference binary (no GMP).
 seqmod: $(SEQMOD_BIN)
 
 # ── seqmod-prof ──────────────────────────────────────────────────────────────
@@ -120,6 +131,8 @@ seqmod-bench: $(SEQMOD_BIN)
 	 else \
 	   echo "(GMP binary $(SEQMOD_GMP_BIN) not found; build with GMP to compare)"; \
 	 fi
+# seqmod-gmp: build the GMP-based comparison binary.
+seqmod-gmp: $(SEQMOD_GMP_BIN)
 
 $(TEST_BIN): tests/test_bignum.cpp $(SRC)
 	@mkdir -p bin

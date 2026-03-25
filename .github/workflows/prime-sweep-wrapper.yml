@@ -126,7 +126,7 @@ jobs:
     needs: sweep
     if: success() || failure()
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 360
     steps:
       - name: Download merged results artifact
         uses: actions/download-artifact@v6

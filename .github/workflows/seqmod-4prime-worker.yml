@@ -71,16 +71,16 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq g++ make
+          sudo apt-get install -y -qq g++ make libboost-dev
 
-      - name: Build sequence_powermod
-        run: make seqmod SEQMOD_CXXFLAGS="-std=c++17 -O3 -march=x86-64 -pthread -Wall -Wextra"
+      - name: Build bignum
+        run: make bin/bignum
 
       - name: Verify binary
         run: |
           echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
           echo "Job: worker"
-          ./bin/sequence_powermod 20 1 1
+          LL_SWEEP_MODE=p LL_MIN_EXPONENT=2 LL_MAX_EXPONENT=5 ./bin/bignum 0 1
           echo "Binary OK."
 
       - name: Run Lucas-Lehmer test
@@ -143,7 +143,7 @@ jobs:
 
           DRY_RUN="${{ inputs.dry_run }}"
           if [ "${DRY_RUN}" = "true" ]; then
-            echo "DRY RUN: would run sequence_powermod on [${P_MIN}, ${P_MAX}] (${ITERS} candidates)"
+          echo "DRY RUN: would run bignum on [${P_MIN}, ${P_MAX}]"
             echo "exit_code=0"    >> "$GITHUB_OUTPUT"
             echo "elapsed_secs=0" >> "$GITHUB_OUTPUT"
             echo "csv_path="      >> "$GITHUB_OUTPUT"
@@ -152,12 +152,17 @@ jobs:
 
           START_SEC=$(date +%s)
           set +e
-          SEQMOD_TIME_LIMIT_SECS="${{ inputs.time_limit_seconds }}" \
-          SEQMOD_OUTPUT_CSV="${CSV_PATH}" \
-          SEQMOD_STATE_FILE="${STATE_PATH}" \
-          ./bin/sequence_powermod "${ITERS}" "${P_MIN}" "4"
+          timeout "${{ inputs.time_limit_seconds }}" \
+          env LL_SWEEP_MODE=p \
+          LL_MIN_EXPONENT="${P_MIN}" \
+          LL_MAX_EXPONENT="${P_MAX}" \
+          LL_BENCH_OUTPUT="${CSV_PATH}" \
+          LL_PROGRESS=0 \
+          ./bin/bignum 0 4
           EXIT_CODE=$?
           set -e
+          # exit 124 means timeout(1) killed the process — treat as timed out.
+          [ "${EXIT_CODE}" -eq 124 ] && EXIT_CODE=42
           ELAPSED=$(( $(date +%s) - START_SEC ))
 
           echo "Exit code : ${EXIT_CODE}"
@@ -171,32 +176,80 @@ jobs:
 
       - name: Rename run if Mersenne prime found
         if: always() && !inputs.dry_run
+        id: tag_run
         env:
           CSV_PATH: ${{ steps.run_ll.outputs.csv_path }}
+          PRIMES_PART: "p=${{ inputs.p1 }}, ${{ inputs.p2 || 'N/A' }}, ${{ inputs.p3 || 'N/A' }}, ${{ inputs.p4 || 'N/A' }}"
         run: |
           set -uo pipefail
 
           if [ -z "${CSV_PATH}" ] || [ ! -f "${CSV_PATH}" ]; then
             echo "No CSV output found – skipping rename check."
+            echo "known_primes="  >> "$GITHUB_OUTPUT"
+            echo "new_primes="    >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # Collect all exponents whose is_prime column is "true".
-          MERSENNE_EXPS=$(grep -E "^[0-9]+,true$" "${CSV_PATH}" | cut -d, -f1 | tr '\n' ' ' | sed 's/ $//' || true)
+          # bignum LL_BENCH_OUTPUT CSV format: p,is_prime,time_sec
+          MERSENNE_EXPS=$(grep -E ",true," "${CSV_PATH}" | cut -d, -f1 | tr '\n' ' ' | sed 's/ $//' || true)
 
           if [ -z "${MERSENNE_EXPS}" ]; then
             echo "No Mersenne primes found in this batch – run name unchanged."
+            echo "known_primes="  >> "$GITHUB_OUTPUT"
+            echo "new_primes="    >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "🎉 Mersenne prime exponent(s) found: ${MERSENNE_EXPS}"
+          echo "Mersenne prime exponent(s) found: ${MERSENNE_EXPS}"
 
-          # Build the M_p labels (e.g. "M_2, M_3, M_5").
-          M_LABELS=$(echo "${MERSENNE_EXPS}" | tr ' ' '\n' | awk '{printf "%sM_%s", (NR>1 ? ", " : ""), $1}' | tr -d '\n')
+          # Classify each found exponent as known or new; build the run title.
+          RENAME_CMD=$(MERSENNE_EXPS="${MERSENNE_EXPS}" python3 - <<'PYEOF'
+import os
 
-          # Build the new display title for this action run.
-          PRIMES_PART="p=${{ inputs.p1 }}, ${{ inputs.p2 || 'N/A' }}, ${{ inputs.p3 || 'N/A' }}, ${{ inputs.p4 || 'N/A' }}"
-          NEW_TITLE="🎉 MERSENNE PRIME ${M_LABELS} · LL · ${PRIMES_PART}"
+KNOWN = {
+    2, 3, 5, 7, 13, 17, 19, 31, 61, 89, 107, 127, 521, 607, 1279, 2203,
+    2281, 3217, 4253, 4423, 9689, 9941, 11213, 19937, 21701, 23209, 44497,
+    86243, 110503, 132049, 216091, 756839, 859433, 1257787, 1398269,
+    2976221, 3021377, 6972593, 13466917, 20996011, 24036583, 25964951,
+    30402457, 32582657, 37156667, 42643801, 43112609, 57885161, 74207281,
+    77232917, 82589933, 136279841,
+}
+
+exps = [int(e) for e in os.environ["MERSENNE_EXPS"].split()]
+known = [e for e in exps if e in KNOWN]
+new   = [e for e in exps if e not in KNOWN]
+
+gh_out = os.environ.get("GITHUB_OUTPUT", "")
+if gh_out:
+    with open(gh_out, "a") as f:
+        f.write(f"known_primes={' '.join(str(e) for e in known)}\n")
+        f.write(f"new_primes={' '.join(str(e) for e in new)}\n")
+
+if new:
+    print(f"🥇 NOT in known list: {new}", flush=True)
+if known:
+    print(f"🍋 Known Mersenne primes: {known}", flush=True)
+
+primes_part = os.environ.get("PRIMES_PART", "")
+if new:
+    m_labels = ", ".join(f"M_{e}" for e in new)
+    title = f"🥇 NEW PRIME {m_labels} · LL · {primes_part}"
+else:
+    m_labels = ", ".join(f"M_{e}" for e in known)
+    title = f"🍋 MERSENNE PRIME {m_labels} · LL · {primes_part}"
+
+# Emit the title so the shell can capture it.
+print(f"__TITLE__:{title}")
+PYEOF
+)
+
+          NEW_TITLE=$(echo "${RENAME_CMD}" | grep '^__TITLE__:' | sed 's/^__TITLE__://')
+
+          if [ -z "${NEW_TITLE}" ]; then
+            echo "No title generated – skipping rename."
+            exit 0
+          fi
 
           echo "Renaming run to: ${NEW_TITLE}"
 

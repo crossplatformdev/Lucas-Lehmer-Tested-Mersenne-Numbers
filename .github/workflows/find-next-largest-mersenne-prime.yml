@@ -92,8 +92,7 @@ jobs:
   compute:
     name: "Search (${{ inputs.chain_id }})"
     runs-on: ubuntu-24.04
-    # No timeout-minutes: the LL test must run to its soft-stop, which is
-    # enforced internally.  GitHub-hosted runners hard-cap at 6 hours.
+    timeout-minutes: 360  # 6 h – maximum allowed on GitHub-hosted runners
     env:
       CHAIN_ID:           ${{ inputs.chain_id }}
       START_EXPONENT:     ${{ inputs.start_exponent }}

@@ -227,7 +227,7 @@ jobs:
     needs: [count_chunks, sweep_chunk]
     if: success() || failure()
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Download all merged results artifacts
         uses: actions/download-artifact@v6

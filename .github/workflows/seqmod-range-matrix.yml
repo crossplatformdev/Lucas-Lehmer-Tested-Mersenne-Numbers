@@ -62,7 +62,7 @@ jobs:
   validate:
     name: Validate inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 3
+    timeout-minutes: 360
     steps:
       - name: Validate
         run: |
@@ -97,14 +97,14 @@ jobs:
           echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
   # ──────────────────────────────────────────────────────────
-  # Stage 2: Build – compile sequence_powermod as a sanity
+  # Stage 2: Build – compile bin/bignum as a sanity
   #           check before dispatching worker runs.
   # ──────────────────────────────────────────────────────────
   build:
     name: Build and verify binary
     needs: validate
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -112,16 +112,16 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq g++ make
+          sudo apt-get install -y -qq g++ make libboost-dev
 
-      - name: Build sequence_powermod
-        run: make seqmod SEQMOD_CXXFLAGS="-std=c++17 -O3 -march=x86-64 -pthread -Wall -Wextra"
+      - name: Build bignum
+        run: make bin/bignum
 
       - name: Verify binary
         run: |
           echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
           echo "Job: build"
-          ./bin/sequence_powermod 20 1 1
+          LL_SWEEP_MODE=p LL_MIN_EXPONENT=2 LL_MAX_EXPONENT=5 ./bin/bignum 0 1
           echo "Binary OK."
 
   # ──────────────────────────────────────────────────────────

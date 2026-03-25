@@ -3423,6 +3423,10 @@ static int run_power_bucket_mode(int argc, char** argv) {
 
     bool any_new_discovery = false;
 
+    // Accumulate all prime findings across buckets for the step summary.
+    std::vector<uint64_t> all_known_primes_found;
+    std::vector<uint64_t> all_new_discoveries_found;
+
     for (uint32_t n = n_lo; n <= n_hi; ++n) {
         const power_bucket::Range br = power_bucket::bucket_range(n);
         std::vector<uint64_t> exps = power_bucket::enumerate_bucket_primes(n);
@@ -3541,6 +3545,12 @@ static int run_power_bucket_mode(int argc, char** argv) {
             }
 
             res.is_new_discovery = res.is_prime && !res.is_known;
+            if (res.is_prime) {
+                if (res.is_known)
+                    all_known_primes_found.push_back(p);
+                else
+                    all_new_discoveries_found.push_back(p);
+            }
             if (res.is_new_discovery) {
                 any_new_discovery = true;
                 emit_discovery_notification(p, run_url);
@@ -3694,10 +3704,29 @@ static int run_power_bucket_mode(int argc, char** argv) {
         if (gsf) {
             gsf << "## Power Bucket Prime Sweep\n\n"
                 << "- Bucket range: " << n_lo << ".." << n_hi << "\n"
-                << "- New discoveries: " << (any_new_discovery ? "**YES**" : "none") << "\n";
+                << "- Known Mersenne primes verified: "
+                << all_known_primes_found.size() << "\n"
+                << "- New discoveries: "
+                << (any_new_discovery ? "**YES**" : "none") << "\n";
             if (!run_url.empty())
                 gsf << "- Workflow run: " << run_url << "\n";
             gsf << "\n";
+
+            if (!all_known_primes_found.empty()) {
+                gsf << "### 🍋 Known Mersenne Primes Verified\n\n"
+                    << "| Exponent |\n|----------|\n";
+                for (uint64_t exp : all_known_primes_found)
+                    gsf << "| M_" << exp << " |\n";
+                gsf << "\n";
+            }
+
+            if (!all_new_discoveries_found.empty()) {
+                gsf << "### 🥇 NEW Mersenne Prime Discoveries\n\n"
+                    << "| Exponent |\n|----------|\n";
+                for (uint64_t exp : all_new_discoveries_found)
+                    gsf << "| **M_" << exp << "** |\n";
+                gsf << "\n";
+            }
         }
     }
 

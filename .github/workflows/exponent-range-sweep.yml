@@ -96,7 +96,7 @@ jobs:
   # ──────────────────────────────────────────────────────────
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -242,8 +242,7 @@ jobs:
     name: "Batch ${{ matrix.batch_index }}/${{ matrix.batch_count }} · exp ${{ matrix.batch_min_exponent }}..${{ matrix.batch_max_exponent }}"
     needs: [plan, build]
     runs-on: ubuntu-24.04
-    # No timeout-minutes: LL tests must complete naturally.
-    # GitHub-hosted runners enforce a hard 6-hour cap regardless.
+    timeout-minutes: 360  # 6 h – maximum allowed on GitHub-hosted runners
     strategy:
       fail-fast: false
       max-parallel: 256
@@ -307,7 +306,7 @@ jobs:
     needs: [worker, plan]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Download all batch results
         uses: actions/download-artifact@v6

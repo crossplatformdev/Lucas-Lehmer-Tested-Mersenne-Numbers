@@ -61,7 +61,7 @@ jobs:
   # Build once, reuse across all shard jobs.
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -87,7 +87,7 @@ jobs:
     name: "Shard ${{ matrix.shard_index }}/${{ inputs.shard_count }} · mode=${{ inputs.sweep_mode }} · ${{ inputs.min_exponent }}..${{ inputs.max_exponent }}"
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -163,7 +163,7 @@ jobs:
     needs: sweep
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 360
     steps:
       - name: Download all shard results
         uses: actions/download-artifact@v6

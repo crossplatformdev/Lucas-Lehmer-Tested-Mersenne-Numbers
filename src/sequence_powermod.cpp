@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -53,17 +54,6 @@ static constexpr int EXIT_ERROR   = 1;
 static std::atomic<bool> g_stop{false};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-static bool is_prime_index(int n) {
-    if (n < 2) return false;
-    if (n == 2) return true;
-    if ((n & 1) == 0) return false;
-    // 1LL * d * d promotes to int64_t before the multiply to avoid int overflow
-    // when d² exceeds INT_MAX (i.e., d > 46340 for 32-bit int).
-    for (int d = 3; 1LL * d * d <= n; d += 2)
-        if (n % d == 0) return false;
-    return true;
-}
-
 static std::string format_duration(std::chrono::seconds total_seconds) {
     const long long s   = total_seconds.count();
     const long long hrs = s / 3600;
@@ -141,30 +131,59 @@ struct Results {
 };
 
 // ─── Main sweep function ───────────────────────────────────────────────────────
+// Returns Mersenne-prime exponents found among the next `prime_count` primes
+// at or above start_n.
 // Returns hits (prime exponents) and the last n value that was dispatched to a
-// worker thread (last_dispatched_n).  On timeout last_dispatched_n is the safe
-// resume boundary: every n ≤ last_dispatched_n has been *dispatched* but may not
-// all be *completed* because some threads may still be inside is_sequence_zero().
-// Since workers finish their current computation before checking g_stop, the safe
-// resume point is: min(currently_working_n) − 1, which we conservatively report
-// as (start_n + next_dispatched_index − worker_count − 1) when stop fires.
+// worker thread (last_dispatched_n).
 static std::vector<int> find_sequence(
-    int          iterations,
+    int          prime_count,
     int          start_n,
     uint32_t     parallel_threads,
     long long    time_limit_secs,
     Results&     results,
     int&         out_last_dispatched_n)
 {
-    start_n   = std::max(1, start_n);
-    iterations = std::max(0, iterations);
+    start_n     = std::max(2, start_n);
+    prime_count = std::max(0, prime_count);
+
+    // Sieve of Eratosthenes — grow the bound until exactly `prime_count`
+    // primes at or above `start_n` have been collected.  We start with the
+    // Rosser upper-bound estimate and double it on each retry; this is O(1)
+    // retries in practice and never silently returns fewer primes than asked.
+    std::vector<int> prime_candidates;
+    if (prime_count > 0) {
+        const double ln_pc = std::log(static_cast<double>(std::max(prime_count, 6)));
+        int sieve_bound = static_cast<int>(
+            start_n + prime_count * (ln_pc + std::log(ln_pc) + 3.0) + 200);
+
+        while (static_cast<int>(prime_candidates.size()) < prime_count) {
+            prime_candidates.clear();
+            std::vector<uint8_t> sieve(static_cast<size_t>(sieve_bound + 1), 1);
+            sieve[0] = 0;
+            if (sieve_bound >= 1) sieve[1] = 0;
+            for (int p = 2; 1LL * p * p <= sieve_bound; ++p) {
+                if (!sieve[static_cast<size_t>(p)]) continue;
+                for (int m = p * p; m <= sieve_bound; m += p)
+                    sieve[static_cast<size_t>(m)] = 0;
+            }
+            prime_candidates.reserve(static_cast<size_t>(prime_count));
+            for (int n = start_n; n <= sieve_bound; ++n) {
+                if (sieve[static_cast<size_t>(n)])
+                    prime_candidates.push_back(n);
+            }
+            if (static_cast<int>(prime_candidates.size()) < prime_count)
+                sieve_bound *= 2;
+        }
+        prime_candidates.resize(static_cast<size_t>(prime_count));
+    }
+    const int actual_prime_count = static_cast<int>(prime_candidates.size());
 
     std::vector<int>           hits;
     std::mutex                 hits_mutex;
     const uint32_t             worker_count = std::max<uint32_t>(1, parallel_threads);
     std::atomic<int>           next_index{0};
     std::atomic<int>           done_count{0};
-    // last_dispatched tracks the highest n handed to any thread so far.
+    // last_dispatched tracks the highest prime n handed to any thread so far.
     std::atomic<int>           last_dispatched_n{start_n - 1};
 
     const auto started_at = std::chrono::steady_clock::now();
@@ -177,10 +196,12 @@ static std::vector<int> find_sequence(
             local_hits.reserve(8);
 
             while (!g_stop.load(std::memory_order_relaxed)) {
-                const int i = next_index.fetch_add(1, std::memory_order_relaxed);
-                if (i >= iterations) break;
+                // Pull from the pre-sieved prime candidate list; composites
+                // are never enqueued so no per-candidate primality check is needed.
+                const int ci = next_index.fetch_add(1, std::memory_order_relaxed);
+                if (ci >= actual_prime_count) break;
 
-                const int n = start_n + i;
+                const int n = prime_candidates[static_cast<size_t>(ci)];
 
                 // Update the high-water mark of dispatched work.
                 // memory_order_relaxed is sufficient here: last_dispatched_n
@@ -194,20 +215,12 @@ static std::vector<int> find_sequence(
                            prev, n, std::memory_order_relaxed))
                 { /* retry CAS */ }
 
-                // Check stop flag before starting an expensive computation.
+                // Re-check stop flag before the long is_sequence_zero() call.
                 if (g_stop.load(std::memory_order_relaxed)) break;
 
-                if (is_prime_index(n)) {
-                    // Re-check stop flag before the long is_sequence_zero() call.
-                    if (g_stop.load(std::memory_order_relaxed)) break;
-
-                    const auto [prime, mod_val] = is_sequence_zero(n);
-                    results.add(n, prime, mod_val.get_str());
-                    if (prime) local_hits.push_back(n);
-                } else {
-                    // mod_result not computed for composite n.
-                    results.add(n, false, "");
-                }
+                const auto [prime, mod_val] = is_sequence_zero(n);
+                results.add(n, prime, mod_val.get_str());
+                if (prime) local_hits.push_back(n);
 
                 done_count.fetch_add(1, std::memory_order_relaxed);
             }
@@ -238,10 +251,10 @@ static std::vector<int> find_sequence(
                       << "\n";
         }
 
-        if (done >= next_progress_report || done == iterations) {
+        if (done >= next_progress_report || done == actual_prime_count) {
             const double avg_sec = (done > 0)
                 ? static_cast<double>(elapsed.count()) / done : 0.0;
-            const int remaining  = iterations - done;
+            const int remaining  = actual_prime_count - done;
             const auto eta       = std::chrono::seconds(
                 static_cast<long long>(avg_sec * remaining));
 
@@ -252,7 +265,7 @@ static std::vector<int> find_sequence(
                 next_progress_report += 1000;
         }
 
-        if (done >= iterations || g_stop.load(std::memory_order_relaxed))
+        if (done >= actual_prime_count || g_stop.load(std::memory_order_relaxed))
             break;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -318,7 +331,7 @@ static bool write_state(
 // ─── main ─────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
     // Parse positional arguments.
-    const int iterations       = (argc > 1) ? std::stoi(argv[1]) : 512;
+    const int prime_count      = (argc > 1) ? std::stoi(argv[1]) : 512;
     const int start_n          = (argc > 2) ? std::stoi(argv[2]) : 1;
     const uint32_t threads     = (argc > 3) ? static_cast<uint32_t>(std::stoul(argv[3])) : 1u;
 
@@ -329,10 +342,8 @@ int main(int argc, char* argv[]) {
     const char* csv_path   = std::getenv("SEQMOD_OUTPUT_CSV");
     const char* state_path = std::getenv("SEQMOD_STATE_FILE");
 
-    const int end_n = start_n + iterations - 1;
-
-    std::cout << "sequence_powermod: start_n=" << start_n
-              << " end_n=" << end_n
+    std::cout << "sequence_powermod_gmp: start_n=" << start_n
+              << " prime_count=" << prime_count
               << " threads=" << threads;
     if (time_limit_secs > 0)
         std::cout << " time_limit=" << time_limit_secs << "s";
@@ -342,7 +353,7 @@ int main(int argc, char* argv[]) {
     int last_dispatched_n = start_n - 1;
 
     const std::vector<int> hits = find_sequence(
-        iterations, start_n, threads, time_limit_secs,
+        prime_count, start_n, threads, time_limit_secs,
         results, last_dispatched_n);
 
     const bool timed_out = g_stop.load();
@@ -353,7 +364,7 @@ int main(int argc, char* argv[]) {
 
     // Write JSON state.
     if (state_path && *state_path)
-        write_state(state_path, start_n, end_n, last_dispatched_n,
+        write_state(state_path, start_n, last_dispatched_n, last_dispatched_n,
                     timed_out, hits);
 
     // Print summary to stdout (matches the original format).

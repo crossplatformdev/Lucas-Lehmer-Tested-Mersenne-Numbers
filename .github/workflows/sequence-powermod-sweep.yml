@@ -1,17 +1,16 @@
 name: Sequence Powermod Sweep
 run-name: "Seqmod Sweep · n=${{ inputs.start_n }}..${{ inputs.end_n }} · epoch ${{ inputs.run_epoch }}"
 
-# Distributed CI/CD sweep for the stdlib-only sequence_powermod algorithm.
+# Distributed CI/CD sweep using bin/bignum (fastest, benchmarked).
 #
 # This workflow tests all prime exponents n in a given [start_n, end_n] range,
-# checking whether M(n) = 2^n − 1 is prime using the algebraic criterion
-# implemented in src/sequence_powermod_stdc.cpp (no GMP required).
+# checking whether M(n) = 2^n − 1 is prime using Lucas-Lehmer (bin/bignum).
 #
 # Architecture:
 #   1. validate   – reject invalid inputs early
-#   2. build      – compile bin/sequence_powermod (stdlib-only, no GMP)
+#   2. build      – compile bin/bignum
 #   3. plan       – divide [start_n, end_n] across up to 20 parallel workers
-#   4. worker     – one job per batch (matrix), 4 threads each, 5.95-hour soft stop
+#   4. worker     – one job per batch (matrix), 4 threads each
 #   5. reschedule – detect timed-out workers; split each range in two and dispatch
 #                   new workflow runs; when the 256-worker budget is exhausted,
 #                   queue another full epoch instead
@@ -19,7 +18,6 @@ run-name: "Seqmod Sweep · n=${{ inputs.start_n }}..${{ inputs.end_n }} · epoch
 #
 # Worker exit codes:
 #   0   – completed; all candidates in the batch were tested
-#   42  – soft stop (≥ SEQMOD_TIME_LIMIT_SECS elapsed); partial CSV written
 #   1   – unexpected error
 #
 # Self-chaining:
@@ -107,7 +105,7 @@ jobs:
   validate:
     name: Validate inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 3
+    timeout-minutes: 360
     steps:
       - name: Validate
         run: |
@@ -148,7 +146,7 @@ jobs:
     name: Build binary
     needs: validate
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -156,26 +154,26 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq g++ make
+          sudo apt-get install -y -qq g++ make libboost-dev
 
-      - name: Build sequence_powermod
-        run: make seqmod SEQMOD_CXXFLAGS="-std=c++17 -O3 -march=x86-64 -pthread -Wall -Wextra"
+      - name: Build bignum
+        run: make bin/bignum
 
       - name: Verify binary
         run: |
           echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
           echo "Job: build | epoch=${{ inputs.run_epoch }}"
-          ./bin/sequence_powermod 20 1 1
+          LL_SWEEP_MODE=p LL_MIN_EXPONENT=2 LL_MAX_EXPONENT=5 ./bin/bignum 0 1
           echo "Binary OK."
 
       - name: Compress binary
-        run: gzip -9 bin/sequence_powermod
+        run: gzip -9 bin/bignum
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v6
         with:
-          name: seqmod-binary-epoch${{ inputs.run_epoch }}
-          path: bin/sequence_powermod.gz
+          name: bignum-binary-epoch${{ inputs.run_epoch }}
+          path: bin/bignum.gz
           retention-days: 1
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -185,7 +183,7 @@ jobs:
     name: Build worker batch matrix
     needs: [validate, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 360
     outputs:
       batch_matrix: ${{ steps.make-matrix.outputs.batch_matrix }}
       batch_count:  ${{ steps.make-matrix.outputs.batch_count }}
@@ -262,8 +260,7 @@ jobs:
     name: "Worker ${{ matrix.worker_name }} · n=${{ matrix.worker_start_n }}..${{ matrix.worker_end_n }}"
     needs: [plan, build]
     runs-on: ubuntu-24.04
-    # No timeout-minutes: the binary enforces the soft stop internally.
-    # GitHub-hosted runners impose a hard 6-hour cap regardless.
+    timeout-minutes: 360  # 6 h – maximum allowed on GitHub-hosted runners
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -274,11 +271,11 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v6
         with:
-          name: seqmod-binary-epoch${{ matrix.epoch }}
+          name: bignum-binary-epoch${{ matrix.epoch }}
           path: bin/
 
       - name: Make binary executable
-        run: gunzip bin/sequence_powermod.gz && chmod +x bin/sequence_powermod
+        run: gunzip bin/bignum.gz && chmod +x bin/bignum
 
       - name: Warmup probe – estimate batch duration
         id: warmup
@@ -360,15 +357,16 @@ jobs:
           echo "Warmup: probing first prime n=${FIRST_PRIME} ..."
           T0=$(date +%s)
           set +e
-          SEQMOD_TIME_LIMIT_SECS="${PER_PROBE}" \
-            ./bin/sequence_powermod 1 "${FIRST_PRIME}" "${PROBE_THREADS}"
+          timeout "${PER_PROBE}" \
+            env LL_SWEEP_MODE=p LL_MIN_EXPONENT="${FIRST_PRIME}" LL_MAX_EXPONENT="${FIRST_PRIME}" LL_PROGRESS=0 \
+            ./bin/bignum 0 "${PROBE_THREADS}"
           EXIT_FIRST=$?
           set -e
           T1=$(date +%s)
           TIME_FIRST=$(( T1 - T0 ))
           echo "Warmup: first prime n=${FIRST_PRIME} → ${TIME_FIRST}s  exit=${EXIT_FIRST}"
 
-          if [ "${EXIT_FIRST}" -eq 42 ]; then
+          if [ "${EXIT_FIRST}" -eq 124 ]; then
             echo "Warmup: first prime exceeded per-probe budget (${PER_PROBE}s) – split needed"
             SPLIT_NEEDED="true"
           else
@@ -376,15 +374,16 @@ jobs:
             echo "Warmup: probing last prime n=${LAST_PRIME} ..."
             T0=$(date +%s)
             set +e
-            SEQMOD_TIME_LIMIT_SECS="${PER_PROBE}" \
-              ./bin/sequence_powermod 1 "${LAST_PRIME}" "${PROBE_THREADS}"
+            timeout "${PER_PROBE}" \
+              env LL_SWEEP_MODE=p LL_MIN_EXPONENT="${LAST_PRIME}" LL_MAX_EXPONENT="${LAST_PRIME}" LL_PROGRESS=0 \
+              ./bin/bignum 0 "${PROBE_THREADS}"
             EXIT_LAST=$?
             set -e
             T1=$(date +%s)
             TIME_LAST=$(( T1 - T0 ))
             echo "Warmup: last prime n=${LAST_PRIME} → ${TIME_LAST}s  exit=${EXIT_LAST}"
 
-            if [ "${EXIT_LAST}" -eq 42 ]; then
+            if [ "${EXIT_LAST}" -eq 124 ]; then
               echo "Warmup: last prime exceeded per-probe budget (${PER_PROBE}s) – split needed"
               SPLIT_NEEDED="true"
             else
@@ -443,15 +442,18 @@ jobs:
           STATE_PATH="worker_out/${{ matrix.worker_name }}_state.json"
 
           set +e
-          SEQMOD_TIME_LIMIT_SECS="${{ inputs.time_limit_seconds }}" \
-          SEQMOD_OUTPUT_CSV="${CSV_PATH}" \
-          SEQMOD_STATE_FILE="${STATE_PATH}" \
-          ./bin/sequence_powermod \
-            "${ITERS}" \
-            "${{ matrix.worker_start_n }}" \
-            "${{ inputs.threads }}"
+          timeout "${{ inputs.time_limit_seconds }}" \
+          env LL_SWEEP_MODE=p \
+          LL_MIN_EXPONENT="${{ matrix.worker_start_n }}" \
+          LL_MAX_EXPONENT="${{ matrix.worker_end_n }}" \
+          LL_BENCH_OUTPUT="${CSV_PATH}" \
+          LL_PROGRESS=0 \
+          ./bin/bignum 0 "${{ inputs.threads }}"
           EXIT_CODE=$?
           set -e
+          # exit 124 = timeout(1) killed the process — treat as timed out
+          # (same convention as the old seqmod exit 42 soft-stop).
+          [ "${EXIT_CODE}" -eq 124 ] && EXIT_CODE=42
 
           echo "Binary exit code: ${EXIT_CODE}"
           echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
@@ -560,7 +562,7 @@ jobs:
     needs: worker
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -740,7 +742,7 @@ jobs:
     needs: [worker, reschedule]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Download all results artifacts
         uses: actions/download-artifact@v6
@@ -754,13 +756,14 @@ jobs:
           set -euo pipefail
           mkdir -p merged_out/
 
-          echo "n,is_prime" > merged_out/merged_results.csv
+          # bignum LL_BENCH_OUTPUT format: p,is_prime,time_sec
+          echo "p,is_prime,time_sec" > merged_out/merged_results.csv
 
           for f in results/*.csv; do
             [ -f "$f" ] && tail -n +2 "$f" >> merged_out/merged_results.csv || true
           done
 
-          # Sort by n (numeric ascending), keeping header.
+          # Sort by p (numeric ascending), keeping header.
           {
             head -1 merged_out/merged_results.csv
             tail -n +2 merged_out/merged_results.csv | sort -t, -k1 -n
@@ -768,7 +771,7 @@ jobs:
           mv merged_out/sorted.csv merged_out/merged_results.csv
 
           TOTAL=$(( $(wc -l < merged_out/merged_results.csv) - 1 ))
-          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv || true)
+          PRIMES=$(grep -c ",true," merged_out/merged_results.csv || true)
           echo "Total candidates tested : ${TOTAL}"
           echo "Mersenne primes found   : ${PRIMES}"
 
@@ -784,7 +787,7 @@ jobs:
           set -euo pipefail
 
           TOTAL=$(( $(wc -l < merged_out/merged_results.csv 2>/dev/null || echo 1) - 1 ))
-          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv 2>/dev/null || true)
+          PRIMES=$(grep -c ",true," merged_out/merged_results.csv 2>/dev/null || true)
           PRIMES=${PRIMES:-0}
           TIMEOUTS=$(python3 - <<'PYEOF'
           import json, pathlib, sys
@@ -824,8 +827,8 @@ jobs:
               echo ""
               echo "| Exponent p | M_p = 2^p − 1 |"
               echo "|------------|---------------|"
-              grep ",true$" merged_out/merged_results.csv 2>/dev/null | \
-                while IFS=, read -r p _; do
+              grep ",true," merged_out/merged_results.csv 2>/dev/null | \
+                while IFS=, read -r p _rest; do
                   echo "| ${p} | M_${p} |"
                 done
             fi
