@@ -231,7 +231,7 @@ jobs:
   # ──────────────────────────────────────────────────────────
   build:
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
-    timeout-minutes: 10
+    timeout-minutes: 360
     outputs:
       cache-key: ${{ steps.cache-key.outputs.key }}
     steps:
@@ -439,9 +439,7 @@ jobs:
     name: "Bucket ${{ matrix.bucket_n }} · exp ${{ matrix.batch_min_exponent }}..${{ matrix.batch_max_exponent }} (${{ matrix.batch_index }}/${{ matrix.batch_count }})"
     needs: [plan, build]
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
-    # No timeout-minutes: Mersenne prime search must not be artificially stopped.
-    # Note: GitHub-hosted runners enforce a hard 6-hour cap regardless.
-    # For unbounded runs (e.g., large buckets), use a self-hosted runner.
+    timeout-minutes: 360  # 6 h – maximum allowed on GitHub-hosted runners
     strategy:
       fail-fast: false
       max-parallel: 256   # allow all workers to run concurrently (GitHub matrix hard cap)
@@ -519,7 +517,7 @@ jobs:
     needs: worker
     if: always()
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
-    timeout-minutes: 10
+    timeout-minutes: 360
     env:
       GH_TOKEN: ${{ github.token }}
     steps:

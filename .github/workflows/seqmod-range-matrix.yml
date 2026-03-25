@@ -62,7 +62,7 @@ jobs:
   validate:
     name: Validate inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 3
+    timeout-minutes: 360
     steps:
       - name: Validate
         run: |
@@ -104,7 +104,7 @@ jobs:
     name: Build and verify binary
     needs: validate
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v5

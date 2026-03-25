@@ -52,7 +52,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 360
     permissions:
       contents: read
     outputs:
@@ -88,9 +88,7 @@ jobs:
     needs: build
     if: ${{ inputs.run_all_shards == false }}
     runs-on: ubuntu-latest
-    # No timeout-minutes: the Mersenne prime search must not be artificially stopped.
-    # Note: GitHub-hosted runners enforce a hard 6-hour cap regardless.
-    # For unbounded long-running scans use a self-hosted runner.
+    timeout-minutes: 360  # 6 h – maximum allowed on GitHub-hosted runners
     permissions:
       contents: read
     steps:
@@ -158,9 +156,7 @@ jobs:
     needs: build
     if: ${{ inputs.run_all_shards == true }}
     runs-on: ubuntu-latest
-    # No timeout-minutes: the Mersenne prime search must not be artificially stopped.
-    # Note: GitHub-hosted runners enforce a hard 6-hour cap regardless.
-    # For unbounded long-running scans use a self-hosted runner.
+    timeout-minutes: 360  # 6 h – maximum allowed on GitHub-hosted runners
     permissions:
       contents: read
     strategy:

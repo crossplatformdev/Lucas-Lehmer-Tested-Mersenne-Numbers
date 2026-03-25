@@ -107,7 +107,7 @@ jobs:
   validate:
     name: Validate inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 3
+    timeout-minutes: 360
     steps:
       - name: Validate
         run: |
@@ -148,7 +148,7 @@ jobs:
     name: Build binary
     needs: validate
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -185,7 +185,7 @@ jobs:
     name: Build worker batch matrix
     needs: [validate, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 360
     outputs:
       batch_matrix: ${{ steps.make-matrix.outputs.batch_matrix }}
       batch_count:  ${{ steps.make-matrix.outputs.batch_count }}
@@ -262,8 +262,7 @@ jobs:
     name: "Worker ${{ matrix.worker_name }} · n=${{ matrix.worker_start_n }}..${{ matrix.worker_end_n }}"
     needs: [plan, build]
     runs-on: ubuntu-24.04
-    # No timeout-minutes: the binary enforces the soft stop internally.
-    # GitHub-hosted runners impose a hard 6-hour cap regardless.
+    timeout-minutes: 360  # 6 h – maximum allowed on GitHub-hosted runners
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -560,7 +559,7 @@ jobs:
     needs: worker
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -740,7 +739,7 @@ jobs:
     needs: [worker, reschedule]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     steps:
       - name: Download all results artifacts
         uses: actions/download-artifact@v6

@@ -55,7 +55,7 @@ jobs:
   cluster-power:
     name: "Cluster Power · p=${{ inputs.exponent }} · ${{ inputs.workers }}w × ${{ inputs.threads }}t"
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v5
