@@ -575,7 +575,9 @@ jobs:
             echo "| Workers requested | ${{ inputs.workers }} |"
             echo "| Threads per worker | ${{ inputs.threads }} |"
             echo "| Per-worker time limit | ${{ inputs.time_limit_seconds }} s |"
-            echo "| Planning time (warm-up) | ${{ needs.plan.outputs.plan_elapsed_sec }} s |"
+            PLAN_SEC="${{ needs.plan.outputs.plan_elapsed_sec }}"
+            if [ -z "${PLAN_SEC}" ]; then PLAN_SEC="n/a"; fi
+            echo "| Planning time (warm-up) | ${PLAN_SEC} s |"
             echo "| Total prime exponents tested | ${TOTAL} |"
             echo "| Mersenne primes found | ${PRIMES} |"
             echo "| Workers that timed out | ${TIMEOUTS} |"

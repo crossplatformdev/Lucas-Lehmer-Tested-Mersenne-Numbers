@@ -363,6 +363,11 @@ jobs:
           else
             WARMUP_DISPLAY="${PROBE_TIME} s"
           fi
+          if [ -z "${PROBE_PRIME}" ] || [ "${PROBE_PRIME}" = "unknown" ]; then
+            WARMUP_LABEL="Estimated warm-up time"
+          else
+            WARMUP_LABEL="Estimated warm-up time (M_${PROBE_PRIME})"
+          fi
 
           {
             echo "## Exponent Range Sweep – Final Report"
@@ -373,7 +378,7 @@ jobs:
             echo ""
             echo "| Metric | Value |"
             echo "|--------|-------|"
-            echo "| Estimated warm-up time (M_${PROBE_PRIME}) | ${WARMUP_DISPLAY} |"
+            echo "| ${WARMUP_LABEL} | ${WARMUP_DISPLAY} |"
             echo "| Total prime exponents tested | ${TOTAL} |"
             echo "| Mersenne primes found | ${PRIMES} |"
             echo ""
