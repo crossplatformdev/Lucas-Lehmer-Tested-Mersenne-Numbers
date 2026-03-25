@@ -1,4 +1,5 @@
 name: Discover Primes (manual / post-known-range exploration)
+run-name: "Discover Primes · exp ≤ ${{ inputs.max_exponent }}"
 
 # This workflow is MANUAL ONLY and must never be triggered by push/PR.
 # It runs the discover mode, which tests prime exponents above 136279841.

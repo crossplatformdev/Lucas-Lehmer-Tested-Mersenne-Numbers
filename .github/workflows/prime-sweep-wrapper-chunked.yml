@@ -1,4 +1,5 @@
 name: Prime Sweep Wrapper (Auto-Chunked)
+run-name: "Prime Sweep (Chunked) · ${{ inputs.sweep_range }} · buckets ${{ inputs.bucket_min }}..${{ inputs.bucket_top }}"
 
 # Multi-run orchestrator that automatically splits large prime sweeps into
 # N separate workflow runs, each with at most 256 worker jobs (the GitHub
@@ -199,6 +200,7 @@ jobs:
   # (default: 256) parallel workers.
   # ──────────────────────────────────────────────────────────
   sweep_chunk:
+    name: "Chunk ${{ matrix.chunk_index }}"
     needs: count_chunks
     strategy:
       fail-fast: false

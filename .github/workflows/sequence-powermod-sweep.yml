@@ -1,4 +1,5 @@
 name: Sequence Powermod Sweep
+run-name: "Seqmod Sweep · n=${{ inputs.start_n }}..${{ inputs.end_n }} · epoch ${{ inputs.run_epoch }}"
 
 # Distributed CI/CD sweep for the stdlib-only sequence_powermod algorithm.
 #
@@ -258,7 +259,7 @@ jobs:
   #    whole workflow matrix.
   # ─────────────────────────────────────────────────────────────────────────────
   worker:
-    name: "Worker ${{ matrix.worker_name }}"
+    name: "Worker ${{ matrix.worker_name }} · n=${{ matrix.worker_start_n }}..${{ matrix.worker_end_n }}"
     needs: [plan, build]
     runs-on: ubuntu-24.04
     # No timeout-minutes: the binary enforces the soft stop internally.

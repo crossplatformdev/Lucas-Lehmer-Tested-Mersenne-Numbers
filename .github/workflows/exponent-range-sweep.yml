@@ -1,4 +1,5 @@
 name: Exponent Range Sweep
+run-name: "Exponent Range Sweep · ${{ inputs.low_cap }}..${{ inputs.high_cap }}"
 
 # Manual-only workflow: tests all prime exponents in an arbitrary [low_cap, high_cap]
 # range, distributing them across up to 256 parallel workers.
@@ -238,6 +239,7 @@ jobs:
   # the GitHub Actions matrix hard cap of 256).
   # ──────────────────────────────────────────────────────────
   worker:
+    name: "Batch ${{ matrix.batch_index }}/${{ matrix.batch_count }} · exp ${{ matrix.batch_min_exponent }}..${{ matrix.batch_max_exponent }}"
     needs: [plan, build]
     runs-on: ubuntu-24.04
     # No timeout-minutes: LL tests must complete naturally.

@@ -1,4 +1,5 @@
 name: Manual Sweep
+run-name: "Manual Sweep · mode=${{ inputs.sweep_mode }} · ${{ inputs.min_exponent }}..${{ inputs.max_exponent }}"
 
 # Triggered only by explicit workflow_dispatch – never runs on push/PR.
 on:
@@ -83,6 +84,7 @@ jobs:
   # Dynamic matrix: one job per shard.
   # If shard_count == 1, only shard 0 runs; otherwise shard_count jobs run in parallel.
   sweep:
+    name: "Shard ${{ matrix.shard_index }}/${{ inputs.shard_count }} · mode=${{ inputs.sweep_mode }} · ${{ inputs.min_exponent }}..${{ inputs.max_exponent }}"
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 120

@@ -1,4 +1,5 @@
 name: Power-Range Prime Sweep (64 Buckets)
+run-name: "Prime Sweep · buckets ${{ inputs.bucket_start }}..${{ inputs.bucket_end }}"
 
 # Manual-only workflow: tests all prime exponents across 64 power-of-two
 # exponent ranges (batched into groups sized to fit within the time limit).
@@ -434,6 +435,7 @@ jobs:
   # slowest single worker batch.
   # ──────────────────────────────────────────────────────────
   worker:
+    name: "Bucket ${{ matrix.bucket_n }} · exp ${{ matrix.batch_min_exponent }}..${{ matrix.batch_max_exponent }} (${{ matrix.batch_index }}/${{ matrix.batch_count }})"
     needs: [plan, build]
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
     # No timeout-minutes: Mersenne prime search must not be artificially stopped.

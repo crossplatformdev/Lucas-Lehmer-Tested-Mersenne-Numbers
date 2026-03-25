@@ -1,4 +1,5 @@
 name: Cluster Power
+run-name: "Cluster Power · p=${{ inputs.exponent }} · ${{ inputs.workers }}w × ${{ inputs.threads }}t"
 
 # Calculate theoretical cluster compute power (Teraflops and MIPS)
 # for a configurable number of workers, LL-threads, and FFT-threads.
@@ -52,6 +53,7 @@ permissions:
 
 jobs:
   cluster-power:
+    name: "Cluster Power · p=${{ inputs.exponent }} · ${{ inputs.workers }}w × ${{ inputs.threads }}t"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

@@ -1,4 +1,5 @@
 name: Prime Sweep Wrapper
+run-name: "Prime Sweep Wrapper · ${{ inputs.sweep_range }} · buckets ${{ inputs.bucket_min }}..${{ inputs.bucket_top }}"
 
 # Simple two-input orchestrator that calls the full Power-Range Prime Sweep
 # (64 Buckets) workflow and presents the merged results report at the end.

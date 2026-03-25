@@ -1,4 +1,5 @@
 name: Seqmod Range Matrix
+run-name: "Seqmod Range · ${{ inputs.low_cap }}..${{ inputs.high_cap }}"
 
 # Single-run matrix wrapper for sequence_powermod that distributes prime
 # exponents in [low_cap, high_cap] linearly across up to 256 parallel workers.
@@ -336,7 +337,7 @@ jobs:
   #     whole matrix.
   # ──────────────────────────────────────────────────────────
   worker:
-    name: "Worker ${{ matrix.worker_name }}"
+    name: "Worker ${{ matrix.worker_name }} · n=${{ matrix.worker_start_n }}..${{ matrix.worker_end_n }}"
     needs: [plan, build]
     runs-on: ubuntu-24.04
     # No timeout-minutes: the binary enforces the soft stop internally.

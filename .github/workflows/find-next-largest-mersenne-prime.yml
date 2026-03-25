@@ -1,4 +1,5 @@
 name: Find Next Largest Mersenne Prime
+run-name: "Mersenne Search · ${{ inputs.chain_id }} · from exp ${{ inputs.start_exponent }}"
 
 # Self-chaining workflow that searches for the next unknown Mersenne prime.
 #
