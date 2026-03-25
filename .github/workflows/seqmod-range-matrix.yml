@@ -166,6 +166,71 @@ jobs:
           repo       = os.environ["GITHUB_REPOSITORY"]
           ref_name   = os.environ["GITHUB_REF_NAME"]
 
+          WORKER_WORKFLOW = "seqmod-4prime-worker.yml"
+
+          # ── Preflight: test the dispatch API before starting batch loop ──
+          # When a workflow file is first added to the default branch, GitHub's
+          # internal Actions indexing can take several minutes to register it
+          # for workflow_dispatch.  Verify the dispatch endpoint works by sending
+          # one real test-dispatch with dry_run=true (so no real work is done).
+          # Retry with exponential backoff up to ~5 minutes before aborting.
+          if not dry_run:
+              PREFLIGHT_WAITS = [5, 10, 20, 40, 60, 90, 120]  # backoff delays (seconds) between retry attempts
+              test_payload = json.dumps({
+                  "ref": ref_name,
+                  "inputs": {
+                      "p1": "2",
+                      "p2": "", "p3": "", "p4": "",
+                      "time_limit_seconds": "60",
+                      "dry_run": "true",   # no real computation
+                  },
+              })
+              print(
+                  f"Preflight: test-dispatching {WORKER_WORKFLOW} (dry_run=true) "
+                  f"to verify dispatch API is ready...",
+                  file=sys.stderr, flush=True,
+              )
+              preflight_ok = False
+              for attempt in range(len(PREFLIGHT_WAITS) + 1):
+                  chk = subprocess.run(
+                      ["gh", "api",
+                       "--method", "POST",
+                       f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/dispatches",
+                       "--input", "-"],
+                      input=test_payload,
+                      capture_output=True, text=True,
+                  )
+                  if chk.returncode == 0:
+                      print(
+                          f"Preflight: {WORKER_WORKFLOW} dispatch API OK ✓",
+                          file=sys.stderr, flush=True,
+                      )
+                      preflight_ok = True
+                      break
+                  stderr = chk.stderr.strip()
+                  # 422 means GitHub hasn't indexed the workflow yet; retry.
+                  # Any other error (e.g. 401, 404) is a permanent failure.
+                  if "HTTP 422" in stderr and attempt < len(PREFLIGHT_WAITS):
+                      wait = PREFLIGHT_WAITS[attempt]
+                      print(
+                          f"Preflight: attempt {attempt + 1}/{len(PREFLIGHT_WAITS) + 1}: "
+                          f"422 error, waiting {wait}s...",
+                          file=sys.stderr, flush=True,
+                      )
+                      time.sleep(wait)
+                  else:
+                      print(
+                          f"Preflight: dispatch failed: {stderr}",
+                          file=sys.stderr,
+                      )
+                      break
+              if not preflight_ok:
+                  print(
+                      f"Preflight: {WORKER_WORKFLOW} dispatch API not ready – aborting.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
           # ── Segmented sieve to enumerate primes in [low_cap, high_cap] ──
           # Uses O(sqrt(high_cap)) memory for small primes plus one segment
           # at a time.  Handles ranges up to ~136 M without issue.
@@ -197,6 +262,11 @@ jobs:
                           yield lo + i
                   lo = hi + 1
 
+          # Retry delays (seconds) for transient 422 dispatch errors.
+          # GitHub's indexing can briefly lag even after the preflight dispatch
+          # succeeds, so individual batch dispatches retry with exponential backoff.
+          DISPATCH_RETRY_WAITS = [5, 10, 20, 40]
+
           def dispatch_batch(batch_index, primes):
               """Dispatch one seqmod-4prime-worker.yml run for `primes` (1–4 elements)."""
               padded = (primes + ["", "", "", ""])[:4]
@@ -213,21 +283,36 @@ jobs:
               }
               payload = json.dumps({"ref": ref_name, "inputs": inputs})
               if dry_run:
-                  print(f"    (dry_run: would dispatch seqmod-4prime-worker.yml)")
+                  print(f"    (dry_run: would dispatch {WORKER_WORKFLOW})")
                   return True
-              result = subprocess.run(
-                  ["gh", "api",
-                   "--method", "POST",
-                   f"repos/{repo}/actions/workflows/seqmod-4prime-worker.yml/dispatches",
-                   "--input", "-"],
-                  input=payload,
-                  capture_output=True, text=True,
-              )
-              if result.returncode != 0:
-                  print(f"    ERROR: {result.stderr.strip()}", file=sys.stderr)
+              for attempt in range(len(DISPATCH_RETRY_WAITS) + 1):
+                  result = subprocess.run(
+                      ["gh", "api",
+                       "--method", "POST",
+                       f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/dispatches",
+                       "--input", "-"],
+                      input=payload,
+                      capture_output=True, text=True,
+                  )
+                  if result.returncode == 0:
+                      print(f"    → dispatched OK")
+                      return True
+                  stderr = result.stderr.strip()
+                  # HTTP 422 "Workflow does not have 'workflow_dispatch' trigger"
+                  # is a transient GitHub indexing error for newly-added workflows.
+                  # Retry with exponential backoff; fail permanently for other errors.
+                  if "HTTP 422" in stderr and attempt < len(DISPATCH_RETRY_WAITS):
+                      wait = DISPATCH_RETRY_WAITS[attempt]
+                      print(
+                          f"    → 422 error (attempt {attempt + 1}/{len(DISPATCH_RETRY_WAITS) + 1}), "
+                          f"retrying in {wait}s...",
+                          file=sys.stderr, flush=True,
+                      )
+                      time.sleep(wait)
+                      continue
+                  print(f"    ERROR: {stderr}", file=sys.stderr)
                   return False
-              print(f"    → dispatched OK")
-              return True
+              return False
 
           # Count primes first so we can print a progress estimate.
           print("Counting primes in range...", file=sys.stderr)
