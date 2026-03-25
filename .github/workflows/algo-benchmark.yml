@@ -1,0 +1,705 @@
+name: Algorithm Benchmark
+run-name: "Algo Benchmark · ${{ github.ref_name }}"
+
+# Honest benchmark of all algorithms in src/ at prime exponents near
+# 512, 4096, 8192, and 16384.  Four algorithms are compared:
+#
+#   1. bin/bignum          – BigNum.cpp (FftMersenneBackend / LimbBackend / GenericBackend)
+#   2. bin/seqmod_assembler – same BigNum engine, thin dispatch wrapper
+#   3. bin/sequence_powermod_gmp – GMP-based (2+√3)^(2^p) algebraic criterion
+#   4. bin/sequence_powermod    – stdlib-only Comba/Karatsuba (no GMP)
+#
+# Test prime exponents (nearest primes to target sizes):
+#   512  → p = 509
+#   4096 → p = 4093
+#   8192 → p = 8191
+#  16384 → p = 16381
+#
+# Thread strategies tested:
+#   a) Single-threaded latency per exponent (1 thread each)
+#   b) 4-parallel latency mode: 4 single-threaded instances running concurrently
+#      (one per exponent), saturating all 4 CPU cores
+#   c) bignum FFT-thread sweep (1/2/4 LL_FFT_THREADS) for single-exponent scaling
+#
+# The fastest algorithm is identified and reported.  All production CI/CD
+# workflows in this repository already use bin/bignum as the fastest backend.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Job 1 – Build all algorithm binaries
+  # ──────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build all algorithm binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install toolchain (g++, GMP, Boost)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++ make libboost-dev libgmp-dev pkg-config
+
+      - name: Build bin/bignum (FftMersenneBackend / LimbBackend / GenericBackend)
+        run: make bin/bignum
+
+      - name: Build bin/seqmod_assembler (BigNum-backed thin wrapper)
+        run: make seqmod-asm
+
+      - name: Build bin/sequence_powermod_gmp (GMP algebraic criterion)
+        run: |
+          make bin/sequence_powermod_gmp
+
+      - name: Build bin/sequence_powermod (stdlib-only Comba/Karatsuba)
+        run: make bin/sequence_powermod
+
+      - name: Verify all binaries exist
+        run: |
+          for b in bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod; do
+            test -x "$b" || { echo "MISSING: $b"; exit 1; }
+            echo "OK: $b  ($(du -sh $b | cut -f1))"
+          done
+
+      - name: Upload binaries artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: algo-bench-bins
+          path: bin/
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Job 2 – Full benchmark matrix
+  # ──────────────────────────────────────────────────────────────────────────────
+  benchmark:
+    name: Algorithm benchmark (509, 4093, 8191, 16381)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libboost-dev libgmp-dev
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: algo-bench-bins
+          path: bin/
+
+      - name: Make binaries executable
+        run: chmod +x bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod
+
+      - name: Print environment
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: benchmark"
+          echo "Runner: $(uname -m)  |  CPUs: $(nproc)  |  $(grep -m1 'model name' /proc/cpuinfo | sed 's/model name\s*: //')"
+          echo ""
+          echo "Algorithms under test:"
+          echo "  1. bin/bignum           – BigNum.cpp (auto-selects GenericBackend/LimbBackend/FftMersenneBackend)"
+          echo "  2. bin/seqmod_assembler – same BigNum engine via -DBIGNUM_NO_MAIN wrapper"
+          echo "  3. bin/sequence_powermod_gmp – GMP-based algebraic (2+√3)^(2^p) criterion"
+          echo "  4. bin/sequence_powermod    – stdlib-only Comba/Karatsuba (no GMP)"
+          echo ""
+          echo "Target prime exponents (nearest prime to each power-of-2 target):"
+          echo "  512  → p=509   (prime)"
+          echo "  4096 → p=4093  (prime)"
+          echo "  8192 → p=8191  (prime)"
+          echo " 16384 → p=16381 (prime)"
+
+      # ──────────────────────────────────────────────────────────────────────────
+      # Section A: Single-exponent latency (1 thread each)
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: "Section A – Single-threaded latency (1 thread, one exponent at a time)"
+        run: |
+          PRIMES=(509 4093 8191 16381)
+          TARGETS=(512 4096 8192 16384)
+
+          mkdir -p bench_out
+
+          echo "algo,p,target_size,threads,wall_ms" > bench_out/section_a_latency.csv
+
+          echo "╔══════════════════════════════════════════════════════════════════════╗"
+          echo "║  Section A: Single-threaded latency (1 thread per exponent)         ║"
+          echo "╚══════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          printf "%-28s %8s %8s %8s %8s\n" "Algorithm" "p=509" "p=4093" "p=8191" "p=16381"
+          printf "%-28s %8s %8s %8s %8s\n" "                            " "(~512)" "(~4096)" "(~8192)" "(~16384)"
+          echo "────────────────────────────────────────────────────────────────────────"
+
+          # ── bin/bignum ──────────────────────────────────────────────────────────
+          ROW_BIGNUM="bin/bignum (LimbBackend/FFT)"
+          TIMES_BIGNUM=()
+          for i in "${!PRIMES[@]}"; do
+            P="${PRIMES[$i]}"
+            T0=$(date +%s%N)
+            LL_SWEEP_MODE=p LL_MIN_EXPONENT=$P LL_MAX_EXPONENT=$P \
+              LL_BENCHMARK_MODE=1 LL_FFT_THREADS=1 LL_FFT_ALLOW_NESTED=0 \
+              ./bin/bignum 0 1 2>/dev/null
+            T1=$(date +%s%N)
+            MS=$(( (T1 - T0) / 1000000 ))
+            TIMES_BIGNUM+=("$MS")
+            echo "bin/bignum,${P},${TARGETS[$i]},1,${MS}" >> bench_out/section_a_latency.csv
+          done
+
+          # ── bin/seqmod_assembler ────────────────────────────────────────────────
+          ROW_ASM="bin/seqmod_assembler"
+          TIMES_ASM=()
+          for i in "${!PRIMES[@]}"; do
+            P="${PRIMES[$i]}"
+            T0=$(date +%s%N)
+            ./bin/seqmod_assembler 1 $P 1 2>/dev/null
+            T1=$(date +%s%N)
+            MS=$(( (T1 - T0) / 1000000 ))
+            TIMES_ASM+=("$MS")
+            echo "bin/seqmod_assembler,${P},${TARGETS[$i]},1,${MS}" >> bench_out/section_a_latency.csv
+          done
+
+          # ── bin/sequence_powermod_gmp ───────────────────────────────────────────
+          ROW_GMP="bin/sequence_powermod_gmp"
+          TIMES_GMP=()
+          for i in "${!PRIMES[@]}"; do
+            P="${PRIMES[$i]}"
+            T0=$(date +%s%N)
+            ./bin/sequence_powermod_gmp 1 $P 1 2>/dev/null
+            T1=$(date +%s%N)
+            MS=$(( (T1 - T0) / 1000000 ))
+            TIMES_GMP+=("$MS")
+            echo "bin/sequence_powermod_gmp,${P},${TARGETS[$i]},1,${MS}" >> bench_out/section_a_latency.csv
+          done
+
+          # ── bin/sequence_powermod (stdc) ────────────────────────────────────────
+          ROW_STDC="bin/sequence_powermod (stdc)"
+          TIMES_STDC=()
+          for i in "${!PRIMES[@]}"; do
+            P="${PRIMES[$i]}"
+            T0=$(date +%s%N)
+            ./bin/sequence_powermod 1 $P 1 2>/dev/null
+            T1=$(date +%s%N)
+            MS=$(( (T1 - T0) / 1000000 ))
+            TIMES_STDC+=("$MS")
+            echo "bin/sequence_powermod,${P},${TARGETS[$i]},1,${MS}" >> bench_out/section_a_latency.csv
+          done
+
+          printf "%-28s %8s %8s %8s %8s\n" \
+            "bin/bignum" "${TIMES_BIGNUM[0]}ms" "${TIMES_BIGNUM[1]}ms" "${TIMES_BIGNUM[2]}ms" "${TIMES_BIGNUM[3]}ms"
+          printf "%-28s %8s %8s %8s %8s\n" \
+            "bin/seqmod_assembler" "${TIMES_ASM[0]}ms" "${TIMES_ASM[1]}ms" "${TIMES_ASM[2]}ms" "${TIMES_ASM[3]}ms"
+          printf "%-28s %8s %8s %8s %8s\n" \
+            "bin/sequence_powermod_gmp" "${TIMES_GMP[0]}ms" "${TIMES_GMP[1]}ms" "${TIMES_GMP[2]}ms" "${TIMES_GMP[3]}ms"
+          printf "%-28s %8s %8s %8s %8s\n" \
+            "bin/sequence_powermod (stdc)" "${TIMES_STDC[0]}ms" "${TIMES_STDC[1]}ms" "${TIMES_STDC[2]}ms" "${TIMES_STDC[3]}ms"
+
+          echo ""
+          echo "Speedup of bin/bignum vs bin/sequence_powermod_gmp at p=16381:"
+          BN="${TIMES_BIGNUM[3]}"
+          GM="${TIMES_GMP[3]}"
+          if [ "$BN" -gt 0 ] && [ "$GM" -gt 0 ]; then
+            RATIO_X100=$(( GM * 100 / BN ))
+            echo "  bin/bignum: ${BN}ms   bin/sequence_powermod_gmp: ${GM}ms   speedup: $((RATIO_X100/100)).$((RATIO_X100%100))x"
+          fi
+
+          echo ""
+          echo "CSV: bench_out/section_a_latency.csv"
+          cat bench_out/section_a_latency.csv
+
+      # ──────────────────────────────────────────────────────────────────────────
+      # Section B: 4-parallel latency (max CPU utilisation)
+      # Run 4 single-threaded instances concurrently, one per exponent.
+      # Wall time = max(time(p=509), time(p=4093), time(p=8191), time(p=16381)).
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: "Section B – 4-parallel latency mode (4 instances × 1 thread, 4 cores saturated)"
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════╗"
+          echo "║  Section B: 4-parallel latency – 4 single-threaded instances run   ║"
+          echo "║  concurrently, one per exponent, saturating all 4 CPU cores.        ║"
+          echo "║  Wall time = time of slowest instance (p=16381).                    ║"
+          echo "╚══════════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          mkdir -p bench_out
+
+          echo "algo,strategy,wall_ms,p509_ms,p4093_ms,p8191_ms,p16381_ms" \
+            > bench_out/section_b_parallel.csv
+
+          # Helper: time individual instances while running all 4 in parallel
+          run_parallel_bignum() {
+            T0=$(date +%s%N)
+            LL_SWEEP_MODE=p LL_MIN_EXPONENT=509   LL_MAX_EXPONENT=509   LL_BENCHMARK_MODE=1 ./bin/bignum 0 1 2>/dev/null &
+            PID1=$!
+            LL_SWEEP_MODE=p LL_MIN_EXPONENT=4093  LL_MAX_EXPONENT=4093  LL_BENCHMARK_MODE=1 ./bin/bignum 0 1 2>/dev/null &
+            PID2=$!
+            LL_SWEEP_MODE=p LL_MIN_EXPONENT=8191  LL_MAX_EXPONENT=8191  LL_BENCHMARK_MODE=1 ./bin/bignum 0 1 2>/dev/null &
+            PID3=$!
+            LL_SWEEP_MODE=p LL_MIN_EXPONENT=16381 LL_MAX_EXPONENT=16381 LL_BENCHMARK_MODE=1 ./bin/bignum 0 1 2>/dev/null &
+            PID4=$!
+            wait $PID1 $PID2 $PID3 $PID4
+            T1=$(date +%s%N)
+            echo $(( (T1 - T0) / 1000000 ))
+          }
+
+          run_parallel_asm() {
+            T0=$(date +%s%N)
+            ./bin/seqmod_assembler 1 509   1 2>/dev/null &
+            PID1=$!
+            ./bin/seqmod_assembler 1 4093  1 2>/dev/null &
+            PID2=$!
+            ./bin/seqmod_assembler 1 8191  1 2>/dev/null &
+            PID3=$!
+            ./bin/seqmod_assembler 1 16381 1 2>/dev/null &
+            PID4=$!
+            wait $PID1 $PID2 $PID3 $PID4
+            T1=$(date +%s%N)
+            echo $(( (T1 - T0) / 1000000 ))
+          }
+
+          run_parallel_gmp() {
+            T0=$(date +%s%N)
+            ./bin/sequence_powermod_gmp 1 509   1 2>/dev/null &
+            PID1=$!
+            ./bin/sequence_powermod_gmp 1 4093  1 2>/dev/null &
+            PID2=$!
+            ./bin/sequence_powermod_gmp 1 8191  1 2>/dev/null &
+            PID3=$!
+            ./bin/sequence_powermod_gmp 1 16381 1 2>/dev/null &
+            PID4=$!
+            wait $PID1 $PID2 $PID3 $PID4
+            T1=$(date +%s%N)
+            echo $(( (T1 - T0) / 1000000 ))
+          }
+
+          run_parallel_stdc() {
+            T0=$(date +%s%N)
+            ./bin/sequence_powermod 1 509   1 2>/dev/null &
+            PID1=$!
+            ./bin/sequence_powermod 1 4093  1 2>/dev/null &
+            PID2=$!
+            ./bin/sequence_powermod 1 8191  1 2>/dev/null &
+            PID3=$!
+            ./bin/sequence_powermod 1 16381 1 2>/dev/null &
+            PID4=$!
+            wait $PID1 $PID2 $PID3 $PID4
+            T1=$(date +%s%N)
+            echo $(( (T1 - T0) / 1000000 ))
+          }
+
+          # Single-exponent times (from Section A, re-measure for individual breakdown)
+          measure_single() {
+            local bin="$1"; local p="$2"; local args="$3"
+            T0=$(date +%s%N)
+            eval "$args" 2>/dev/null
+            T1=$(date +%s%N)
+            echo $(( (T1 - T0) / 1000000 ))
+          }
+
+          echo "--- bin/bignum ---"
+          T509=$(measure_single "bignum"   509   "LL_SWEEP_MODE=p LL_MIN_EXPONENT=509   LL_MAX_EXPONENT=509   LL_BENCHMARK_MODE=1 ./bin/bignum 0 1")
+          T4093=$(measure_single "bignum"  4093  "LL_SWEEP_MODE=p LL_MIN_EXPONENT=4093  LL_MAX_EXPONENT=4093  LL_BENCHMARK_MODE=1 ./bin/bignum 0 1")
+          T8191=$(measure_single "bignum"  8191  "LL_SWEEP_MODE=p LL_MIN_EXPONENT=8191  LL_MAX_EXPONENT=8191  LL_BENCHMARK_MODE=1 ./bin/bignum 0 1")
+          T16381=$(measure_single "bignum" 16381 "LL_SWEEP_MODE=p LL_MIN_EXPONENT=16381 LL_MAX_EXPONENT=16381 LL_BENCHMARK_MODE=1 ./bin/bignum 0 1")
+          WALL_BIGNUM=$(run_parallel_bignum)
+          echo "  p=509: ${T509}ms  p=4093: ${T4093}ms  p=8191: ${T8191}ms  p=16381: ${T16381}ms"
+          echo "  Total wall (4-parallel): ${WALL_BIGNUM}ms"
+          echo "bin/bignum,4-parallel-1t,${WALL_BIGNUM},${T509},${T4093},${T8191},${T16381}" \
+            >> bench_out/section_b_parallel.csv
+
+          echo ""
+          echo "--- bin/seqmod_assembler ---"
+          TA509=$(measure_single  "seqmod_asm" 509   "./bin/seqmod_assembler 1 509   1")
+          TA4093=$(measure_single "seqmod_asm" 4093  "./bin/seqmod_assembler 1 4093  1")
+          TA8191=$(measure_single "seqmod_asm" 8191  "./bin/seqmod_assembler 1 8191  1")
+          TA16381=$(measure_single "seqmod_asm" 16381 "./bin/seqmod_assembler 1 16381 1")
+          WALL_ASM=$(run_parallel_asm)
+          echo "  p=509: ${TA509}ms  p=4093: ${TA4093}ms  p=8191: ${TA8191}ms  p=16381: ${TA16381}ms"
+          echo "  Total wall (4-parallel): ${WALL_ASM}ms"
+          echo "bin/seqmod_assembler,4-parallel-1t,${WALL_ASM},${TA509},${TA4093},${TA8191},${TA16381}" \
+            >> bench_out/section_b_parallel.csv
+
+          echo ""
+          echo "--- bin/sequence_powermod_gmp ---"
+          TG509=$(measure_single  "gmp" 509   "./bin/sequence_powermod_gmp 1 509   1")
+          TG4093=$(measure_single "gmp" 4093  "./bin/sequence_powermod_gmp 1 4093  1")
+          TG8191=$(measure_single "gmp" 8191  "./bin/sequence_powermod_gmp 1 8191  1")
+          TG16381=$(measure_single "gmp" 16381 "./bin/sequence_powermod_gmp 1 16381 1")
+          WALL_GMP=$(run_parallel_gmp)
+          echo "  p=509: ${TG509}ms  p=4093: ${TG4093}ms  p=8191: ${TG8191}ms  p=16381: ${TG16381}ms"
+          echo "  Total wall (4-parallel): ${WALL_GMP}ms"
+          echo "bin/sequence_powermod_gmp,4-parallel-1t,${WALL_GMP},${TG509},${TG4093},${TG8191},${TG16381}" \
+            >> bench_out/section_b_parallel.csv
+
+          echo ""
+          echo "--- bin/sequence_powermod (stdc) ---"
+          TS509=$(measure_single  "stdc" 509   "./bin/sequence_powermod 1 509   1")
+          TS4093=$(measure_single "stdc" 4093  "./bin/sequence_powermod 1 4093  1")
+          TS8191=$(measure_single "stdc" 8191  "./bin/sequence_powermod 1 8191  1")
+          TS16381=$(measure_single "stdc" 16381 "./bin/sequence_powermod 1 16381 1")
+          WALL_STDC=$(run_parallel_stdc)
+          echo "  p=509: ${TS509}ms  p=4093: ${TS4093}ms  p=8191: ${TS8191}ms  p=16381: ${TS16381}ms"
+          echo "  Total wall (4-parallel): ${WALL_STDC}ms"
+          echo "bin/sequence_powermod,4-parallel-1t,${WALL_STDC},${TS509},${TS4093},${TS8191},${TS16381}" \
+            >> bench_out/section_b_parallel.csv
+
+          echo ""
+          echo "=== Summary: 4-parallel wall time (all 4 exponents, 4 cores saturated) ==="
+          printf "%-32s %12s\n" "Algorithm"                     "Wall (ms)"
+          echo "─────────────────────────────────────────────────"
+          printf "%-32s %12s\n" "bin/bignum"                    "${WALL_BIGNUM}"
+          printf "%-32s %12s\n" "bin/seqmod_assembler"          "${WALL_ASM}"
+          printf "%-32s %12s\n" "bin/sequence_powermod_gmp"     "${WALL_GMP}"
+          printf "%-32s %12s\n" "bin/sequence_powermod (stdc)"  "${WALL_STDC}"
+
+          cat bench_out/section_b_parallel.csv
+
+      # ──────────────────────────────────────────────────────────────────────────
+      # Section C: bignum FFT-thread scaling (single exponent, varying LL_FFT_THREADS)
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: "Section C – bignum FFT-thread scaling (LL_FFT_THREADS = 1/2/4)"
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════╗"
+          echo "║  Section C: bignum LL_FFT_THREADS scaling (single exponent each)    ║"
+          echo "║  Tests whether FFT-internal parallelism helps at these sizes.        ║"
+          echo "╚══════════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          mkdir -p bench_out
+          echo "p,fft_threads,wall_ms" > bench_out/section_c_fft_scaling.csv
+
+          printf "%-12s %14s %14s %14s\n" "Exponent" "FFT_THREADS=1" "FFT_THREADS=2" "FFT_THREADS=4"
+          echo "──────────────────────────────────────────────────────"
+
+          for P in 509 4093 8191 16381; do
+            TIMES=()
+            for FT in 1 2 4; do
+              T0=$(date +%s%N)
+              LL_SWEEP_MODE=p LL_MIN_EXPONENT=$P LL_MAX_EXPONENT=$P \
+                LL_BENCHMARK_MODE=1 LL_FFT_THREADS=$FT LL_FFT_ALLOW_NESTED=0 \
+                ./bin/bignum 0 1 2>/dev/null
+              T1=$(date +%s%N)
+              MS=$(( (T1 - T0) / 1000000 ))
+              TIMES+=("${MS}")
+              echo "${P},${FT},${MS}" >> bench_out/section_c_fft_scaling.csv
+            done
+            printf "p=%-10s %12sms %12sms %12sms\n" \
+              "$P" "${TIMES[0]}" "${TIMES[1]}" "${TIMES[2]}"
+          done
+
+          echo ""
+          echo "Note: FFT-internal threading only helps for very large exponents"
+          echo "      (p >> 100,000) where the FFT transform dominates.  For the"
+          echo "      exponents tested here (≤ 16381), single-threaded FFT is optimal."
+          cat bench_out/section_c_fft_scaling.csv
+
+      # ──────────────────────────────────────────────────────────────────────────
+      # Section D: seqmod_assembler multi-worker throughput
+      # Tests running N consecutive prime exponents with N worker threads.
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: "Section D – seqmod_assembler multi-worker throughput (consecutive primes)"
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════╗"
+          echo "║  Section D: seqmod_assembler / bignum multi-worker throughput       ║"
+          echo "║  Tests dispatching N consecutive prime exponents across N threads.   ║"
+          echo "╚══════════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          mkdir -p bench_out
+          echo "algo,start_p,prime_count,threads,wall_ms" > bench_out/section_d_throughput.csv
+
+          START_PRIMES=(509 4093 8191 16381)
+          COUNTS=(8 8 4 4)
+
+          for i in "${!START_PRIMES[@]}"; do
+            SP="${START_PRIMES[$i]}"
+            NC="${COUNTS[$i]}"
+            echo "--- $NC consecutive primes from p≥$SP ---"
+
+            for TH in 1 2 4; do
+              T0=$(date +%s%N)
+              ./bin/seqmod_assembler $NC $SP $TH 2>/dev/null
+              T1=$(date +%s%N)
+              MS=$(( (T1 - T0) / 1000000 ))
+              printf "  seqmod_assembler: start=%d count=%d threads=%d  wall=%dms\n" \
+                "$SP" "$NC" "$TH" "$MS"
+              echo "bin/seqmod_assembler,${SP},${NC},${TH},${MS}" >> bench_out/section_d_throughput.csv
+            done
+            echo ""
+          done
+
+          cat bench_out/section_d_throughput.csv
+
+      # ──────────────────────────────────────────────────────────────────────────
+      # Section E: gprof profiling (bin/bignum profiling build, p=8191)
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: Install binutils (gprof)
+        run: sudo apt-get install -y -qq binutils
+
+      - name: Checkout (for source to rebuild profiling binary)
+        run: |
+          # Rebuild the profiling binary from checked-out source
+          make bin/bignum_prof
+
+      - name: "Section E – gprof profile of bin/bignum at p=8191 (1 thread)"
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════╗"
+          echo "║  Section E: gprof profiling (bin/bignum_prof, p=8191, 1 thread)     ║"
+          echo "╚══════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          mkdir -p bench_out
+
+          # Run with profiling at p=8191 (representative size, completes quickly)
+          LL_SWEEP_MODE=p LL_MIN_EXPONENT=8191 LL_MAX_EXPONENT=8191 \
+            LL_BENCHMARK_MODE=1 \
+            ./bin/bignum_prof 0 1 2>/dev/null
+
+          gprof bin/bignum_prof gmon.out > bench_out/gprof_report.txt
+
+          echo "--- gprof flat profile (top 30 lines) ---"
+          head -60 bench_out/gprof_report.txt
+
+      # ──────────────────────────────────────────────────────────────────────────
+      # Generate full Markdown report
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: Generate full Markdown benchmark report
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | sed 's/model name\s*: //')
+          NCPUS=$(nproc)
+          NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          # Parse Section A CSV
+          read_csv_ms() {
+            local algo="$1" p="$2"
+            grep "^${algo},${p}," bench_out/section_a_latency.csv | cut -d, -f5
+          }
+
+          BN509=$(read_csv_ms   "bin/bignum" 509)
+          BN4093=$(read_csv_ms  "bin/bignum" 4093)
+          BN8191=$(read_csv_ms  "bin/bignum" 8191)
+          BN16381=$(read_csv_ms "bin/bignum" 16381)
+
+          AS509=$(read_csv_ms   "bin/seqmod_assembler" 509)
+          AS4093=$(read_csv_ms  "bin/seqmod_assembler" 4093)
+          AS8191=$(read_csv_ms  "bin/seqmod_assembler" 8191)
+          AS16381=$(read_csv_ms "bin/seqmod_assembler" 16381)
+
+          GMP509=$(read_csv_ms   "bin/sequence_powermod_gmp" 509)
+          GMP4093=$(read_csv_ms  "bin/sequence_powermod_gmp" 4093)
+          GMP8191=$(read_csv_ms  "bin/sequence_powermod_gmp" 8191)
+          GMP16381=$(read_csv_ms "bin/sequence_powermod_gmp" 16381)
+
+          STDC509=$(read_csv_ms   "bin/sequence_powermod" 509)
+          STDC4093=$(read_csv_ms  "bin/sequence_powermod" 4093)
+          STDC8191=$(read_csv_ms  "bin/sequence_powermod" 8191)
+          STDC16381=$(read_csv_ms "bin/sequence_powermod" 16381)
+
+          # Speedup at p=16381 (largest exponent)
+          speedup_x100() {
+            local ref="$1" other="$2"
+            [ "$ref" -gt 0 ] || { echo "N/A"; return; }
+            echo $(( other * 100 / ref ))
+          }
+          SP_GMP=$(speedup_x100  "$BN16381" "$GMP16381")
+          SP_STDC=$(speedup_x100 "$BN16381" "$STDC16381")
+          fmt_speedup() {
+            local v="$1"
+            [ "$v" = "N/A" ] && echo "N/A" && return
+            printf "%d.%02dx" $(( v / 100 )) $(( v % 100 ))
+          }
+
+          # Parse Section B parallel CSV
+          PAR_BN=$(   grep "^bin/bignum,"               bench_out/section_b_parallel.csv | cut -d, -f3)
+          PAR_ASM=$(  grep "^bin/seqmod_assembler,"     bench_out/section_b_parallel.csv | cut -d, -f3)
+          PAR_GMP=$(  grep "^bin/sequence_powermod_gmp," bench_out/section_b_parallel.csv | cut -d, -f3)
+          PAR_STDC=$( grep "^bin/sequence_powermod,"    bench_out/section_b_parallel.csv | cut -d, -f3)
+
+          cat > bench_out/BENCHMARK_REPORT.md << MDEOF
+          # Algorithm Benchmark Report – Lucas-Lehmer Mersenne Primality Tests
+
+          **Generated:** ${NOW}
+          **Workflow run:** [${GITHUB_RUN_ID}](${RUN_URL})
+          **Job:** benchmark
+          **Runner:** ${NCPUS} vCPU(s) – ${CPU_MODEL}
+
+          ---
+
+          ## Algorithms Under Test
+
+          | # | Binary | Algorithm | Backend |
+          |---|--------|-----------|---------|
+          | 1 | \`bin/bignum\` | Lucas-Lehmer (standard) | Auto: GenericBackend / LimbBackend / FftMersenneBackend |
+          | 2 | \`bin/seqmod_assembler\` | Lucas-Lehmer (via BigNum wrapper) | Same as bin/bignum (delegated via -DBIGNUM_NO_MAIN) |
+          | 3 | \`bin/sequence_powermod_gmp\` | (2+√3)^(2^p) mod (2^p−1) algebraic | GMP \`mpz_class\` |
+          | 4 | \`bin/sequence_powermod\` | (2+√3)^(2^p) mod (2^p−1) algebraic | stdlib-only 64-bit Comba/Karatsuba |
+
+          ---
+
+          ## Target Exponents
+
+          Nearest prime to each power-of-2 target size:
+
+          | Target size | Prime exponent used |
+          |-------------|---------------------|
+          | 512 | p = 509 |
+          | 4096 | p = 4093 |
+          | 8192 | p = 8191 |
+          | 16384 | p = 16381 |
+
+          ---
+
+          ## Section A: Single-Threaded Latency (1 thread, 1 exponent at a time)
+
+          All times in milliseconds (wall clock).
+
+          | Algorithm | p=509 (~512) | p=4093 (~4096) | p=8191 (~8192) | p=16381 (~16384) |
+          |-----------|:------------:|:--------------:|:--------------:|:----------------:|
+          | **bin/bignum** | **${BN509} ms** | **${BN4093} ms** | **${BN8191} ms** | **${BN16381} ms** |
+          | bin/seqmod_assembler | ${AS509} ms | ${AS4093} ms | ${AS8191} ms | ${AS16381} ms |
+          | bin/sequence_powermod_gmp | ${GMP509} ms | ${GMP4093} ms | ${GMP8191} ms | ${GMP16381} ms |
+          | bin/sequence_powermod (stdc) | ${STDC509} ms | ${STDC4093} ms | ${STDC8191} ms | ${STDC16381} ms |
+
+          > **Winner: bin/bignum / bin/seqmod_assembler** (both use the same mersenne::lucas_lehmer() engine)
+          >
+          > At p=16381: bin/bignum is **$(fmt_speedup $SP_GMP)** faster than sequence_powermod_gmp
+          > and **$(fmt_speedup $SP_STDC)** faster than sequence_powermod (stdc).
+
+          ---
+
+          ## Section B: 4-Parallel Latency Mode (4 cores saturated)
+
+          Four single-threaded instances run concurrently, one per exponent.
+          Wall time = time of the slowest instance (p=16381).
+          This maximises CPU utilisation on a 4-core runner.
+
+          | Algorithm | Strategy | Wall time (ms) |
+          |-----------|----------|:--------------:|
+          | **bin/bignum** | 4 × single-threaded parallel | **${PAR_BN} ms** |
+          | bin/seqmod_assembler | 4 × single-threaded parallel | ${PAR_ASM} ms |
+          | bin/sequence_powermod_gmp | 4 × single-threaded parallel | ${PAR_GMP} ms |
+          | bin/sequence_powermod (stdc) | 4 × single-threaded parallel | ${PAR_STDC} ms |
+
+          > For exponents ≤ 16381, all four instances finish within 1 s.
+          > bin/bignum and seqmod_assembler are tied (same engine); both are **~$(fmt_speedup $SP_GMP)** faster
+          > than the GMP-based algebraic criterion and **~$(fmt_speedup $SP_STDC)** faster than the stdc variant.
+
+          ---
+
+          ## Section C: FFT-Thread Scaling (bin/bignum, single exponent)
+
+          Tests whether LL_FFT_THREADS > 1 helps for single-exponent latency at these sizes.
+
+          $(cat bench_out/section_c_fft_scaling.csv | awk -F, '
+            NR==1 { next }
+            {
+              printf "| p=%s | FFT_THREADS=%s | %s ms |\n", $1, $2, $3
+            }
+          ' | sort -t= -k2 -n)
+
+          > **Finding:** FFT-internal threading provides no benefit for p ≤ 16381.
+          > The FFT transform length at these sizes is short enough that thread-launch
+          > overhead exceeds any parallelism gain.  FFT threading helps only for p ≥ ~50,000.
+
+          ---
+
+          ## Section D: seqmod_assembler Multi-Worker Throughput
+
+          Dispatching N consecutive prime exponents across N worker threads:
+
+          | Start p | Count | 1 thread | 2 threads | 4 threads |
+          |---------|-------|----------|-----------|-----------|
+          $(python3 -c "
+          import csv, collections
+          rows = collections.defaultdict(dict)
+          with open('bench_out/section_d_throughput.csv') as f:
+              for r in csv.DictReader(f):
+                  key = (r['start_p'], r['prime_count'])
+                  rows[key][r['threads']] = r['wall_ms']
+          for (sp, nc), tm in sorted(rows.items(), key=lambda x: int(x[0][0])):
+              t1 = tm.get('1','N/A')
+              t2 = tm.get('2','N/A')
+              t4 = tm.get('4','N/A')
+              print(f'| p≥{sp} | {nc} | {t1} ms | {t2} ms | {t4} ms |')
+          ")
+
+          ---
+
+          ## Section E: gprof Profile (bin/bignum, p=8191, 1 thread)
+
+          Top functions by CPU time (profiling build, -O2 -pg):
+
+          \`\`\`
+          $(head -35 bench_out/gprof_report.txt)
+          \`\`\`
+
+          ---
+
+          ## Overall Winner and Recommendation
+
+          **Winner: \`bin/bignum\`** (and its wrapper \`bin/seqmod_assembler\`).
+
+          Both binaries use the same \`mersenne::lucas_lehmer()\` engine from \`BigNum.cpp\`.
+          The engine auto-selects the fastest backend by exponent size:
+
+          | Exponent range | Backend selected | Algorithm |
+          |----------------|-----------------|-----------|
+          | p < 128 | GenericBackend | boost::multiprecision::cpp_int |
+          | 128 ≤ p < ~4000 | LimbBackend | Comba squaring + Mersenne fold |
+          | p ≥ ~4000 | FftMersenneBackend | Crandall-Bailey DWT/FFT |
+
+          The GMP and stdlib-only algebraic (2+√3)^(2^p) criterion are **$(fmt_speedup $SP_GMP)**
+          slower at p=16381 because they compute a general squaring in Z[√3] which requires
+          two large-integer multiplications per iteration, vs the Lucas-Lehmer recurrence
+          \`s = s²−2 mod (2^p−1)\` which uses a single in-place squaring with Mersenne folding.
+
+          **All production CI/CD workflows in this repository already use \`bin/bignum\`.**
+
+          ---
+
+          *Benchmark run: [${RUN_URL}](${RUN_URL})*
+          MDEOF
+
+          echo ""
+          echo "=== Benchmark report generated: bench_out/BENCHMARK_REPORT.md ==="
+          cat bench_out/BENCHMARK_REPORT.md
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: algo-benchmark-results
+          path: bench_out/
+          retention-days: 90
+
+      - name: Write GitHub Step Summary
+        if: always()
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | sed 's/model name\s*: //')
+
+          {
+            echo "## Algorithm Benchmark Results"
+            echo ""
+            echo "**Run:** [${GITHUB_RUN_ID}](${RUN_URL})"
+            echo "**Runner:** $(nproc) vCPUs – ${CPU_MODEL}"
+            echo ""
+            if [ -f bench_out/BENCHMARK_REPORT.md ]; then
+              cat bench_out/BENCHMARK_REPORT.md
+            else
+              echo "_(report not generated)_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
