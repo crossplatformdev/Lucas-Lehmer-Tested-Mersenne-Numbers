@@ -134,10 +134,27 @@ static size_t bitlen(const Limbs& a) {
 
 // ─── Workspace-based Karatsuba squaring ──────────────────────────────────────
 // Operations: n diagonal + n(n-1)/2 cross terms ≈ n²/2 multiplications.
-// Each 64-bit × 64-bit product is computed with __uint128_t.
+// Uses comba_sqr_adx (MULX+ADCX/ADOX) when available, otherwise scalar Comba.
+
+// Forward declarations (defined in the Karatsuba section below).
+#if defined(__BMI2__) && defined(__ADX__) && defined(__x86_64__)
+static constexpr size_t ADX_MIN_N = 4;
+[[gnu::target("bmi2,adx")]]
+static void comba_sqr_adx(const uint64_t* __restrict__, size_t,
+                           uint64_t* __restrict__);
+#endif
+
 static void square_comba(const Limbs& a, Limbs& out) {
     const size_t n = a.size();
     out.assign(n * 2, 0);  // zero-fill; no realloc when capacity >= n*2
+
+#if defined(__BMI2__) && defined(__ADX__) && defined(__x86_64__)
+    if (n >= ADX_MIN_N) {
+        comba_sqr_adx(a.data(), n, out.data());
+        normalize(out);
+        return;
+    }
+#endif
 
     for (size_t i = 0; i < n; ++i) {
         // Diagonal: a[i]^2 → accumulate at position 2i
@@ -202,7 +219,131 @@ static void square_comba(const Limbs& a, Limbs& out) {
 
 static constexpr size_t KARA_THRESHOLD = 10;
 
-// Schoolbook (Comba) squaring on raw arrays.
+// ─── ADX-accelerated schoolbook squaring (MULX + ADCX/ADOX) ─────────────────
+//
+// Replaces the scalar Comba inner loop for n ≥ ADX_MIN_N on x86-64 CPUs
+// with BMI2 (MULX) and ADX (ADCX/ADOX).
+//
+// Three-phase algorithm:
+//   1. Upper-triangle cross terms a[i]·a[j] (j>i), undoubled, row-by-row:
+//        RDX = a[i]
+//        For j = i+1..n-1:
+//          MULX a[j]          → hi:lo          (preserves CF and OF)
+//          ADOX out[i+j],   lo  (OF chain: accumulates lo, updates OF)
+//          ADCX out[i+j+1], hi  (CF chain: accumulates hi, updates CF)
+//        LOOP (uses/decrements RCX; does NOT modify CF or OF)
+//      After each row the residual CF and OF are captured via GCC
+//      "=@ccc"/"=@cco" constraints and propagated in C.
+//   2. Double out[] by CLC + LOOP of RCL $1, (%p).
+//   3. Add a[i]² diagonal terms with MULX + __uint128_t carry.
+//
+// Speedup rationale (AMD EPYC 7763 / Zen 3, Agner Fog tables):
+//   • MULX:  3-cycle latency, 1/cycle throughput, does NOT touch CF/OF
+//   • ADCX:  1-cycle latency, uses CF only
+//   • ADOX:  1-cycle latency, uses OF only
+//   → ADCX and ADOX can execute in parallel (disjoint flag resources),
+//     giving ~2× the carry-accumulation throughput of scalar ADD/ADC.
+//   • No carry-propagation tail loop (the serial bottleneck in comba_sqr_raw).
+//
+// out[] must have exactly 2n zeroed elements on entry (guaranteed by caller).
+#if defined(__BMI2__) && defined(__ADX__) && defined(__x86_64__)
+
+[[gnu::target("bmi2,adx")]]
+static void comba_sqr_adx(const uint64_t* __restrict__ a, size_t n,
+                           uint64_t* __restrict__ out) {
+    // ── Phase 1: upper-triangle cross terms (undoubled) ──────────────────────
+    for (size_t i = 0; i + 1 < n; ++i) {
+        uint64_t        cnt = n - 1 - i;    // j runs from i+1 to n-1 (cnt steps)
+        const uint64_t* src = &a[i + 1];    // first source limb: a[i+1]
+        // ADOX writes lo(a[i]*a[j]) at out[i+j]; first j = i+1 → out[2i+1].
+        // ADCX writes hi(a[i]*a[j]) at out[i+j+1].
+        // Both advance by 1 limb per j iteration, so dst starts at out[2i+1].
+        uint64_t*       dst = &out[2 * i + 1];
+        const uint64_t  ai  = a[i];
+
+        // CF = carry out of the last ADCX (pending into out[n+i+1])
+        // OF = carry out of the last ADOX  (pending into out[n+i])
+        uint8_t cf, of;
+        __asm__ volatile (
+            // XOR clears CF and OF simultaneously.
+            "xorl %%eax, %%eax\n\t"
+            ".align 16\n\t"
+            "1:\n\t"
+            // hi:lo = RDX * *src  (MULX: reads RDX; never modifies CF or OF)
+            "mulx  (%[s]), %%r8, %%r9\n\t"
+            // ADOX/ADCX destination must be a register; source may be memory.
+            // r8 = r8 (lo) + *dst      + OF  (OF chain)
+            "adoxq (%[d]),  %%r8\n\t"
+            // r9 = r9 (hi) + *(dst+1)  + CF  (CF chain)
+            "adcxq 8(%[d]), %%r9\n\t"
+            // Write the updated limbs back into the output array.
+            "movq  %%r8, (%[d])\n\t"
+            "movq  %%r9, 8(%[d])\n\t"
+            // Advance both pointers (LEA: no flags touched)
+            "leaq  8(%[s]), %[s]\n\t"
+            "leaq  8(%[d]), %[d]\n\t"
+            // LOOP decrements RCX and branches if non-zero; it does NOT touch CF or OF.
+            // cnt ("+c") is declared read-write so GCC knows RCX is consumed here.
+            "loop  1b\n\t"
+            // After the loop, [d] = &out[i+n].
+            // CF = carry pending from last ADCX, OF = carry pending from last ADOX.
+            : [s] "+r"(src), [d] "+r"(dst), "+c"(cnt),
+              "=@ccc"(cf), "=@cco"(of)     // capture CF and OF
+            : "d"(ai)                       // RDX = a[i]  (MULX multiplier)
+            : "rax", "r8", "r9", "memory", "cc"
+        );
+        // dst now points to &out[i+n].
+        // Propagate the pending OF carry into out[i+n] and beyond.
+        for (size_t k = (size_t)(dst - out); of && k < 2 * n; ++k)
+            of = (++out[k] == 0) ? 1u : 0u;
+        // Propagate the pending CF carry into out[i+n+1] and beyond.
+        for (size_t k = (size_t)(dst - out) + 1; cf && k < 2 * n; ++k)
+            cf = (++out[k] == 0) ? 1u : 0u;
+    }
+
+    // ── Phase 2: double out[] (left-shift by 1) ──────────────────────────────
+    // CLC sets CF=0 (incoming bit for the lowest limb).
+    // RCL $1 shifts each limb left by 1, using CF as the in-bit and depositing
+    // the shifted-out top bit into CF for the next limb.
+    // DEC does NOT modify CF, so the carry chain survives across iterations.
+    {
+        uint64_t* p   = out;
+        uint64_t  cnt = 2 * n;
+        __asm__ volatile (
+            "clc\n\t"
+            ".align 16\n\t"
+            "1:\n\t"
+            "rclq  $1, (%[p])\n\t"
+            "leaq  8(%[p]), %[p]\n\t"
+            "decq  %[cnt]\n\t"        // DEC: modifies ZF/SF/OF/PF/AF but NOT CF
+            "jnz   1b\n\t"
+            : [p] "+r"(p), [cnt] "+r"(cnt)
+            :
+            : "memory", "cc"
+        );
+        // The final CF should be 0: cross-term sum < 2^(128n), fits in 2n limbs.
+    }
+
+    // ── Phase 3: add diagonal a[i]² ──────────────────────────────────────────
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t lo, hi;
+        const uint64_t ai = a[i];
+        // MULX: hi:lo = ai * ai  (RDX must equal ai)
+        __asm__ ("mulx %[ai], %[lo], %[hi]"
+                 : [lo] "=r"(lo), [hi] "=r"(hi)
+                 : [ai] "rm"(ai), "d"(ai));
+        __uint128_t acc = (__uint128_t)out[2 * i] + lo;
+        out[2 * i]     = (uint64_t)acc;
+        acc            = (__uint128_t)out[2 * i + 1] + hi + (uint64_t)(acc >> 64);
+        out[2 * i + 1] = (uint64_t)acc;
+        for (size_t k = 2*i+2, c = (size_t)(acc >> 64); c && k < 2*n; ++k)
+            c = (++out[k] == 0) ? 1u : 0u;
+    }
+}
+
+#endif  // __BMI2__ && __ADX__ && __x86_64__
+
+// Schoolbook (Comba) squaring on raw arrays — portable fallback.
 // out[0..2n-1] ← a[0..n-1]²  (all 2n elements initialised to 0 by this function).
 static void comba_sqr_raw(const uint64_t* a, size_t n, uint64_t* out) {
     for (size_t k = 0; k < 2 * n; ++k) out[k] = 0;
@@ -250,7 +391,16 @@ static size_t kara_ws_size(size_t n) noexcept {
 // ws[0..kara_ws_size(n)-1]: scratch; contents are not preserved.
 static void kara_sqr_raw(const uint64_t* a, size_t n, uint64_t* out, uint64_t* ws) {
     if (n < KARA_THRESHOLD) {
+#if defined(__BMI2__) && defined(__ADX__) && defined(__x86_64__)
+        if (n >= ADX_MIN_N) {
+            for (size_t k = 0; k < 2 * n; ++k) out[k] = 0;
+            comba_sqr_adx(a, n, out);
+        } else {
+            comba_sqr_raw(a, n, out);
+        }
+#else
         comba_sqr_raw(a, n, out);
+#endif
         return;
     }
     const size_t m      = n / 2;
