@@ -188,8 +188,6 @@ jobs:
               while lo <= hi_end:
                   hi  = min(lo + SEG - 1, hi_end)
                   seg = bytearray(hi - lo + 1)   # 0 = prime
-                  if lo == 1:
-                      seg[0] = 1   # 1 is not prime
                   for p in small_primes:
                       start = max(p * p, ((lo + p - 1) // p) * p)
                       for j in range(start - lo, hi - lo + 1, p):
