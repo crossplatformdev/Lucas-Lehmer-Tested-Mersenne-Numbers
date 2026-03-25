@@ -28,7 +28,6 @@ on:
   workflow_dispatch:
   push:
     branches: ["main"]
-  pull_request:
 
 permissions:
   contents: read
@@ -77,7 +76,11 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: algo-bench-bins
-          path: bin/
+          path: |
+            bin/bignum
+            bin/seqmod_assembler
+            bin/sequence_powermod_gmp
+            bin/sequence_powermod
           retention-days: 1
 
   # ──────────────────────────────────────────────────────────────────────────────
@@ -98,7 +101,7 @@ jobs:
           sudo apt-get install -y -qq libboost-dev libgmp-dev
 
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: algo-bench-bins
           path: bin/
@@ -250,7 +253,12 @@ jobs:
             PID3=$!
             LL_SWEEP_MODE=p LL_MIN_EXPONENT=16381 LL_MAX_EXPONENT=16381 LL_BENCHMARK_MODE=1 ./bin/bignum 0 1 2>/dev/null &
             PID4=$!
-            wait $PID1 $PID2 $PID3 $PID4
+            local rc=0
+            wait $PID1 || rc=$?
+            wait $PID2 || rc=$?
+            wait $PID3 || rc=$?
+            wait $PID4 || rc=$?
+            [ $rc -eq 0 ] || { echo "ERROR: one or more bin/bignum parallel instances failed (exit $rc)" >&2; return $rc; }
             T1=$(date +%s%N)
             echo $(( (T1 - T0) / 1000000 ))
           }
@@ -265,7 +273,12 @@ jobs:
             PID3=$!
             ./bin/seqmod_assembler 1 16381 1 2>/dev/null &
             PID4=$!
-            wait $PID1 $PID2 $PID3 $PID4
+            local rc=0
+            wait $PID1 || rc=$?
+            wait $PID2 || rc=$?
+            wait $PID3 || rc=$?
+            wait $PID4 || rc=$?
+            [ $rc -eq 0 ] || { echo "ERROR: one or more bin/seqmod_assembler parallel instances failed (exit $rc)" >&2; return $rc; }
             T1=$(date +%s%N)
             echo $(( (T1 - T0) / 1000000 ))
           }
@@ -280,7 +293,12 @@ jobs:
             PID3=$!
             ./bin/sequence_powermod_gmp 1 16381 1 2>/dev/null &
             PID4=$!
-            wait $PID1 $PID2 $PID3 $PID4
+            local rc=0
+            wait $PID1 || rc=$?
+            wait $PID2 || rc=$?
+            wait $PID3 || rc=$?
+            wait $PID4 || rc=$?
+            [ $rc -eq 0 ] || { echo "ERROR: one or more bin/sequence_powermod_gmp parallel instances failed (exit $rc)" >&2; return $rc; }
             T1=$(date +%s%N)
             echo $(( (T1 - T0) / 1000000 ))
           }
@@ -295,7 +313,12 @@ jobs:
             PID3=$!
             ./bin/sequence_powermod 1 16381 1 2>/dev/null &
             PID4=$!
-            wait $PID1 $PID2 $PID3 $PID4
+            local rc=0
+            wait $PID1 || rc=$?
+            wait $PID2 || rc=$?
+            wait $PID3 || rc=$?
+            wait $PID4 || rc=$?
+            [ $rc -eq 0 ] || { echo "ERROR: one or more bin/sequence_powermod parallel instances failed (exit $rc)" >&2; return $rc; }
             T1=$(date +%s%N)
             echo $(( (T1 - T0) / 1000000 ))
           }
@@ -446,10 +469,12 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────────
       # Section E: gprof profiling (bin/bignum profiling build, p=8191)
       # ──────────────────────────────────────────────────────────────────────────
-      - name: Install binutils (gprof)
-        run: sudo apt-get install -y -qq binutils
+      - name: Install binutils (gprof) and build toolchain for profiling binary
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils g++ make pkg-config
 
-      - name: Checkout (for source to rebuild profiling binary)
+      - name: Build profiling binary (bin/bignum_prof)
         run: |
           # Rebuild the profiling binary from checked-out source
           make bin/bignum_prof
