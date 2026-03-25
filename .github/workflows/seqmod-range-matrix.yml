@@ -21,7 +21,6 @@ run-name: "Seqmod Range · ${{ inputs.low_cap }}..${{ inputs.high_cap }}"
 # Inputs:
 #   low_cap            – lower bound of exponent range (inclusive, ≥ 2)
 #   high_cap           – upper bound of exponent range (inclusive, ≥ low_cap)
-#   threads            – threads per worker (1–4, default 1)
 #   time_limit_seconds – per-worker soft-stop in seconds (default 21420 = 5.95 h)
 #   dry_run            – print plan only – do not dispatch worker runs
 
@@ -36,11 +35,6 @@ on:
         description: "Upper bound of exponent range (inclusive, ≥ low_cap)"
         required: true
         type: string
-      threads:
-        description: "Threads per worker (1–4)"
-        required: false
-        type: string
-        default: "1"
       time_limit_seconds:
         description: "Per-worker soft-stop in seconds (default 21420 = 5.95 h)"
         required: false
@@ -76,7 +70,6 @@ jobs:
 
           LOW="${{ inputs.low_cap }}"
           HIGH="${{ inputs.high_cap }}"
-          THREADS="${{ inputs.threads }}"
           TL="${{ inputs.time_limit_seconds }}"
 
           if ! [[ "$LOW" =~ ^[0-9]+$ ]]; then
@@ -95,16 +88,12 @@ jobs:
             echo "::error::high_cap (${HIGH}) must be >= low_cap (${LOW})."
             exit 1
           fi
-          if ! [[ "$THREADS" =~ ^[0-9]+$ ]] || (( THREADS < 1 || THREADS > 4 )); then
-            echo "::error::threads must be an integer in [1, 4], got '${THREADS}'."
-            exit 1
-          fi
           if ! [[ "$TL" =~ ^[0-9]+$ ]] || (( TL < 60 )); then
             echo "::error::time_limit_seconds must be >= 60, got '${TL}'."
             exit 1
           fi
 
-          echo "Inputs validated: range=[${LOW}, ${HIGH}], threads=${THREADS}, time_limit=${TL}s"
+          echo "Inputs validated: range=[${LOW}, ${HIGH}], threads=4 (fixed), time_limit=${TL}s"
           echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
   # ──────────────────────────────────────────────────────────
@@ -158,12 +147,11 @@ jobs:
           export LOW="${{ inputs.low_cap }}"
           export HIGH="${{ inputs.high_cap }}"
           export DRY_RUN="${{ inputs.dry_run }}"
-          export THREADS="${{ inputs.threads }}"
           export TIME_LIMIT="${{ inputs.time_limit_seconds }}"
 
           echo "=== Seqmod Range Matrix – Dispatch Phase ==="
           echo "Range   : [${LOW}, ${HIGH}]"
-          echo "Threads : ${THREADS}"
+          echo "Threads : 4 (fixed)"
           echo "Dry run : ${DRY_RUN}"
           echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo ""
@@ -174,7 +162,6 @@ jobs:
           low_cap    = int(os.environ["LOW"])
           high_cap   = int(os.environ["HIGH"])
           dry_run    = os.environ["DRY_RUN"] == "true"
-          threads    = os.environ["THREADS"]
           time_limit = os.environ["TIME_LIMIT"]
           repo       = os.environ["GITHUB_REPOSITORY"]
           ref_name   = os.environ["GITHUB_REF_NAME"]
@@ -223,7 +210,6 @@ jobs:
                   "p2": str(p2),
                   "p3": str(p3),
                   "p4": str(p4),
-                  "threads":            threads,
                   "time_limit_seconds": time_limit,
                   "dry_run":            dry_run,
               }
@@ -312,7 +298,7 @@ jobs:
             echo "| Field | Value |"
             echo "|-------|-------|"
             echo "| Range | [${{ inputs.low_cap }}, ${{ inputs.high_cap }}] |"
-            echo "| Threads per worker | ${{ inputs.threads }} |"
+            echo "| Threads per worker | 4 (fixed) |"
             echo "| Per-worker time limit | ${{ inputs.time_limit_seconds }} s |"
             echo "| Dry run | ${{ inputs.dry_run }} |"
             echo "| Worker workflow | seqmod-4prime-worker.yml |"

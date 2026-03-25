@@ -14,7 +14,6 @@ run-name: "LL · p=${{ inputs.p1 }}, ${{ inputs.p2 || 'N/A' }}, ${{ inputs.p3 ||
 # Inputs:
 #   p1                 – first prime exponent (required)
 #   p2..p4             – additional prime exponents (optional; empty = skip)
-#   threads            – LL threads per worker (1–4, default 1)
 #   time_limit_seconds – per-worker soft-stop in seconds (default 21420 = 5.95 h)
 #   dry_run            – print plan only – do not run tests
 
@@ -40,11 +39,6 @@ on:
         required: false
         type: string
         default: ""
-      threads:
-        description: "Threads per worker (1–4)"
-        required: false
-        type: string
-        default: "1"
       time_limit_seconds:
         description: "Per-worker soft-stop in seconds (default 21420 = 5.95 h)"
         required: false
@@ -134,7 +128,7 @@ jobs:
           SEQMOD_TIME_LIMIT_SECS="${{ inputs.time_limit_seconds }}" \
           SEQMOD_OUTPUT_CSV="${CSV_PATH}" \
           SEQMOD_STATE_FILE="${STATE_PATH}" \
-          ./bin/sequence_powermod "${ITERS}" "${P_MIN}" "${{ inputs.threads }}"
+          ./bin/sequence_powermod "${ITERS}" "${P_MIN}" "4"
           EXIT_CODE=$?
           set -e
           ELAPSED=$(( $(date +%s) - START_SEC ))
