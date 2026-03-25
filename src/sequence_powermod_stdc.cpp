@@ -577,71 +577,74 @@ static bool is_prime_index(int n) {
     return true;
 }
 
-// ─── Formula approach: a(n) = Ceil[2^n · exp(2^n · log₁₀(2))] ────────────────
+// ─── Lucas-Lehmer sequence: a(n) = s_{n-1},  s₀=4,  s_{k+1} = s_k²−2 ─────────
 //
-// With log₁₀(2) ≈ 0.30103, "log" here means the common (base-10) logarithm,
-// which is confirmed by the known starting value a(1) = 4:
-//   2¹ · exp(2¹ · log₁₀2) = 2 · exp(2 · 0.30103) = 2 · 1.8258… = 3.6516…
-//   Ceil[3.6516…] = 4  ✓
+// The L-L sequence starting value s₀=4 arises from the identity
+//   (2+√3)^1 + (2-√3)^1 = 4.
+// Each iterate is s_k = (2+√3)^(2^k) + (2-√3)^(2^k).
 //
-// The formula grows super-exponentially.  a(n) already exceeds 10³⁸ for n=8,
-// far beyond what long double can represent exactly.  For n > 10 the exponent
-// of exp() itself exceeds 10², so computing the ceiling would require arbitrary-
-// precision arithmetic with ~2^n · log₁₀(2) ≈ 0.43 · 2^n decimal digits –
-// exponentially more work than the Lucas-Lehmer algebraic method.
+// Lucas-Lehmer primality test: M_p = 2^p−1 is prime  iff  s_{p-2} ≡ 0 (mod M_p),
+// except for p=2 (M₂=3 is prime but s₀=4, and 4 mod 3 = 1 ≠ 0).
 //
-// Values below are exact (computed with Python Decimal, precision = 300 digits).
+// Mapping used in this table: index n = p−1, so a(n) = s_{n-1} = s_{p-2},
+// checked mod (2^{n+1}−1) = (2^p−1) = M_p.
+//
+// Values below are exact integers (computed with Python arbitrary precision).
 // The table is used both for display and for the formula_sequence_zero() path.
 struct FormulaTerm {
-    const char* an_str;  // a(n) as exact decimal string
-    int         mod_val; // a(n) mod (2^(n+1) − 1), exact
+    const char* an_str;  // s_{n-1} as exact decimal string
+    int         mod_val; // s_{n-1} mod (2^(n+1) − 1), exact
 };
 
 // n=1..10; index 0 is unused.
 static const FormulaTerm FORMULA_TERMS[11] = {
     {nullptr, 0},
 
-    // n=1: 2^(n+1)−1 = 3,   mod = 1  (M₂=3 IS prime, formula MISSES it)
+    // n=1 (p=2): M₂=3,   s₀=4,              4 mod 3 = 1  ← exception: M₂ IS prime
     {"4", 1},
 
-    // n=2: 2^(n+1)−1 = 7,   mod = 0  ← only true positive in n=1..10
-    //       (all other Mersenne-prime exponents ≤ 11 are missed)
+    // n=2 (p=3): M₃=7,   s₁=14,             14 mod 7 = 0  → M₃=7 prime ✓
     {"14", 0},
 
-    // n=3: 2^(n+1)−1 = 15,  mod = 14
-    {"89", 14},
+    // n=3 (p=4): M₄=15,  s₂=194,            194 mod 15 = 14  → not prime ✓
+    {"194", 14},
 
-    // n=4: 2^(n+1)−1 = 31,  mod = 24 (M₅=31 IS prime, formula MISSES it)
-    {"1977", 24},
+    // n=4 (p=5): M₅=31,  s₃=37634,          37634 mod 31 = 0  → M₅=31 prime ✓
+    {"37634", 0},
 
-    // n=5: 2^(n+1)−1 = 63,  mod = 56
-    {"488306", 56},
+    // n=5 (p=6): M₆=63,  s₄=1416317954,     mod 63 = 23  → not prime ✓
+    {"1416317954", 23},
 
-    // n=6: 2^(n+1)−1 = 127, mod = 82 (M₇=127 IS prime, formula MISSES it)
-    {"14902618994", 82},
+    // n=6 (p=7): M₇=127, s₅=2005956546822746114,  mod 127 = 0  → M₇=127 prime ✓
+    {"2005956546822746114", 0},
 
-    // n=7: 2^(n+1)−1 = 255, mod = 39
-    {"6940251652416355824", 39},
+    // n=7 (p=8): M₈=255, s₆=…,              mod 255 = 149  → not prime ✓
+    {"4023861667741036022825635656102100994", 149},
 
-    // n=8: 2^(n+1)−1 = 511, mod = 113
-    {"752610828107311835845879003449461727", 113},
+    // n=8 (p=9): M₉=511, s₇=…,              mod 511 = 205  → not prime ✓
+    {"16191462721115671781777559070120513664958590125499158514329308740975788034", 205},
 
-    // n=9: 2^(n+1)−1 = 1023, mod = 353
-    {"4425180145190419400561328003597198230956585615632884229084218578420004", 353},
+    // n=9 (p=10): M₁₀=1023, s₈=…,           mod 1023 = 95  → not prime ✓
+    {"262163465049278514526059369557563039213647877559524545911906005349555773"
+     "831236935015956281848933426999307982418664943276943901608919396607297585154", 95},
 
-    // n=10: 2^(n+1)−1 = 2047, mod = 95
-    {"76493044208544927055507189925045921336436936843142683231725592719426378"
-     "658889424279584100101770230801467453669518185398052940582766454325", 95},
+    // n=10 (p=11): M₁₁=2047, s₉=…,          mod 2047 = 1736  → not prime ✓
+    //              (2047 = 23 × 89, confirmed composite)
+    {"68729682406644277238837486231747530924247154108646671752192618583088487405"
+     "790957964732883069102561043436779663935595172042357306594916344606074564712"
+     "868078287608055203024658359439017580883910978666185875717415541084494926500"
+     "475167381168505927378181899753839260609452265365274850901879881203714", 1736},
 };
 
-// Print the first 10 terms with their mod values.
+// Print the first 10 terms of the L-L sequence with their mod values.
 static void print_formula_terms() {
     std::cout <<
-        "\na(n) = Ceil[2^n · exp(2^n · log₁₀(2))]  — first 10 terms\n"
-        "(\"log\" = common / base-10 logarithm; confirmed by a(1) = 4)\n\n";
+        "\nLucas-Lehmer sequence: s₀=4, s_{k+1}=s_k²−2\n"
+        "Table: a(n) = s_{n-1},  checked mod M_{n+1} = 2^{n+1}−1\n"
+        "(implements the L-L primality test for M_{n+1})\n\n";
     std::cout
         << std::setw(4)  << "n"
-        << "  " << std::setw(38) << "a(n)  [truncated to 35 chars]"
+        << "  " << std::setw(38) << "s_{n-1}  [truncated to 35 chars]"
         << "  " << std::setw(6)  << "M(n+1)"
         << "  " << std::setw(5)  << "mod"
         << "  =0?\n";
@@ -661,20 +664,22 @@ static void print_formula_terms() {
                                            + " prime" : "no") << '\n';
     }
     std::cout <<
-        "\nObservations:\n"
-        "  • a(1)=4,   M₂=3: mod=1  — M₂ IS prime but formula returns 1 (false negative).\n"
-        "  • a(2)=14,  M₃=7: mod=0  — formula correctly identifies M₃ as prime.\n"
-        "  • a(4)=1977, M₅=31: mod=24 — M₅ IS prime but formula returns 24 (false negative).\n"
-        "  • a(6)=14902618994, M₇=127: mod=82 — M₇ IS prime but formula returns 82 (false negative).\n"
-        "  • For n≥8: a(n) has >38 decimal digits; long double cannot compute the\n"
-        "    ceiling exactly.  Arbitrary precision would need ~0.43·2^n digits.\n"
-        "  Formula is NOT a valid Mersenne primality test beyond n=2.\n\n";
+        "\nObservations (L-L sequence):\n"
+        "  • n=1 (p=2): s₀=4, M₂=3: mod=1  — p=2 is the standard L-L exception;\n"
+        "    M₂=3 IS prime but the test requires s_{p-2}=s₀ which gives 1, not 0.\n"
+        "  • n=2 (p=3): s₁=14, M₃=7: mod=0  — M₃=7 prime ✓\n"
+        "  • n=4 (p=5): s₃=37634, M₅=31: mod=0 — M₅=31 prime ✓\n"
+        "  • n=6 (p=7): s₅=…, M₇=127: mod=0 — M₇=127 prime ✓\n"
+        "  • All composite M_{n+1} correctly yield non-zero remainders.\n"
+        "  Table is precomputed for n=1..10 (p=2..11); for p>11 the algebraic\n"
+        "  L-L path (is_sequence_zero) is used instead.\n\n";
 }
 
-// Primality check via the formula for prime exponent p (tests M_p = 2^p − 1).
-// The mapping is: exponent p → sequence index n = p − 1 → a(n) mod (2^p − 1).
-// Only feasible for p − 1 ≤ 10, i.e. p ≤ 11.
-// Returns false for p > 11 (infeasible with floating-point arithmetic).
+// Primality check via the precomputed L-L sequence table for prime exponent p.
+// Checks s_{p-2} ≡ 0 (mod M_p) using the stored mod value.
+// Mapping: exponent p → table index n = p−1 → s_{n-1} mod (2^p−1).
+// Covers p ≤ 11 (n ≤ 10); returns false for p > 11 (use is_sequence_zero instead).
+// Note: p=2 is the standard L-L exception — M₂=3 is prime but this returns false.
 static bool formula_sequence_zero(int p) {
     if (p < 2) return false;
     const int n = p - 1;
@@ -1127,13 +1132,12 @@ static void run_formula_benchmark() {
 
     std::cout <<
         "\nConclusion:\n"
-        "  The formula is faster for p ≤ 11 (table lookup ≈ 1–3 ns).\n"
-        "  However it is NOT kept because:\n"
-        "    1. It produces false negatives for M₂, M₅, M₇, M₁₁ (all tested\n"
-        "       prime exponents except M₃ within the n=1..10 table).\n"
-        "    2. For p > 11 it requires ~0.43·2^p decimal digits of precision\n"
-        "       to evaluate the ceiling — exponentially worse than LL.\n"
-        "  The Lucas-Lehmer algebraic method is correct for ALL p and is kept.\n\n";
+        "  The precomputed L-L table is faster for p ≤ 11 (lookup ≈ 1 ns).\n"
+        "  It is correct for p=3,5,7 and all composite M_{n+1} in the table.\n"
+        "  p=2 is the standard L-L exception: M₂=3 is prime but s₀ mod 3 = 1.\n"
+        "  For p > 11 the table is not available; is_sequence_zero() is used.\n"
+        "  The Lucas-Lehmer algebraic method is correct for ALL p and is kept\n"
+        "  as the primary path to handle arbitrary exponents.\n\n";
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
