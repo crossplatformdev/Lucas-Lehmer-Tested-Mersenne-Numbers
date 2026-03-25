@@ -14,7 +14,7 @@ run-name: "Seqmod Range · ${{ inputs.low_cap }}..${{ inputs.high_cap }}"
 #
 # Workflow stages:
 #   1. validate          – reject invalid inputs early
-#   2. build             – compile sequence_powermod (sanity-check before dispatch)
+#   2. build             – compile bin/bignum (sanity-check before dispatch)
 #   3. plan_and_dispatch – sieve [low_cap, high_cap], create batches of 4 primes,
 #                          call gh api to dispatch one new run per batch
 #
