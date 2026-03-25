@@ -209,7 +209,7 @@ jobs:
                   "p3": str(p3),
                   "p4": str(p4),
                   "time_limit_seconds": time_limit,
-                  "dry_run":            dry_run,
+                  "dry_run":            "true" if dry_run else "false",
               }
               payload = json.dumps({"ref": ref_name, "inputs": inputs})
               if dry_run:
