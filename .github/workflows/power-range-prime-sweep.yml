@@ -234,7 +234,7 @@ jobs:
       cache-key: ${{ steps.cache-key.outputs.key }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Compute cache key
         id: cache-key
@@ -250,7 +250,7 @@ jobs:
         run: make all
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bignum-binary
           path: bin/bignum
@@ -313,7 +313,7 @@ jobs:
           echo "chunk_index validated: ${CHUNK_INDEX}, chunk_size validated: ${CHUNK_SIZE}"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Compile plan tool
         run: |
@@ -321,7 +321,7 @@ jobs:
           gcc -std=c11 -O2 -o bin/split_bucket_batches src/split_bucket_batches.c -lm
 
       - name: Download bignum binary for timing calibration
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: bignum-binary
           path: bin/
@@ -446,10 +446,10 @@ jobs:
         include: ${{ fromJson(needs.plan.outputs.batch_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download binary artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: bignum-binary
           path: bin/
@@ -502,7 +502,7 @@ jobs:
 
       - name: Upload batch artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.worker_name }}-results
           path: batch_out/bucket_${{ matrix.bucket_n }}/
@@ -519,10 +519,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all batch artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: bucket-*-batch-*-results
           path: batch_artifacts/
@@ -616,7 +616,7 @@ jobs:
 
       - name: Upload merged results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bucket-sweep-merged-results
           path: |

@@ -58,7 +58,7 @@ jobs:
       cache-key: ${{ steps.cache-key.outputs.key }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Compute cache key
         id: cache-key
@@ -94,7 +94,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Restore binary
         uses: actions/cache@v4
@@ -138,7 +138,7 @@ jobs:
 
       - name: Upload discover artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: discover-results-shard-0
           path: discover_out/
@@ -176,7 +176,7 @@ jobs:
           exit 1
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Restore binary
         uses: actions/cache@v4
@@ -219,7 +219,7 @@ jobs:
 
       - name: Upload discover artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: discover-results-shard-${{ matrix.shard_index }}
           path: discover_out/

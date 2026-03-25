@@ -169,7 +169,7 @@ jobs:
 
       # ── 2. Checkout ─────────────────────────────────────────────────────
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ── 3. Install toolchain ─────────────────────────────────────────────
       - name: Install toolchain
@@ -528,7 +528,7 @@ jobs:
       # ── 10. Upload checkpoint artifact (soft-stop path) ───────────────────
       - name: Upload checkpoint artifact
         if: steps.ll_run.outputs.run_status == 'timed_out_resume_needed' && steps.ll_run.outputs.chk_out != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.save_state.outputs.chk_artifact_name }}
           path: checkpoint_out/ll_chk_*.bin
@@ -538,7 +538,7 @@ jobs:
       # ── 11. Upload chain state artifact ──────────────────────────────────
       - name: Upload chain state artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: chain-state-${{ inputs.chain_id }}
           path: chain_state_out/chain_state.json
@@ -548,7 +548,7 @@ jobs:
       # ── 12. Upload per-run artifacts ──────────────────────────────────────
       - name: Upload per-run results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: "run-results-${{ inputs.chain_id }}-p${{ steps.plan.outputs.current_exponent }}-${{ steps.ll_run.outputs.run_status }}-${{ github.run_id }}"
           path: |

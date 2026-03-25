@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -57,7 +57,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -78,7 +78,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -98,7 +98,7 @@ jobs:
           head -50 prof_report.txt
 
       - name: Upload profiler report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: gprof-report
           path: prof_report.txt
@@ -113,7 +113,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -178,7 +178,7 @@ jobs:
           make bench-ci BENCH_LL_THREADS=4 BENCH_FFT_THREADS=2 BENCH_FFT_ALLOW_NESTED=1
 
       - name: Upload benchmark CSV artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results
           path: bin/bench_ci_*.csv
@@ -192,7 +192,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -234,7 +234,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload cluster power report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: cluster-power-report
           path: cluster_power_report.txt

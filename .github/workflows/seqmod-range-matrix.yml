@@ -136,7 +136,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -157,7 +157,7 @@ jobs:
         run: gzip -9 bin/sequence_powermod
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: seqmod-range-binary
           path: bin/sequence_powermod.gz
@@ -174,8 +174,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      batch_matrix: ${{ steps.make-matrix.outputs.batch_matrix }}
-      batch_count:  ${{ steps.make-matrix.outputs.batch_count }}
+      batch_matrix:     ${{ steps.make-matrix.outputs.batch_matrix }}
+      batch_count:      ${{ steps.make-matrix.outputs.batch_count }}
+      plan_elapsed_sec: ${{ steps.make-matrix.outputs.plan_elapsed_sec }}
     steps:
       - name: Enumerate primes and build matrix
         id: make-matrix
@@ -190,6 +191,8 @@ jobs:
           echo "Range  : [${LOW}, ${HIGH}]"
           echo "Workers: ${WORKERS}"
           echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          PLAN_START=$(date +%s)
 
           python3 - <<'PYEOF'
           import json, math, os, sys
@@ -305,6 +308,22 @@ jobs:
               gh_out.write(f"batch_count={len(batches)}\n")
           PYEOF
 
+          PLAN_ELAPSED=$(( $(date +%s) - PLAN_START ))
+          echo "plan_elapsed_sec=${PLAN_ELAPSED}" >> "$GITHUB_OUTPUT"
+
+          # Write step summary showing plan duration (warm-up time).
+          # Visible in both dry_run (planning) and normal run modes.
+          {
+            echo "## 📋 Planning Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Range | [${LOW}, ${HIGH}] |"
+            echo "| Workers | ${WORKERS} |"
+            echo "| Dry run | ${{ inputs.dry_run }} |"
+            echo "| Planning time (warm-up) | ${PLAN_ELAPSED} s |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ──────────────────────────────────────────────────────────
   # Stage 4: Workers – one job per batch (up to 256 parallel).
   #
@@ -330,7 +349,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: Download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: seqmod-range-binary
           path: bin/
@@ -427,7 +446,7 @@ jobs:
 
       - name: Upload results artifact
         if: always() && !inputs.dry_run
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: seqmod-range-results-${{ matrix.worker_name }}
           path: worker_out/${{ matrix.worker_name }}.csv
@@ -436,7 +455,7 @@ jobs:
 
       - name: Upload state artifact
         if: always() && !inputs.dry_run
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: seqmod-range-state-${{ matrix.worker_name }}
           path: worker_out/${{ matrix.worker_name }}_state.json
@@ -486,20 +505,20 @@ jobs:
   # ──────────────────────────────────────────────────────────
   merge:
     name: Merge results and write report
-    needs: worker
+    needs: [worker, plan]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Download all results artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: seqmod-range-results-*
           path: results/
           merge-multiple: true
 
       - name: Download all state artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: seqmod-range-state-*
           path: states/
@@ -556,6 +575,9 @@ jobs:
             echo "| Workers requested | ${{ inputs.workers }} |"
             echo "| Threads per worker | ${{ inputs.threads }} |"
             echo "| Per-worker time limit | ${{ inputs.time_limit_seconds }} s |"
+            PLAN_SEC="${{ needs.plan.outputs.plan_elapsed_sec }}"
+            if [ -z "${PLAN_SEC}" ]; then PLAN_SEC="n/a"; fi
+            echo "| Planning time (warm-up) | ${PLAN_SEC} s |"
             echo "| Total prime exponents tested | ${TOTAL} |"
             echo "| Mersenne primes found | ${PRIMES} |"
             echo "| Workers that timed out | ${TIMEOUTS} |"
@@ -630,7 +652,7 @@ jobs:
 
       - name: Upload merged results artifact
         if: hashFiles('merged_results.zip') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: seqmod-range-merged-results
           path: merged_results.zip

@@ -150,7 +150,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -171,7 +171,7 @@ jobs:
         run: gzip -9 bin/sequence_powermod
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: seqmod-binary-epoch${{ inputs.run_epoch }}
           path: bin/sequence_powermod.gz
@@ -271,7 +271,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: Download binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: seqmod-binary-epoch${{ matrix.epoch }}
           path: bin/
@@ -500,7 +500,7 @@ jobs:
 
       - name: Upload results artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: seqmod-results-${{ matrix.worker_name }}
           path: worker_out/${{ matrix.worker_name }}.csv
@@ -509,7 +509,7 @@ jobs:
 
       - name: Upload state artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: seqmod-state-${{ matrix.worker_name }}
           path: worker_out/${{ matrix.worker_name }}_state.json
@@ -564,7 +564,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Download all state artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: seqmod-state-*
           path: states/
@@ -742,7 +742,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download all results artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: seqmod-results-*
           path: results/
@@ -772,7 +772,7 @@ jobs:
           echo "Mersenne primes found   : ${PRIMES}"
 
       - name: Download all state artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: seqmod-state-*
           path: states/
@@ -874,7 +874,7 @@ jobs:
 
       - name: Upload merged results artifact
         if: hashFiles('merged_results.zip') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: seqmod-merged-results-epoch${{ inputs.run_epoch }}
           path: merged_results.zip
