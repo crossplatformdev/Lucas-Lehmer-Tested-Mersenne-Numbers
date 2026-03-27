@@ -68,7 +68,16 @@ PERF_LDFLAGS  := -pthread
 CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
 CALLGRIND_LDFLAGS  := -pthread
 
-.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-prof seqmod-bench seqmod-asm seqmod-asm-prof seqmod-asm-bench
+# expr_mod_gmp: standalone GMP-based Mersenne recurrence evaluator.
+# Computes S(n) mod (2^(n+2)-1) where S(0)=4, S(k+1)=S(k)^2-2.
+# Usage: bin/expr_mod_gmp <n>
+# Set EXPR_PROFILE=1 in the environment to emit per-operation timing.
+EXPR_MOD_GMP_SRC      := src/expr_mod_gmp.cpp
+EXPR_MOD_GMP_BIN      := bin/expr_mod_gmp
+EXPR_MOD_GMP_CXXFLAGS := -std=c++20 -O3 -march=native -mtune=native -Wall -Wextra -Wpedantic
+EXPR_MOD_GMP_LDFLAGS  := -lgmp
+
+.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-prof seqmod-bench seqmod-asm seqmod-asm-prof seqmod-asm-bench expr-mod-gmp
 
 BENCH_START_INDEX ?= 14
 
