@@ -1,0 +1,180 @@
+name: Retag Past LL Runs
+run-name: "Retag Past LL Runs · dry_run=${{ inputs.dry_run }}"
+
+# One-shot manual workflow that scans every completed run of
+# seqmod-4prime-worker.yml and prepends the correct emoji tag:
+#
+#   🍋  – run found a known Mersenne prime (exponent ≤ 136279841)
+#   🥇  – run found a new Mersenne prime   (exponent > 136279841)
+#
+# Runs that are already tagged (start with 🍋 or 🥇) are skipped.
+# Runs in the old "🎉 MERSENNE PRIME M_p · LL · p=…" format are
+# converted to the new short format.
+# Unsuccessful runs (conclusion ≠ success) are skipped unless they
+# carry the old 🎉 prefix (those were renamed by the API so they
+# definitely found a prime).
+#
+# Inputs:
+#   dry_run   – print what would be renamed without calling the API
+#               (default: true – safe to run without side-effects)
+#   max_pages – stop after scanning this many pages (100 runs/page);
+#               0 means scan all pages (default: 0)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print plan only – do not rename any runs"
+        required: false
+        type: boolean
+        default: true
+      max_pages:
+        description: "Max pages to scan (100 runs/page, 0 = all)"
+        required: false
+        type: string
+        default: "0"
+
+permissions:
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  retag:
+    name: "Retag past runs (dry_run=${{ inputs.dry_run }})"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Scan and retag
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, subprocess, re, time
+
+          KNOWN = {
+              2, 3, 5, 7, 13, 17, 19, 31, 61, 89, 107, 127, 521, 607, 1279, 2203,
+              2281, 3217, 4253, 4423, 9689, 9941, 11213, 19937, 21701, 23209, 44497,
+              86243, 110503, 132049, 216091, 756839, 859433, 1257787, 1398269,
+              2976221, 3021377, 6972593, 13466917, 20996011, 24036583, 25964951,
+              30402457, 32582657, 37156667, 42643801, 43112609, 57885161, 74207281,
+              77232917, 82589933, 136279841,
+          }
+
+          DRY_RUN  = os.environ.get('DRY_RUN',   'true').lower() in ('true', '1', 'yes')
+          MAX_PAGES = int(os.environ.get('MAX_PAGES', '0') or '0')
+          REPO     = os.environ['GITHUB_REPOSITORY']
+
+          renamed_count  = 0
+          skipped_count  = 0
+          page           = 1
+
+          print(f"{'[DRY RUN] ' if DRY_RUN else ''}Scanning seqmod-4prime-worker.yml runs in {REPO}")
+          print(f"max_pages={'unlimited' if MAX_PAGES == 0 else MAX_PAGES}")
+          print()
+
+          while True:
+              if MAX_PAGES > 0 and page > MAX_PAGES:
+                  print(f"Reached max_pages={MAX_PAGES}, stopping.")
+                  break
+
+              result = subprocess.run(
+                  ['gh', 'api',
+                   f'repos/{REPO}/actions/workflows/seqmod-4prime-worker.yml/runs'
+                   f'?per_page=100&page={page}'],
+                  capture_output=True, text=True,
+              )
+              if result.returncode != 0:
+                  print(f"API error on page {page}: {result.stderr.strip()}")
+                  break
+
+              data = json.loads(result.stdout)
+              runs = data.get('workflow_runs', [])
+
+              if not runs:
+                  print(f"No more runs on page {page}. Scan complete.")
+                  break
+
+              print(f"Page {page}: {len(runs)} runs", flush=True)
+
+              for run in runs:
+                  run_id    = run['id']
+                  title     = run['display_title']
+                  conclusion = run.get('conclusion', '')
+
+                  # ── Already correctly tagged – skip ──────────────────────
+                  if title.startswith('🍋') or title.startswith('🥇'):
+                      skipped_count += 1
+                      continue
+
+                  # ── Old "🎉 MERSENNE PRIME M_p · LL · p=…" format ────────
+                  # These were renamed by the API so the prime was confirmed.
+                  if '🎉' in title or ('MERSENNE' in title and 'PRIME' in title):
+                      m        = re.search(r'M_(\d+)', title)
+                      ll_match = re.search(r'(LL\s*·\s*p=.+)', title)
+                      if not m or not ll_match:
+                          continue
+                      p       = int(m.group(1))
+                      tag     = '🍋' if p in KNOWN else '🥇'
+                      new_title = f"{tag} {ll_match.group(1).strip()}"
+
+                  # ── Normal "LL · p=X, Y, Z, W" run that succeeded ────────
+                  elif conclusion == 'success':
+                      m = re.search(r'p=(.+)', title)
+                      if not m:
+                          continue
+                      # Extract bare integers; "N/A" entries are ignored.
+                      exps = [int(tok) for tok in re.findall(r'\b(\d+)\b', m.group(1))]
+                      found_known = [e for e in exps if e in KNOWN]
+                      if not found_known:
+                          continue
+                      new_title = f"🍋 {title}"
+
+                  # ── Failed / timed-out runs without old emoji ─────────────
+                  else:
+                      continue
+
+                  prefix = '[DRY RUN] ' if DRY_RUN else ''
+                  print(f"{prefix}run {run_id}:")
+                  print(f"  from: {title!r}")
+                  print(f"    to: {new_title!r}")
+                  renamed_count += 1
+
+                  if not DRY_RUN:
+                      r = subprocess.run(
+                          ['gh', 'api', '--method', 'PATCH',
+                           f'repos/{REPO}/actions/runs/{run_id}',
+                           '-f', f'display_title={new_title}'],
+                          capture_output=True, text=True,
+                      )
+                      if r.returncode == 0:
+                          print(f"  ✅ renamed.")
+                      else:
+                          print(f"  ⚠️  failed: {r.stderr.strip()}")
+                      time.sleep(0.3)   # stay well under the API rate limit
+
+              page += 1
+
+          print()
+          print('=' * 60)
+          action = 'to rename (dry run)' if DRY_RUN else 'renamed'
+          print(f"Runs {action}         : {renamed_count}")
+          print(f"Runs already tagged (skipped): {skipped_count}")
+          PYEOF
+
+      - name: Write step summary
+        if: always()
+        run: |
+          {
+            echo "## Retag Past LL Runs"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Mode | ${{ inputs.dry_run == true && '📋 dry run' || '✅ live' }} |"
+            echo "| Max pages | ${{ inputs.max_pages == '0' && 'unlimited' || inputs.max_pages }} |"
+            echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
