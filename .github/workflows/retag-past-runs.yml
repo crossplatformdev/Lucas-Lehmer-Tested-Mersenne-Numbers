@@ -66,7 +66,10 @@ jobs:
           }
 
           DRY_RUN   = os.environ.get('DRY_RUN',   'true').lower() in ('true', '1', 'yes')
-          MAX_PAGES = int(os.environ.get('MAX_PAGES', '0') or '0')
+          raw_max_pages = (os.environ.get('MAX_PAGES', '0') or '0').strip()
+          if not re.fullmatch(r'\d+', raw_max_pages):
+              raise SystemExit(f"Invalid MAX_PAGES={raw_max_pages!r}: must be a non-negative integer (digits only).")
+          MAX_PAGES = int(raw_max_pages)
           REPO      = os.environ['GITHUB_REPOSITORY']
 
           renamed_count = 0
@@ -164,19 +167,57 @@ jobs:
                   print(f"    to: {new_title!r}")
 
                   if not DRY_RUN:
-                      r = subprocess.run(
-                          ['gh', 'api', '--method', 'PATCH',
-                           f'repos/{REPO}/actions/runs/{run_id}',
-                           '-f', f'display_title={new_title}'],
-                          capture_output=True, text=True,
-                      )
-                      if r.returncode == 0:
-                          print(f"  ✅ renamed.")
-                          renamed_count += 1
-                      else:
-                          print(f"  ⚠️  failed: {r.stderr.strip()}")
+                      # Try to be gentle with GitHub's rate limits: retry on
+                      # rate-limit-style errors with exponential backoff, and
+                      # keep a conservative steady-state pacing between renames.
+                      max_attempts = 5
+                      backoff = 2.0
+                      attempt = 0
+                      while True:
+                          attempt += 1
+                          r = subprocess.run(
+                              ['gh', 'api', '--method', 'PATCH',
+                               f'repos/{REPO}/actions/runs/{run_id}',
+                               '-f', f'display_title={new_title}'],
+                              capture_output=True, text=True,
+                          )
+                          if r.returncode == 0:
+                              print(f"  ✅ renamed.")
+                              renamed_count += 1
+                              break
+                          err = r.stderr.strip()
+                          print(f"  ⚠️  failed (attempt {attempt}/{max_attempts}): {err}")
+                          lower_err = err.lower()
+                          is_rate_limited = any(
+                              token in lower_err
+                              for token in ('rate limit', 'secondary rate limit', 'abuse detection')
+                          )
+                          if is_rate_limited and attempt < max_attempts:
+                              # Honor a Retry-After hint if present in the error text, otherwise
+                              # use an exponential backoff capped at 60 seconds.
+                              retry_after = None
+                              for line in err.splitlines():
+                                  if 'retry-after' in line.lower():
+                                      parts = line.split(':', 1)
+                                      if len(parts) == 2:
+                                          try:
+                                              retry_after = float(parts[1].strip())
+                                          except ValueError:
+                                              pass
+                                      break
+                              sleep_for = retry_after if retry_after is not None else backoff
+                              if sleep_for < 0:
+                                  sleep_for = 0
+                              print(f"  ⏱️  rate limited, sleeping {sleep_for:.1f}s before retry...")
+                              time.sleep(sleep_for)
+                              backoff = min(backoff * 2.0, 60.0)
+                              continue
+                          # Non-rate-limit failure or out of retries: count and move on.
                           failed_count += 1
-                      time.sleep(0.1)   # 100 ms ≈ 600 renames/min, well within rate limits
+                          break
+                      # Conservative pacing between successful/attempted renames to
+                      # avoid tripping primary/secondary write limits.
+                      time.sleep(0.5)   # 500 ms ≈ 120 renames/min
                   else:
                       renamed_count += 1
 
