@@ -1,11 +1,11 @@
 name: expr-mod-gmp
 run-name: "expr-mod-gmp · ${{ github.ref_name }}"
 
-# Runs the GMP-based S(n) mod (2^(n+2)-1) recurrence evaluator via
-# scripts/run_expr_mod_gmp.sh (Bash equivalent of the PowerShell runner).
+# Runs the Mersenne pipeline binary (bin/ll_fft) via
+# scripts/run_expr_mod_gmp.sh.
 #
 # Two phases:
-#   1. build  – compile bin/expr_mod_gmp from src/expr_mod_gmp.cpp
+#   1. build  – compile bin/ll_fft from src/ll_fft.cpp (no GMP required)
 #   2. run    – execute the batch + search runner and upload the CSV
 #
 # On push to main  → conservative sanity run (known_limit=10, search in the
@@ -31,11 +31,6 @@ on:
         description: "Max prime candidates to evaluate during search"
         required: false
         default: "1000000"
-      profile:
-        description: "Set EXPR_PROFILE=1 for per-operation timing"
-        required: false
-        type: boolean
-        default: false
   push:
     branches: ["main"]
 
@@ -47,52 +42,47 @@ env:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 1 – Build bin/expr_mod_gmp
+  # Job 1 – Build bin/ll_fft
   # ──────────────────────────────────────────────────────────────────────────
   build:
-    name: Build expr_mod_gmp
+    name: Build ll_fft
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install toolchain (g++, GMP)
+      - name: Install toolchain (g++)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq g++ make libgmp-dev
+          sudo apt-get install -y -qq g++ make
 
-      - name: Build bin/expr_mod_gmp
+      - name: Build bin/ll_fft
         run: make expr-mod-gmp
 
       - name: Verify binary
         run: |
-          test -x bin/expr_mod_gmp || { echo "MISSING: bin/expr_mod_gmp"; exit 1; }
-          echo "OK: bin/expr_mod_gmp  ($(du -sh bin/expr_mod_gmp | cut -f1))"
+          test -x bin/ll_fft || { echo "MISSING: bin/ll_fft"; exit 1; }
+          echo "OK: bin/ll_fft  ($(du -sh bin/ll_fft | cut -f1))"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v6
         with:
           name: expr-mod-gmp-bin
-          path: bin/expr_mod_gmp
+          path: bin/ll_fft
           retention-days: 1
 
   # ──────────────────────────────────────────────────────────────────────────
   # Job 2 – Run the batch + search script
   # ──────────────────────────────────────────────────────────────────────────
   run:
-    name: Run expr_mod_gmp (batch + search)
+    name: Run ll_fft (batch + search)
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
-      - name: Install runtime dependencies (GMP)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libgmp-dev
 
       - name: Download binary artifact
         uses: actions/download-artifact@v4
@@ -101,7 +91,7 @@ jobs:
           path: bin/
 
       - name: Restore execute permission
-        run: chmod +x bin/expr_mod_gmp
+        run: chmod +x bin/ll_fft
 
       # On push to main: lightweight sanity run (KNOWN_LIMIT=10, search in
       # the 600s so each call takes milliseconds).
@@ -114,13 +104,11 @@ jobs:
             echo "known_limit=10"           >> "$GITHUB_OUTPUT"
             echo "search_start=600"         >> "$GITHUB_OUTPUT"
             echo "max_prime_checks=20"      >> "$GITHUB_OUTPUT"
-            echo "profile=0"                >> "$GITHUB_OUTPUT"
           else
             echo "batch_size=${{ inputs.batch_size }}"                    >> "$GITHUB_OUTPUT"
             echo "known_limit=${{ inputs.known_limit }}"                  >> "$GITHUB_OUTPUT"
             echo "search_start=${{ inputs.search_start }}"                >> "$GITHUB_OUTPUT"
             echo "max_prime_checks=${{ inputs.max_prime_checks }}"        >> "$GITHUB_OUTPUT"
-            echo "profile=${{ inputs.profile == 'true' && '1' || '0' }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Print run configuration
@@ -132,11 +120,10 @@ jobs:
           echo "known_limit      = ${{ steps.params.outputs.known_limit }}"
           echo "search_start     = ${{ steps.params.outputs.search_start }}"
           echo "max_prime_checks = ${{ steps.params.outputs.max_prime_checks }}"
-          echo "profile          = ${{ steps.params.outputs.profile }}"
 
       - name: Run batch + search
         env:
-          EXPR_PROFILE: "${{ steps.params.outputs.profile }}"
+          EXPR_BIN: "${{ github.workspace }}/bin/ll_fft"
         run: |
           chmod +x scripts/run_expr_mod_gmp.sh
           scripts/run_expr_mod_gmp.sh \

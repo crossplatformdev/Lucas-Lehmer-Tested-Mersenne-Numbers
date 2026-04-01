@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # scripts/run_expr_mod_gmp.sh
 #
-# Bash equivalent of the PowerShell runner for expr_mod_gmp.
+# Bash runner for bin/ll_fft – the Mersenne pipeline binary.
 #
-# Computes S(n) mod (2^(n+2)-1) [where S(0)=4, S(k+1)=S(k)^2-2] for:
+# Computes s_{p-2} mod (2^p - 1) for:
 #   1. Every known Mersenne-prime exponent (in batches).
-#   2. A forward search from SEARCH_START for the first prime exponent
-#      whose result is 0 (i.e. a Mersenne-prime candidate).
+#   2. A forward search from SEARCH_START for the first prime p
+#      whose result is 0 (i.e. a new Mersenne-prime candidate).
 #
 # Usage:
 #   scripts/run_expr_mod_gmp.sh [BATCH_SIZE [SEARCH_START [MAX_PRIME_CHECKS [KNOWN_LIMIT]]]]
@@ -22,7 +22,6 @@
 #   EXPR_KNOWN_LIMIT      EXPR_BIN            EXPR_SRC
 #
 # Outputs a CSV file to bin/expr_batch_results_<timestamp>.csv.
-# Set EXPR_PROFILE=1 to emit per-operation timing from the binary.
 #
 # Notes on integer-overflow safety:
 #   The Miller-Rabin primality test uses bash 64-bit signed arithmetic.
@@ -42,13 +41,14 @@ SEARCH_START="${EXPR_SEARCH_START:-${2:-136279841}}"
 MAX_PRIME_CHECKS="${EXPR_MAX_PRIME_CHECKS:-${3:-1000000}}"
 KNOWN_LIMIT="${EXPR_KNOWN_LIMIT:-${4:-0}}"
 
-EXE="${EXPR_BIN:-${REPO_ROOT}/bin/expr_mod_gmp}"
-SRC="${EXPR_SRC:-${REPO_ROOT}/src/expr_mod_gmp.cpp}"
+EXE="${EXPR_BIN:-${REPO_ROOT}/bin/ll_fft}"
+SRC="${EXPR_SRC:-${REPO_ROOT}/src/ll_fft.cpp}"
 
 # ── Build if necessary ───────────────────────────────────────────────────────
 if [[ ! -x "${EXE}" ]]; then
-    echo "[$(date)] Building expr_mod_gmp..."
-    g++ -O3 -std=c++20 -o "${EXE}" "${SRC}" -lgmp
+    echo "[$(date)] Building ll_fft..."
+    g++ -O3 -std=c++17 -march=native -mtune=native -Wall -Wextra -Wpedantic \
+        -o "${EXE}" "${SRC}"
 fi
 
 # ── Known Mersenne-prime exponents ───────────────────────────────────────────
@@ -221,7 +221,7 @@ while (( prime_checks < MAX_PRIME_CHECKS )); do
             "${prime_checks}" "${candidate}" "${INVOKE_RESULT}" "${INVOKE_ELAPSED_MS}" \
             >> "${CSV_PATH}"
 
-        if [[ "${INVOKE_RESULT}" == "0" ]]; then
+        if [[ "${INVOKE_RESULT}" == "Residuo = 0" ]]; then
             printf "FOUND,,,%s,0,\n" "${candidate}" >> "${CSV_PATH}"
             echo ""
             echo "First prime exponent with result 0: ${candidate}"

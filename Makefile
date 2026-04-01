@@ -68,14 +68,13 @@ PERF_LDFLAGS  := -pthread
 CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
 CALLGRIND_LDFLAGS  := -pthread
 
-# expr_mod_gmp: standalone GMP-based Mersenne recurrence evaluator.
-# Computes S(n) mod (2^(n+2)-1) where S(0)=4, S(k+1)=S(k)^2-2.
-# Usage: bin/expr_mod_gmp <n>
-# Set EXPR_PROFILE=1 in the environment to emit per-operation timing.
-EXPR_MOD_GMP_SRC      := src/expr_mod_gmp.cpp
-EXPR_MOD_GMP_BIN      := bin/expr_mod_gmp
-EXPR_MOD_GMP_CXXFLAGS := -std=c++20 -O3 -march=native -mtune=native -Wall -Wextra -Wpedantic
-EXPR_MOD_GMP_LDFLAGS  := -lgmp
+# ll_fft: Mersenne pipeline – limb-based Lucas-Lehmer with prefiltros.
+# Computes s_{p-2} mod (2^p - 1) for a given Mersenne exponent p.
+# Usage: bin/ll_fft <p> [--factor-limit N] [--hex] [--force-ll] [--selftest]
+EXPR_MOD_GMP_SRC      := src/ll_fft.cpp
+EXPR_MOD_GMP_BIN      := bin/ll_fft
+EXPR_MOD_GMP_CXXFLAGS := -std=c++17 -O3 -march=native -mtune=native -Wall -Wextra -Wpedantic
+EXPR_MOD_GMP_LDFLAGS  :=
 
 .PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-prof seqmod-bench seqmod-asm seqmod-asm-prof seqmod-asm-bench expr-mod-gmp
 
@@ -83,7 +82,7 @@ $(EXPR_MOD_GMP_BIN): $(EXPR_MOD_GMP_SRC)
 	@mkdir -p bin
 	$(CXX) $(EXPR_MOD_GMP_CXXFLAGS) $< -o $@ $(EXPR_MOD_GMP_LDFLAGS)
 
-# expr-mod-gmp: build the standalone GMP recurrence evaluator.
+# expr-mod-gmp: build the Mersenne pipeline binary (bin/ll_fft).
 expr-mod-gmp: $(EXPR_MOD_GMP_BIN)
 
 BENCH_START_INDEX ?= 14
