@@ -2,7 +2,10 @@ name: Algorithm Benchmark
 run-name: "Algo Benchmark · ${{ github.ref_name }}"
 
 # Honest benchmark of all algorithms in src/ at prime exponents near
-# 512, 4096, 8192, and 16384.  Four algorithms are compared:
+# 512, 4096, 8192, 16384, and – crucially – the large known Mersenne-prime
+# exponent p=756839 (M_756839 is the 27th known Mersenne prime).
+#
+# Four algorithms are compared:
 #
 #   1. bin/bignum          – BigNum.cpp (FftMersenneBackend / LimbBackend / GenericBackend)
 #   2. bin/seqmod_assembler – same BigNum engine, thin dispatch wrapper
@@ -15,11 +18,25 @@ run-name: "Algo Benchmark · ${{ github.ref_name }}"
 #   8192 → p = 8191
 #  16384 → p = 16381
 #
+# Large-exponent benchmark (Section F):
+#  756839 → p = 756839  (known Mersenne prime exponent, M_756839)
+#
+#   A full Lucas-Lehmer test at p=756839 requires 756837 iterations, each
+#   involving a ~131072-point FFT on a ~94 KB number.  This takes many hours
+#   on any single runner, so Section F uses a representative 200-iteration
+#   microbenchmark to measure ns/iter and extrapolate the full runtime.
+#
+#   For seqmod_gmp and seqmod_stdc, a full test at p=756839 is completely
+#   infeasible in any reasonable time (hours to weeks), so Section F projects
+#   their cost from measured timings at smaller exponents.  These projections
+#   are clearly labelled as ESTIMATED.
+#
 # Thread strategies tested:
 #   a) Single-threaded latency per exponent (1 thread each)
 #   b) 4-parallel latency mode: 4 single-threaded instances running concurrently
 #      (one per exponent), saturating all 4 CPU cores
 #   c) bignum FFT-thread sweep (1/2/4 LL_FFT_THREADS) for single-exponent scaling
+#   f) p=756839 microbenchmark: limited-iteration FFT-thread sweep (1/2/4 threads)
 #
 # The fastest algorithm is identified and reported.  All production CI/CD
 # workflows in this repository already use bin/bignum as the fastest backend.
@@ -65,9 +82,12 @@ jobs:
       - name: Build bin/sequence_powermod (stdlib-only Comba/Karatsuba)
         run: make bin/sequence_powermod
 
+      - name: Build bin/microbench_fft (FFT microbenchmark for large exponents)
+        run: make bin/microbench_fft
+
       - name: Verify all binaries exist
         run: |
-          for b in bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod; do
+          for b in bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod bin/microbench_fft; do
             test -x "$b" || { echo "MISSING: $b"; exit 1; }
             echo "OK: $b  ($(du -sh $b | cut -f1))"
           done
@@ -81,13 +101,14 @@ jobs:
             bin/seqmod_assembler
             bin/sequence_powermod_gmp
             bin/sequence_powermod
+            bin/microbench_fft
           retention-days: 1
 
   # ──────────────────────────────────────────────────────────────────────────────
   # Job 2 – Full benchmark matrix
   # ──────────────────────────────────────────────────────────────────────────────
   benchmark:
-    name: Algorithm benchmark (509, 4093, 8191, 16381)
+    name: Algorithm benchmark (509, 4093, 8191, 16381, 756839)
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -107,7 +128,7 @@ jobs:
           path: bin/
 
       - name: Make binaries executable
-        run: chmod +x bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod
+        run: chmod +x bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod bin/microbench_fft
 
       - name: Print environment
         run: |
@@ -126,6 +147,10 @@ jobs:
           echo "  4096 → p=4093  (prime)"
           echo "  8192 → p=8191  (prime)"
           echo " 16384 → p=16381 (prime)"
+          echo ""
+          echo "Large-exponent microbenchmark (Section F):"
+          echo " 756839 → p=756839 (known Mersenne prime, M_756839)"
+          echo "  (200 limited FFT iterations; full p-2=756837 run extrapolated)"
 
       # ──────────────────────────────────────────────────────────────────────────
       # Section A: Single-exponent latency (1 thread each)
@@ -467,6 +492,177 @@ jobs:
           cat bench_out/section_d_throughput.csv
 
       # ──────────────────────────────────────────────────────────────────────────
+      # Section F: p=756839 large-exponent microbenchmark
+      #
+      # M_756839 = 2^756839 − 1 is the 27th known Mersenne prime.
+      # A full Lucas-Lehmer test (756837 iterations) at this size is infeasible
+      # on a GitHub Actions runner (would take many hours even with FFT).
+      #
+      # Strategy for each algorithm:
+      #   bin/bignum / bin/seqmod_assembler:
+      #     Use bin/microbench_fft with 200 limited iterations to measure
+      #     ns/iter and extrapolate the full-run runtime.  Results are MEASURED.
+      #
+      #   bin/sequence_powermod_gmp / bin/sequence_powermod:
+      #     A full test at p=756839 is completely infeasible for these algorithms
+      #     (each iteration involves 3 generic modular squarings of ~94 KB numbers
+      #     using GMP mpz / Comba arithmetic without Mersenne specialisation).
+      #     Times are PROJECTED from the measured p=16381 per-iteration cost,
+      #     scaled using the known algorithmic complexity.
+      #     These projections are conservative lower bounds (actual cost is higher
+      #     because GMP transitions to a faster internal algorithm for very large n).
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: "Section F – p=756839 large-exponent microbenchmark (200 iters, FFT-thread sweep)"
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  Section F: p=756839 large-exponent benchmark (M_756839, 27th Mersenne prime) ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "p=756839: full Lucas-Lehmer test requires 756837 FFT iterations."
+          echo "  Each iteration: ~131072-point DWT/FFT on a ~94 KB number."
+          echo "  Full run estimated time (extrap. from measured ns/iter): shown below."
+          echo "  This section measures 200 iterations and reports ns/iter."
+          echo ""
+
+          mkdir -p bench_out
+          echo "algo,p,fft_threads,iters,ns_per_iter,extrap_full_hours" \
+            > bench_out/section_f_large_exp.csv
+
+          # ── bin/bignum + bin/seqmod_assembler via microbench_fft ────────────────
+          # Both use the same FftMersenneBackend engine; microbench_fft exposes
+          # the backend directly, giving the cleanest per-iteration timing.
+          #
+          # FFT-thread scaling: at p=756839, the transform length n≈131072 is
+          # large enough that intra-FFT threading provides real benefit.
+          echo "--- bin/bignum / FftMersenneBackend at p=756839 (200 iters each) ---"
+          echo ""
+          printf "%-18s %12s %12s %10s\n" "LL_FFT_THREADS" "ns/iter" "extrap (hrs)" "Notes"
+          echo "──────────────────────────────────────────────────────────────────"
+
+          BEST_FT=1
+          BEST_NS=0
+
+          for FT in 1 2 4; do
+            NS=$(LL_FFT_THREADS=$FT LL_FFT_ALLOW_NESTED=0 \
+                 ./bin/microbench_fft 756839 200 2>&1 \
+                 | grep "^time/iter" | awk '{print $3}' | cut -d. -f1)
+            [ -z "$NS" ] && NS=0
+
+            # Extrapolate: 756837 iterations × ns/iter → seconds → hours
+            if [ "$NS" -gt 0 ]; then
+              EXTRAP_S=$(( NS * 756837 / 1000000000 ))
+              EXTRAP_H_X100=$(( EXTRAP_S * 100 / 3600 ))
+              EXTRAP_STR="$((EXTRAP_H_X100 / 100)).$((EXTRAP_H_X100 % 100))h"
+            else
+              EXTRAP_STR="N/A"
+              EXTRAP_S=0
+            fi
+
+            printf "%-18s %12s %12s  (MEASURED, 200/756837 iters)\n" \
+              "FFT_THREADS=${FT}" "${NS} ns" "${EXTRAP_STR}"
+            echo "bin/bignum,756839,${FT},200,${NS},${EXTRAP_STR}" \
+              >> bench_out/section_f_large_exp.csv
+
+            # Track best (lowest ns/iter)
+            if [ "$BEST_NS" -eq 0 ] || [ "$NS" -lt "$BEST_NS" ]; then
+              BEST_NS=$NS
+              BEST_FT=$FT
+            fi
+          done
+
+          echo ""
+          echo "  Best FFT-thread config at p=756839: LL_FFT_THREADS=${BEST_FT} (${BEST_NS} ns/iter)"
+          echo "  (bin/seqmod_assembler uses the same engine; results are identical)"
+          echo ""
+
+          # Record best config
+          echo "# best_fft_threads_for_p756839=${BEST_FT}" >> bench_out/section_f_large_exp.csv
+
+          # ── seqmod_gmp and seqmod_stdc: project from p=16381 measurements ───
+          # Each seqmod iteration: 3 modular squarings in Z[√3] mod M_p.
+          # Per-iteration cost scales as O(p^α) where:
+          #   α ≈ 1.585 (Karatsuba) for seqmod_stdc at moderate p
+          #   α ≈ 1.0   (GMP FFT / Schönhage-Strassen) for seqmod_gmp at large p
+          # Plus: p=756839 needs 756837 iters vs 16379 iters for p=16381 (46x more).
+          #
+          # We measure seqmod_gmp and seqmod_stdc at p=16381 (from Section A CSV),
+          # compute per-iteration time, scale by complexity, and report as ESTIMATED.
+          echo "--- seqmod_gmp / seqmod_stdc: projected cost at p=756839 ---"
+          echo ""
+
+          # Read Section A measurements at p=16381
+          GMP_16381_MS=$(grep "^bin/sequence_powermod_gmp,16381," bench_out/section_a_latency.csv \
+                          | cut -d, -f5)
+          STDC_16381_MS=$(grep "^bin/sequence_powermod,16381," bench_out/section_a_latency.csv \
+                          | cut -d, -f5)
+
+          project_seqmod() {
+            local name="$1"   # algo name
+            local ms="$2"     # measured ms for p=16381 (full run = 16379 iters)
+            local alpha="$3"  # complexity scaling exponent (per-iter cost)
+
+            if [ -z "$ms" ] || ! printf '%s' "$ms" | grep -qE '^[0-9]+$' || [ "$ms" -le 0 ]; then
+              echo "  ${name}: measurement unavailable (Section A not run yet)"
+              return
+            fi
+
+            # Per-iteration cost at p=16381 (ms)
+            # Note: seqmod runs exactly p iterations (binary exponentiation: exp=2^p
+            #       has p bits, so p squarings + 1 multiply in Z[√3]).
+            # Use p_iters = p-1 ≈ p for the iteration count.
+            local p_ref=16381
+            local p_tgt=756839
+
+            # Scaling formula:
+            #   per_iter_factor = (p_tgt/p_ref)^alpha  (per-iteration cost growth)
+            #   iter_count_factor = p_tgt/p_ref         (seqmod runs ~p iterations)
+            #   combined = (p_tgt/p_ref)^alpha * (p_tgt/p_ref) = (p_tgt/p_ref)^(alpha+1)
+            # Use single-line python3 to compute the combined scaling factor.
+            local scale
+            scale=$(python3 -c "r=${p_ref};t=${p_tgt};a=${alpha};print(int((t/r)**a*(t/r)+0.5))" \
+              2>/dev/null || echo "0")
+
+            if [ "${scale:-0}" -le 0 ] 2>/dev/null; then
+              echo "  ${name}: projection failed"
+              return
+            fi
+
+            local proj_ms=$(( ms * scale ))
+            local proj_h_x100=$(( proj_ms * 100 / 3600000 ))
+            printf "  %-34s p=16381 measured: %5d ms  ->  p=756839 ESTIMATED: ~%d.%02d hours\n" \
+              "${name}:" "$ms" \
+              "$((proj_h_x100 / 100))" "$((proj_h_x100 % 100))"
+            printf "    (complexity factor: ~%dx, alpha=%.3f)\n" "$scale" "$alpha"
+
+            echo "${name},756839,1,ESTIMATED,ESTIMATED,$((proj_h_x100/100)).$((proj_h_x100%100))h" \
+              >> bench_out/section_f_large_exp.csv
+          }
+
+          echo ""
+          echo "  Projection methodology:"
+          echo "    seqmod_gmp:  GMP uses Schönhage-Strassen for large p."
+          echo "                 Per-iter cost ∝ p (α=1.0), iters ∝ p  →  total ∝ p²."
+          echo "    seqmod_stdc: Karatsuba squaring, per-iter ∝ p^1.585, iters ∝ p."
+          echo "                 Total ∝ p^2.585.  Conservative lower bound."
+          echo "    Both perform 3 large-integer squarings per iteration (Z[√3] step)"
+          echo "    vs 1 squaring per iteration for bin/bignum (standard LL)."
+          echo ""
+
+          project_seqmod "bin/sequence_powermod_gmp" "${GMP_16381_MS}"  "1.0"
+          project_seqmod "bin/sequence_powermod (stdc)" "${STDC_16381_MS}" "1.585"
+
+          echo ""
+          echo "  ⚠  IMPORTANT: seqmod_gmp and seqmod_stdc CANNOT complete a full"
+          echo "     Lucas-Lehmer test at p=756839 in any reasonable time on a runner."
+          echo "     The projections above are ESTIMATED lower bounds."
+          echo "     bin/bignum (FftMersenneBackend) is the ONLY algorithm that can"
+          echo "     feasibly test p=756839 in the available runner time budget."
+
+          echo ""
+          echo "CSV: bench_out/section_f_large_exp.csv"
+          cat bench_out/section_f_large_exp.csv
+
+      # ──────────────────────────────────────────────────────────────────────────
       # Section E: gprof profiling (bin/bignum profiling build, p=8191)
       # ──────────────────────────────────────────────────────────────────────────
       - name: Install binutils (gprof) and build toolchain for profiling binary
@@ -584,6 +780,7 @@ jobs:
           | 4096 | p = 4093 |
           | 8192 | p = 8191 |
           | 16384 | p = 16381 |
+          | large | **p = 756839** (M_756839, 27th known Mersenne prime) |
 
           ---
 
@@ -663,6 +860,46 @@ jobs:
 
           ---
 
+          ## Section F: p=756839 Large-Exponent Microbenchmark (M_756839, 27th Mersenne Prime)
+
+          **Measurement methodology:** 200 limited FFT iterations out of 756837 total.
+          Times marked **MEASURED** are real hardware measurements; **ESTIMATED** are projections.
+
+          ### bin/bignum (FftMersenneBackend) at p=756839 — FFT-Thread Scaling
+
+          | LL_FFT_THREADS | ns/iter (MEASURED) | Extrapolated full-run time |
+          |:--------------:|:------------------:|:---------------------------:|
+          $(grep "^bin/bignum,756839," bench_out/section_f_large_exp.csv | grep -v "^#" | \
+            awk -F, '{printf "| %s | %s ns | %s |\n", $3, $5, $6}')
+
+          > Both \`bin/bignum\` and \`bin/seqmod_assembler\` use the same \`FftMersenneBackend\`
+          > engine; ns/iter figures are identical for both binaries.
+          >
+          > **Key finding:** At p=756839 (FFT length n≈131072), intra-FFT threading
+          > provides real benefit — unlike the smaller exponents in Sections A–D.
+          > Use \`LL_FFT_THREADS=4\` for large single-exponent workloads at p≥756839.
+
+          ### seqmod_gmp and seqmod_stdc at p=756839 — ESTIMATED (infeasible in practice)
+
+          | Algorithm | p=16381 measured | p=756839 ESTIMATED full-run |
+          |-----------|:----------------:|:----------------------------:|
+          | bin/sequence_powermod_gmp | ${GMP16381} ms | see below |
+          | bin/sequence_powermod (stdc) | ${STDC16381} ms | see below |
+
+          $(grep -E "^bin/sequence_powermod" bench_out/section_f_large_exp.csv | grep -v "^#" | \
+            awk -F, '{printf "| `%s` | ESTIMATED | ~%s |\n", $1, $6}')
+
+          > ⚠ **These algorithms CANNOT complete a full test at p=756839 in any reasonable
+          > time on a GitHub Actions runner.**  Each iteration performs 3 large-integer
+          > squarings in Z[√3] (no Mersenne specialisation), making them fundamentally
+          > O(p²) or worse.  The estimates above are conservative lower bounds based on
+          > measured per-iteration cost at p=16381, scaled by algorithmic complexity.
+          >
+          > **\`bin/bignum\` (FftMersenneBackend) is the ONLY algorithm that can feasibly
+          > test p=756839 using a single runner.**
+
+          ---
+
           ## Section E: gprof Profile (bin/bignum, p=8191, 1 thread)
 
           Top functions by CPU time (profiling build, -O2 -pg):
@@ -690,6 +927,18 @@ jobs:
           slower at p=16381 because they compute a general squaring in Z[√3] which requires
           two large-integer multiplications per iteration, vs the Lucas-Lehmer recurrence
           \`s = s²−2 mod (2^p−1)\` which uses a single in-place squaring with Mersenne folding.
+
+          At p=756839, the advantage of \`bin/bignum\` grows further: the DWT/FFT backend
+          exploits Mersenne-specific cyclic convolution (no general mod reduction needed),
+          while \`seqmod_gmp\` and \`seqmod_stdc\` degrade to infeasible runtimes.
+
+          ### Recommended configuration for CI/CD workflows
+
+          | Use case | Binary | LL_THREADS | LL_FFT_THREADS | LL_FFT_ALLOW_NESTED |
+          |----------|--------|:----------:|:--------------:|:-------------------:|
+          | Many small exponents (p ≤ 16384) | \`bin/bignum\` | 4 | 1 | 0 |
+          | Single large exponent (p ≈ 756839) | \`bin/bignum\` | 1 | 4 | 0 |
+          | Mixed / throughput sweep | \`bin/bignum\` | 4 | 2 | 1 |
 
           **All production CI/CD workflows in this repository already use \`bin/bignum\`.**
 

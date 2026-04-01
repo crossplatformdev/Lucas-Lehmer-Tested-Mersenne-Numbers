@@ -16,8 +16,12 @@
 //   make microbench MICROBENCH_ITERS=500   (partial run, no residue check)
 //
 // Usage:
-//   ./bin/microbench_fft [p]
-//   p defaults to 44497 (known Mersenne prime exponent, exercises FFT backend).
+//   ./bin/microbench_fft [p [iters]]
+//   p     defaults to 44497 (known Mersenne prime exponent, exercises FFT backend).
+//   iters overrides the iteration count at runtime (overrides compile-time
+//         MICROBENCH_ITERS).  Useful for large exponents (e.g., p=756839)
+//         where a full p-2 run is infeasible: pass 200 to measure ns/iter
+//         and extrapolate the full runtime.
 //
 // Cluster power environment variables (override defaults):
 //   LL_CLUSTER_WORKERS    – number of worker nodes  (default 256)
@@ -63,27 +67,55 @@ static constexpr const char* kExpectedResidue = "0000000000000000";
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
-    // Optional: override p from command line.
+    // Optional: override p from command line (argv[1]).
     uint32_t p = kDefaultP;
     if (argc >= 2) {
         char* end = nullptr;
         const long v = std::strtol(argv[1], &end, 10);
         if (end == argv[1] || *end != '\0' || v < 2 || v > kMaxSupportedExponent) {
             std::fprintf(stderr,
-                "Usage: %s [p]\n"
-                "  p must be an integer in [2, %ld]\n",
+                "Usage: %s [p [iters]]\n"
+                "  p     must be an integer in [2, %ld]\n"
+                "  iters must be a positive integer (default: p-2, full LL test;\n"
+                "        values > p-2 are clamped to p-2)\n",
                 argv[0], kMaxSupportedExponent);
             return 2;
         }
         p = static_cast<uint32_t>(v);
     }
 
-    // Determine iteration count.
+    // Optional: override iteration count from command line (argv[2]).
+    // Overrides the compile-time MICROBENCH_ITERS default.
+    // Useful for large exponents (e.g., p=756839) where a full p-2 run is
+    // infeasible on a CI runner: pass a small count (e.g., 200) to measure
+    // ns/iter and extrapolate the full runtime.
+    uint32_t runtime_iters = 0u;
+    if (argc >= 3) {
+        char* end = nullptr;
+        const long v = std::strtol(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0' || v < 1) {
+            std::fprintf(stderr,
+                "Usage: %s [p [iters]]\n"
+                "  p     must be an integer in [2, %ld]\n"
+                "  iters must be a positive integer (default: p-2, full LL test;\n"
+                "        values > p-2 are clamped to p-2)\n",
+                argv[0], kMaxSupportedExponent);
+            return 2;
+        }
+        runtime_iters = static_cast<uint32_t>(v);
+    }
+
+    // Determine iteration count:
+    //   runtime_iters (argv[2]) takes precedence when provided.
+    //   Values larger than p-2 are clamped to p-2 (treated as full run).
+    //   Otherwise fall back to compile-time MICROBENCH_ITERS (0 = full p-2 run).
     const uint32_t p_minus2   = p - 2u;
     const uint32_t bench_iters =
-        (MICROBENCH_ITERS == 0u || MICROBENCH_ITERS >= p_minus2)
-            ? p_minus2
-            : static_cast<uint32_t>(MICROBENCH_ITERS);
+        (runtime_iters > 0u)
+            ? std::min(runtime_iters, p_minus2)
+            : ((MICROBENCH_ITERS == 0u || MICROBENCH_ITERS >= p_minus2)
+                ? p_minus2
+                : static_cast<uint32_t>(MICROBENCH_ITERS));
     const bool full_run = (bench_iters == p_minus2);
 
     // Lucas–Lehmer for p=2 has zero iterations (p-2 == 0), so a per-iteration
