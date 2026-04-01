@@ -68,7 +68,22 @@ PERF_LDFLAGS  := -pthread
 CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
 CALLGRIND_LDFLAGS  := -pthread
 
-.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-prof seqmod-bench seqmod-asm seqmod-asm-prof seqmod-asm-bench
+# ll_fft: Mersenne pipeline – limb-based Lucas-Lehmer with prefiltros.
+# Computes s_{p-2} mod (2^p - 1) for a given Mersenne exponent p.
+# Usage: bin/ll_fft <p> [--factor-limit N] [--hex] [--force-ll] [--selftest]
+EXPR_MOD_GMP_SRC      := src/ll_fft.cpp
+EXPR_MOD_GMP_BIN      := bin/ll_fft
+EXPR_MOD_GMP_CXXFLAGS := -std=c++17 -O3 -march=native -mtune=native -Wall -Wextra -Wpedantic
+EXPR_MOD_GMP_LDFLAGS  :=
+
+.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-prof seqmod-bench seqmod-asm seqmod-asm-prof seqmod-asm-bench expr-mod-gmp
+
+$(EXPR_MOD_GMP_BIN): $(EXPR_MOD_GMP_SRC)
+	@mkdir -p bin
+	$(CXX) $(EXPR_MOD_GMP_CXXFLAGS) $< -o $@ $(EXPR_MOD_GMP_LDFLAGS)
+
+# expr-mod-gmp: build the Mersenne pipeline binary (bin/ll_fft).
+expr-mod-gmp: $(EXPR_MOD_GMP_BIN)
 
 BENCH_START_INDEX ?= 14
 

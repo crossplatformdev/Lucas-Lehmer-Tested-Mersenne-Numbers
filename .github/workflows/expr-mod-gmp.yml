@@ -1,0 +1,171 @@
+name: expr-mod-gmp
+run-name: "expr-mod-gmp · ${{ github.ref_name }}"
+
+# Runs the Mersenne pipeline binary (bin/ll_fft) via
+# scripts/run_expr_mod_gmp.sh.
+#
+# Two phases:
+#   1. build  – compile bin/ll_fft from src/ll_fft.cpp (no GMP required)
+#   2. run    – execute the batch + search runner and upload the CSV
+#
+# On push to main  → conservative sanity run (known_limit=10, search in the
+#                    600s so results come back in seconds).
+# workflow_dispatch → fully configurable via inputs below.
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Known-exponent batch size"
+        required: false
+        default: "24"
+      known_limit:
+        description: "Max known exponents to test (0 = all 51)"
+        required: false
+        default: "0"
+      search_start:
+        description: "First candidate for the result-0 search"
+        required: false
+        default: "136279841"
+      max_prime_checks:
+        description: "Max prime candidates to evaluate during search"
+        required: false
+        default: "1000000"
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 1 – Build bin/ll_fft
+  # ──────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build ll_fft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install toolchain (g++)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++ make
+
+      - name: Build bin/ll_fft
+        run: make expr-mod-gmp
+
+      - name: Verify binary
+        run: |
+          test -x bin/ll_fft || { echo "MISSING: bin/ll_fft"; exit 1; }
+          echo "OK: bin/ll_fft  ($(du -sh bin/ll_fft | cut -f1))"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: expr-mod-gmp-bin
+          path: bin/ll_fft
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 2 – Run the batch + search script
+  # ──────────────────────────────────────────────────────────────────────────
+  run:
+    name: Run ll_fft (batch + search)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: expr-mod-gmp-bin
+          path: bin/
+
+      - name: Restore execute permission
+        run: chmod +x bin/ll_fft
+
+      # On push to main: lightweight sanity run (KNOWN_LIMIT=10, search in
+      # the 600s so each call takes milliseconds).
+      # On workflow_dispatch: use the values supplied by the caller.
+      - name: Resolve run parameters
+        id: params
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "batch_size=24"            >> "$GITHUB_OUTPUT"
+            echo "known_limit=10"           >> "$GITHUB_OUTPUT"
+            echo "search_start=600"         >> "$GITHUB_OUTPUT"
+            echo "max_prime_checks=20"      >> "$GITHUB_OUTPUT"
+          else
+            echo "batch_size=${{ inputs.batch_size }}"                    >> "$GITHUB_OUTPUT"
+            echo "known_limit=${{ inputs.known_limit }}"                  >> "$GITHUB_OUTPUT"
+            echo "search_start=${{ inputs.search_start }}"                >> "$GITHUB_OUTPUT"
+            echo "max_prime_checks=${{ inputs.max_prime_checks }}"        >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Print run configuration
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: run"
+          echo ""
+          echo "batch_size       = ${{ steps.params.outputs.batch_size }}"
+          echo "known_limit      = ${{ steps.params.outputs.known_limit }}"
+          echo "search_start     = ${{ steps.params.outputs.search_start }}"
+          echo "max_prime_checks = ${{ steps.params.outputs.max_prime_checks }}"
+
+      - name: Run batch + search
+        env:
+          EXPR_BIN: "${{ github.workspace }}/bin/ll_fft"
+        run: |
+          chmod +x scripts/run_expr_mod_gmp.sh
+          scripts/run_expr_mod_gmp.sh \
+            "${{ steps.params.outputs.batch_size }}" \
+            "${{ steps.params.outputs.search_start }}" \
+            "${{ steps.params.outputs.max_prime_checks }}" \
+            "${{ steps.params.outputs.known_limit }}"
+
+      - name: Print summary
+        if: always()
+        run: |
+          CSV=$(ls bin/expr_batch_results_*.csv 2>/dev/null | head -1 || true)
+          {
+            echo "## expr-mod-gmp results"
+            echo ""
+            echo "**Workflow run:** [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+            echo ""
+            echo "| Parameter       | Value |"
+            echo "| --------------- | ----- |"
+            echo "| batch_size      | ${{ steps.params.outputs.batch_size }} |"
+            echo "| known_limit     | ${{ steps.params.outputs.known_limit }} |"
+            echo "| search_start    | ${{ steps.params.outputs.search_start }} |"
+            echo "| max_prime_checks| ${{ steps.params.outputs.max_prime_checks }} |"
+            if [[ -n "${CSV}" ]]; then
+              echo ""
+              echo "### Output CSV (first 40 rows)"
+              echo '```'
+              head -40 "${CSV}"
+              echo '```'
+              echo ""
+              found_row=$(grep '^FOUND,' "${CSV}" || true)
+              if [[ -n "${found_row}" ]]; then
+                found_exp=$(echo "${found_row}" | cut -d',' -f4)
+                echo "**Result-0 exponent found:** \`${found_exp}\`"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload CSV artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: expr-mod-gmp-results
+          path: bin/expr_batch_results_*.csv
+          retention-days: 30
