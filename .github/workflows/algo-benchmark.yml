@@ -682,12 +682,14 @@ jobs:
 
           # ── stdc Comba: EXTRAPOLATED with extra O(n) penalty ──────────────────
           # Comba cost ∝ n_limbs²;  FFT cost ∝ n_limbs × log₂(n_limbs).
+          # Comba cost ∝ n_limbs²;  FFT cost ∝ n_limbs × log₂(n_limbs).
           # Extra factor = (n_target/log₂(n_target)) / (n_test/log₂(n_test))
+          LIMB_BITS = 64  # 64-bit limbs used by all limb-based backends
           if bn_ms > 0 and best_ns and stdc_ms > 0:
               ns_bn_44497     = bn_ms * 1e6 / ITERS_TEST
               per_iter_scale  = best_ns / ns_bn_44497
-              n_test          = math.ceil(P_TEST   / 64)
-              n_target        = math.ceil(P_TARGET / 64)
+              n_test          = math.ceil(P_TEST   / LIMB_BITS)
+              n_target        = math.ceil(P_TARGET / LIMB_BITS)
               comba_extra     = (n_target / math.log2(n_target)) / (n_test / math.log2(n_test))
               stdc_756839_ms  = stdc_ms * per_iter_scale * (ITERS_TARGET / ITERS_TEST) * comba_extra
               stdc_proj = f'{fmt_time(stdc_756839_ms)}  [EXTRAPOLATED, O(n²) Comba scaling]'
@@ -704,10 +706,10 @@ jobs:
           print(f'  bin/sequence_powermod     : {stdc_proj}')
           print()
           print('Methodology:')
-          print('  bignum       – ns/iter from 200-iter FFT microbench × 756,837 total iters')
-          print('  seqmod_asm   – identical mersenne::lucas_lehmer() engine as bignum')
-          print('  seqmod_gmp   – extrapolated from p=44497 data (O(n log n) FFT scaling)')
-          print('  seqmod_stdc  – as above plus extra O(n) Comba-vs-FFT penalty')
+          print('  bin/bignum           – ns/iter from 200-iter FFT microbench × 756,837 total iters (p−2 for LL)')
+          print('  bin/seqmod_assembler – identical mersenne::lucas_lehmer() engine as bin/bignum')
+          print('  bin/sequence_powermod_gmp  – extrapolated from p=44497 data (O(n log n) FFT scaling)')
+          print('  bin/sequence_powermod      – as above plus extra O(n) Comba-vs-FFT penalty')
           print()
           print('Winner: bin/bignum (FftMersenneBackend)')
           print('  Fastest at every exponent; the ONLY algorithm completable at p=756839')
@@ -997,7 +999,7 @@ jobs:
           ")
 
           > **Methodology:**
-          > - `bin/bignum`: ns/iter measured directly from 200-iteration FFT microbench; projected full run = ns/iter × 756,837.
+          > - `bin/bignum`: ns/iter measured directly from 200-iteration FFT microbench; projected full run = ns/iter × (p − 2) = ns/iter × 756,837 Lucas-Lehmer iterations.
           > - `bin/seqmod_assembler`: uses the identical `mersenne::lucas_lehmer()` engine; same projection applies.
           > - `bin/sequence_powermod_gmp`: extrapolated from p=44497 data using the bignum per-iteration scaling ratio (O(n log n) FFT).
           > - `bin/sequence_powermod`: as above plus an additional O(n) Comba-vs-FFT penalty (Comba ∝ n², FFT ∝ n log n).
