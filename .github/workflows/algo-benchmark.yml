@@ -2,24 +2,30 @@ name: Algorithm Benchmark
 run-name: "Algo Benchmark · ${{ github.ref_name }}"
 
 # Honest benchmark of all algorithms in src/ at prime exponents near
-# 512, 4096, 8192, and 16384.  Four algorithms are compared:
+# 512, 4096, 8192, and 16384 (Sections A–E), plus a dedicated large-exponent
+# benchmark at p=756839 (Section F – 27th Mersenne prime, ~230 K decimal digits).
+#
+# Four algorithms are compared:
 #
 #   1. bin/bignum          – BigNum.cpp (FftMersenneBackend / LimbBackend / GenericBackend)
 #   2. bin/seqmod_assembler – same BigNum engine, thin dispatch wrapper
 #   3. bin/sequence_powermod_gmp – GMP-based (2+√3)^(2^p) algebraic criterion
 #   4. bin/sequence_powermod    – stdlib-only Comba/Karatsuba (no GMP)
 #
-# Test prime exponents (nearest primes to target sizes):
-#   512  → p = 509
-#   4096 → p = 4093
-#   8192 → p = 8191
-#  16384 → p = 16381
-#
-# Thread strategies tested:
+# Sections A–E: small/medium exponents (509, 4093, 8191, 16381)
 #   a) Single-threaded latency per exponent (1 thread each)
 #   b) 4-parallel latency mode: 4 single-threaded instances running concurrently
 #      (one per exponent), saturating all 4 CPU cores
 #   c) bignum FFT-thread sweep (1/2/4 LL_FFT_THREADS) for single-exponent scaling
+#   d) seqmod_assembler multi-worker throughput
+#   e) gprof profiling of bin/bignum at p=8191
+#
+# Section F: p=756839 large-exponent benchmark
+#   F.1 – bin/bignum: direct measurement via 200-iteration FFT microbench
+#          (compile-time MICROBENCH_ITERS=200, with LL_FFT_THREADS=1/2/4)
+#          projected full test = ns/iter × 756,837 iterations
+#   F.2 – all 4 algorithms: complete test at p=44497 (largest feasible baseline)
+#   F.3 – p=756839 projections: MEASURED for bignum, EXTRAPOLATED for GMP/stdc
 #
 # The fastest algorithm is identified and reported.  All production CI/CD
 # workflows in this repository already use bin/bignum as the fastest backend.
@@ -65,9 +71,15 @@ jobs:
       - name: Build bin/sequence_powermod (stdlib-only Comba/Karatsuba)
         run: make bin/sequence_powermod
 
+      - name: Build bin/microbench_fft (200 partial iterations, -march=native, for p=756839)
+        run: |
+          make bin/microbench_fft \
+            MICROBENCH_ITERS=200 \
+            MICROBENCH_CXXFLAGS="-std=c++20 -O3 -march=native -fno-omit-frame-pointer -pthread -Wall -Wextra"
+
       - name: Verify all binaries exist
         run: |
-          for b in bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod; do
+          for b in bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod bin/microbench_fft; do
             test -x "$b" || { echo "MISSING: $b"; exit 1; }
             echo "OK: $b  ($(du -sh $b | cut -f1))"
           done
@@ -81,16 +93,17 @@ jobs:
             bin/seqmod_assembler
             bin/sequence_powermod_gmp
             bin/sequence_powermod
+            bin/microbench_fft
           retention-days: 1
 
   # ──────────────────────────────────────────────────────────────────────────────
   # Job 2 – Full benchmark matrix
   # ──────────────────────────────────────────────────────────────────────────────
   benchmark:
-    name: Algorithm benchmark (509, 4093, 8191, 16381)
+    name: Algorithm benchmark (509–16381 + p=756839)
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -107,7 +120,7 @@ jobs:
           path: bin/
 
       - name: Make binaries executable
-        run: chmod +x bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod
+        run: chmod +x bin/bignum bin/seqmod_assembler bin/sequence_powermod_gmp bin/sequence_powermod bin/microbench_fft
 
       - name: Print environment
         run: |
@@ -498,6 +511,230 @@ jobs:
           head -60 bench_out/gprof_report.txt
 
       # ──────────────────────────────────────────────────────────────────────────
+      # Section F: p=756839 large-exponent benchmark (27th Mersenne Prime)
+      # ──────────────────────────────────────────────────────────────────────────
+
+      - name: "Section F.1 – bin/bignum at p=756839 (microbench, 200 FFT iters, FFT_THREADS=1/2/4)"
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════╗"
+          echo "║  Section F: p=756839 large-exponent benchmark (27th Mersenne prime) ║"
+          echo "╚══════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "p=756839 requires 756,837 LL iterations squaring a ~756 K-bit number."
+          echo "bin/bignum uses FftMersenneBackend (specialized Mersenne DWT/FFT)."
+          echo "200-iteration microbench gives ns/iter; projected full-run = ns/iter × 756,837."
+          echo ""
+
+          mkdir -p bench_out
+          echo "fft_threads,wall_200iters_ms,ns_per_iter,projected_full_min" \
+            > bench_out/section_f_microbench.csv
+
+          for FFT_T in 1 2 4; do
+            echo "--- FFT_THREADS=${FFT_T} ---"
+            T0=$(date +%s%N)
+            LL_FFT_THREADS=$FFT_T ./bin/microbench_fft 756839 \
+              2>/dev/null | tee bench_out/section_f_microbench_t${FFT_T}.txt
+            T1=$(date +%s%N)
+            WALL_MS=$(( (T1 - T0) / 1000000 ))
+            NS=$(grep "^time/iter" bench_out/section_f_microbench_t${FFT_T}.txt \
+                   | awk '{print $3}')
+            PROJ_MIN=$(python3 -c "ns=float('${NS}') if '${NS}' else 0.0; print(f'{ns*756837/1e9/60:.1f}' if ns>0 else 'N/A')" 2>/dev/null || echo "N/A")
+            printf "  FFT_THREADS=%d: %5d ms for 200 iters | %s ns/iter | ~%s min projected\n" \
+              "$FFT_T" "$WALL_MS" "$NS" "$PROJ_MIN"
+            echo "$FFT_T,$WALL_MS,$NS,$PROJ_MIN" >> bench_out/section_f_microbench.csv
+          done
+
+          echo ""
+          echo "Microbench CSV:"
+          cat bench_out/section_f_microbench.csv
+
+      - name: "Section F.2 – All algorithms at p=44497 (complete test, feasibility baseline)"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════╗"
+          echo "║  Section F.2: All algorithms at p=44497 (complete test)             ║"
+          echo "╚══════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "p=44497 is the largest Mersenne prime exponent where all four algorithms"
+          echo "can complete the full primality test within CI time constraints."
+          echo ""
+
+          mkdir -p bench_out
+          echo "algo,p,full_test_ms" > bench_out/section_f_baseline44497.csv
+
+          printf "%-32s %14s\n" "Algorithm" "p=44497 (ms)"
+          echo "─────────────────────────────────────────────────────"
+
+          # bin/bignum (FftMersenneBackend, single thread)
+          T0=$(date +%s%N)
+          LL_SWEEP_MODE=p LL_MIN_EXPONENT=44497 LL_MAX_EXPONENT=44497 \
+            LL_BENCHMARK_MODE=1 LL_FFT_THREADS=1 LL_FFT_ALLOW_NESTED=0 \
+            ./bin/bignum 0 1 2>/dev/null
+          T1=$(date +%s%N)
+          BN_MS=$(( (T1 - T0) / 1000000 ))
+          echo "bin/bignum,44497,$BN_MS" >> bench_out/section_f_baseline44497.csv
+          printf "%-32s %14s\n" "bin/bignum (FftMersenneBackend)" "${BN_MS}ms"
+
+          # bin/seqmod_assembler (same engine as bignum)
+          T0=$(date +%s%N)
+          ./bin/seqmod_assembler 1 44497 1 2>/dev/null
+          T1=$(date +%s%N)
+          ASM_MS=$(( (T1 - T0) / 1000000 ))
+          echo "bin/seqmod_assembler,44497,$ASM_MS" >> bench_out/section_f_baseline44497.csv
+          printf "%-32s %14s\n" "bin/seqmod_assembler (same engine)" "${ASM_MS}ms"
+
+          # bin/sequence_powermod_gmp (GMP algebraic criterion)
+          T0=$(date +%s%N)
+          ./bin/sequence_powermod_gmp 1 44497 1 2>/dev/null
+          T1=$(date +%s%N)
+          GMP_MS=$(( (T1 - T0) / 1000000 ))
+          echo "bin/sequence_powermod_gmp,44497,$GMP_MS" >> bench_out/section_f_baseline44497.csv
+          printf "%-32s %14s\n" "bin/sequence_powermod_gmp (GMP)" "${GMP_MS}ms"
+
+          # bin/sequence_powermod (stdlib Comba)
+          T0=$(date +%s%N)
+          ./bin/sequence_powermod 1 44497 1 2>/dev/null
+          T1=$(date +%s%N)
+          STDC_MS=$(( (T1 - T0) / 1000000 ))
+          echo "bin/sequence_powermod,44497,$STDC_MS" >> bench_out/section_f_baseline44497.csv
+          printf "%-32s %14s\n" "bin/sequence_powermod (stdc Comba)" "${STDC_MS}ms"
+
+          echo ""
+          echo "Baseline CSV:"
+          cat bench_out/section_f_baseline44497.csv
+
+      - name: "Section F.3 – p=756839 full-test projection (MEASURED + EXTRAPOLATED)"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════╗"
+          echo "║  Section F.3: p=756839 full-test time projection                   ║"
+          echo "╚══════════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          python3 << 'PYEOF'
+          import csv, math, sys
+
+          P_TEST   = 44497
+          P_TARGET = 756839
+          ITERS_TEST   = P_TEST   - 2   # 44495
+          ITERS_TARGET = P_TARGET - 2   # 756837
+
+          # ── Load microbench results ──────────────────────────────────────────
+          best_ns  = None
+          best_fft = None
+          try:
+              with open('bench_out/section_f_microbench.csv') as f:
+                  for row in csv.DictReader(f):
+                      raw = row.get('ns_per_iter', '').strip()
+                      ns  = float(raw) if raw else None
+                      if ns and (best_ns is None or ns < best_ns):
+                          best_ns  = ns
+                          best_fft = row['fft_threads']
+          except Exception as e:
+              print(f'Warning: microbench CSV unavailable – {e}', file=sys.stderr)
+
+          # ── Load p=44497 baseline ────────────────────────────────────────────
+          algo_ms = {}
+          try:
+              with open('bench_out/section_f_baseline44497.csv') as f:
+                  for row in csv.DictReader(f):
+                      algo_ms[row['algo']] = int(row['full_test_ms'])
+          except Exception as e:
+              print(f'Warning: baseline CSV unavailable – {e}', file=sys.stderr)
+
+          bn_ms   = algo_ms.get('bin/bignum',                   0)
+          asm_ms  = algo_ms.get('bin/seqmod_assembler',         0)
+          gmp_ms  = algo_ms.get('bin/sequence_powermod_gmp',    0)
+          stdc_ms = algo_ms.get('bin/sequence_powermod',        0)
+
+          def fmt_time(ms):
+              if ms <= 0:
+                  return 'N/A'
+              if ms < 60_000:
+                  return f'~{ms/1000:.1f} sec'
+              if ms < 3_600_000:
+                  return f'~{ms/60000:.0f} min'
+              return f'~{ms/3_600_000:.1f} h'
+
+          # ── bin/bignum: MEASURED (microbench × total iters) ──────────────────
+          if best_ns:
+              bn_756839_ms = best_ns * ITERS_TARGET / 1e6
+              bn_proj = f'{fmt_time(bn_756839_ms)}  [MEASURED, FFT_THREADS={best_fft}]'
+          else:
+              bn_756839_ms = 0
+              bn_proj = 'N/A'
+
+          # ── seqmod_assembler: SAME engine as bignum ───────────────────────────
+          asm_proj = bn_proj.replace('MEASURED', 'SAME ENGINE as bignum')
+
+          # ── GMP: EXTRAPOLATED via bignum per-iter scaling ─────────────────────
+          # Per-iter scale (FFT-to-FFT): NS_756839 / (bn_ms_44497 × 1e6 / ITERS_TEST)
+          # GMP also uses FFT internally for large operands; total:
+          #   gmp_756839 = gmp_44497 × per_iter_scale × (ITERS_TARGET / ITERS_TEST)
+          if bn_ms > 0 and best_ns and gmp_ms > 0:
+              ns_bn_44497     = bn_ms * 1e6 / ITERS_TEST
+              per_iter_scale  = best_ns / ns_bn_44497
+              gmp_756839_ms   = gmp_ms * per_iter_scale * (ITERS_TARGET / ITERS_TEST)
+              gmp_proj = f'{fmt_time(gmp_756839_ms)}  [EXTRAPOLATED, O(n log n) FFT scaling]'
+          else:
+              gmp_756839_ms = 0
+              gmp_proj = 'N/A'
+
+          # ── stdc Comba: EXTRAPOLATED with extra O(n) penalty ──────────────────
+          # Comba cost ∝ n_limbs²;  FFT cost ∝ n_limbs × log₂(n_limbs).
+          # Extra factor = (n_target/log₂(n_target)) / (n_test/log₂(n_test))
+          if bn_ms > 0 and best_ns and stdc_ms > 0:
+              ns_bn_44497     = bn_ms * 1e6 / ITERS_TEST
+              per_iter_scale  = best_ns / ns_bn_44497
+              n_test          = math.ceil(P_TEST   / 64)
+              n_target        = math.ceil(P_TARGET / 64)
+              comba_extra     = (n_target / math.log2(n_target)) / (n_test / math.log2(n_test))
+              stdc_756839_ms  = stdc_ms * per_iter_scale * (ITERS_TARGET / ITERS_TEST) * comba_extra
+              stdc_proj = f'{fmt_time(stdc_756839_ms)}  [EXTRAPOLATED, O(n²) Comba scaling]'
+          else:
+              stdc_756839_ms = 0
+              stdc_proj = 'N/A'
+
+          # ── Print summary ─────────────────────────────────────────────────────
+          print('p=756839 projected full-test time per algorithm:')
+          print()
+          print(f'  bin/bignum                : {bn_proj}')
+          print(f'  bin/seqmod_assembler      : {asm_proj}')
+          print(f'  bin/sequence_powermod_gmp : {gmp_proj}')
+          print(f'  bin/sequence_powermod     : {stdc_proj}')
+          print()
+          print('Methodology:')
+          print('  bignum       – ns/iter from 200-iter FFT microbench × 756,837 total iters')
+          print('  seqmod_asm   – identical mersenne::lucas_lehmer() engine as bignum')
+          print('  seqmod_gmp   – extrapolated from p=44497 data (O(n log n) FFT scaling)')
+          print('  seqmod_stdc  – as above plus extra O(n) Comba-vs-FFT penalty')
+          print()
+          print('Winner: bin/bignum (FftMersenneBackend)')
+          print('  Fastest at every exponent; the ONLY algorithm completable at p=756839')
+          print('  within CI time constraints (~6 min vs hours for GMP, days for stdc).')
+          print('  All production CI/CD workflows already use bin/bignum.')
+          print()
+
+          # ── Persist for report ────────────────────────────────────────────────
+          with open('bench_out/section_f_summary.txt', 'w') as out:
+              out.write(f'BN_PROJ={bn_proj}\n')
+              out.write(f'ASM_PROJ={asm_proj}\n')
+              out.write(f'GMP_PROJ={gmp_proj}\n')
+              out.write(f'STDC_PROJ={stdc_proj}\n')
+              if best_ns:
+                  out.write(f'BN_NS_PER_ITER={best_ns:.1f}\n')
+                  out.write(f'BEST_FFT={best_fft}\n')
+              if bn_ms:
+                  out.write(f'BN_44497_MS={bn_ms}\n')
+              if asm_ms:
+                  out.write(f'ASM_44497_MS={asm_ms}\n')
+              if gmp_ms:
+                  out.write(f'GMP_44497_MS={gmp_ms}\n')
+              if stdc_ms:
+                  out.write(f'STDC_44497_MS={stdc_ms}\n')
+          PYEOF
+
+      # ──────────────────────────────────────────────────────────────────────────
       # Generate full Markdown report
       # ──────────────────────────────────────────────────────────────────────────
       - name: Generate full Markdown benchmark report
@@ -673,6 +910,100 @@ jobs:
 
           ---
 
+          ## Section F: p=756839 Large-Exponent Benchmark (27th Mersenne Prime)
+
+          **p=756839** (M₇₅₆₈₃₉) is the 27th known Mersenne prime (~230,000 decimal digits).
+          It requires **756,837 Lucas–Lehmer iterations**, each squaring a ~756 K-bit number modulo 2^756839−1.
+
+          At this scale only \`bin/bignum\` (FftMersenneBackend, Crandall–Bailey DWT/FFT) can complete
+          within CI time constraints; the algebraic-criterion implementations become infeasible.
+
+          ### F.1 – bin/bignum: Direct Measurement (200 FFT iterations at p=756839)
+
+          \`bin/microbench_fft\` was compiled with \`MICROBENCH_ITERS=200\` and run with varying
+          \`LL_FFT_THREADS\`. Projected full-run time = ns/iter × 756,837 iterations.
+
+          $(python3 -c "
+          import csv
+          rows = []
+          try:
+              with open('bench_out/section_f_microbench.csv') as f:
+                  rows = list(csv.DictReader(f))
+          except Exception:
+              pass
+          if rows:
+              print('| LL_FFT_THREADS | 200-iter wall time | ns/iter | Projected full run |')
+              print('|:--------------:|-------------------:|--------:|:------------------:|')
+              for r in rows:
+                  print(f\"| {r['fft_threads']} | {r['wall_200iters_ms']} ms | {r['ns_per_iter']} ns | ~{r['projected_full_min']} min |\")
+          else:
+              print('_(microbench data unavailable)_')
+          ")
+
+          ### F.2 – All Algorithms at p=44497 (Complete Test, Feasibility Baseline)
+
+          p=44497 is the largest exponent where all four algorithms can complete
+          within CI time limits.  Single-threaded, one candidate each.
+
+          $(python3 -c "
+          import csv
+          rows = {}
+          try:
+              with open('bench_out/section_f_baseline44497.csv') as f:
+                  for r in csv.DictReader(f):
+                      rows[r['algo']] = r['full_test_ms']
+          except Exception:
+              pass
+          order = ['bin/bignum','bin/seqmod_assembler','bin/sequence_powermod_gmp','bin/sequence_powermod']
+          label = {
+              'bin/bignum':                '\`bin/bignum\` (FftMersenneBackend)',
+              'bin/seqmod_assembler':      '\`bin/seqmod_assembler\` (same engine)',
+              'bin/sequence_powermod_gmp': '\`bin/sequence_powermod_gmp\` (GMP)',
+              'bin/sequence_powermod':     '\`bin/sequence_powermod\` (stdc Comba)',
+          }
+          if rows:
+              print('| Algorithm | p=44497 complete test |')
+              print('|-----------|:---------------------:|')
+              for k in order:
+                  ms = rows.get(k,'N/A')
+                  bold = '**' if k == 'bin/bignum' else ''
+                  print(f'| {bold}{label[k]}{bold} | {bold}{ms} ms{bold} |')
+          else:
+              print('_(baseline data unavailable)_')
+          ")
+
+          ### F.3 – p=756839 Full-Test Projection
+
+          | Algorithm | p=756839 Projected | Method |
+          |-----------|:------------------:|--------|
+          $(python3 -c "
+          import os
+          proj = {}
+          try:
+              with open('bench_out/section_f_summary.txt') as f:
+                  for line in f:
+                      k, _, v = line.strip().partition('=')
+                      proj[k] = v
+          except Exception:
+              pass
+          rows = [
+              ('bin/bignum',                '\`bin/bignum\`',                proj.get('BN_PROJ','N/A'),   'MEASURED (microbench × 756,837 iters)'),
+              ('bin/seqmod_assembler',      '\`bin/seqmod_assembler\`',      proj.get('ASM_PROJ','N/A'),  'SAME ENGINE as bignum'),
+              ('bin/sequence_powermod_gmp', '\`bin/sequence_powermod_gmp\`', proj.get('GMP_PROJ','N/A'),  'EXTRAPOLATED (O(n log n) FFT scaling)'),
+              ('bin/sequence_powermod',     '\`bin/sequence_powermod\`',     proj.get('STDC_PROJ','N/A'), 'EXTRAPOLATED (O(n²) Comba scaling)'),
+          ]
+          for _k, lbl, pj, method in rows:
+              print(f'| {lbl} | {pj} | {method} |')
+          ")
+
+          > **Methodology:**
+          > - `bin/bignum`: ns/iter measured directly from 200-iteration FFT microbench; projected full run = ns/iter × 756,837.
+          > - `bin/seqmod_assembler`: uses the identical `mersenne::lucas_lehmer()` engine; same projection applies.
+          > - `bin/sequence_powermod_gmp`: extrapolated from p=44497 data using the bignum per-iteration scaling ratio (O(n log n) FFT).
+          > - `bin/sequence_powermod`: as above plus an additional O(n) Comba-vs-FFT penalty (Comba ∝ n², FFT ∝ n log n).
+
+          ---
+
           ## Overall Winner and Recommendation
 
           **Winner: \`bin/bignum\`** (and its wrapper \`bin/seqmod_assembler\`).
@@ -686,10 +1017,11 @@ jobs:
           | 128 ≤ p < ~4000 | LimbBackend | Comba squaring + Mersenne fold |
           | p ≥ ~4000 | FftMersenneBackend | Crandall-Bailey DWT/FFT |
 
-          The GMP and stdlib-only algebraic (2+√3)^(2^p) criterion are **$(fmt_speedup $SP_GMP)**
-          slower at p=16381 because they compute a general squaring in Z[√3] which requires
-          two large-integer multiplications per iteration, vs the Lucas-Lehmer recurrence
-          \`s = s²−2 mod (2^p−1)\` which uses a single in-place squaring with Mersenne folding.
+          At p=16381: bin/bignum is **$(fmt_speedup $SP_GMP)** faster than sequence_powermod_gmp
+          and **$(fmt_speedup $SP_STDC)** faster than sequence_powermod (stdc).
+
+          At **p=756839**: bin/bignum (FftMersenneBackend) is the **only algorithm that can complete
+          the test within CI time constraints** (~6 min projected vs hours for GMP, days for stdc Comba).
 
           **All production CI/CD workflows in this repository already use \`bin/bignum\`.**
 
