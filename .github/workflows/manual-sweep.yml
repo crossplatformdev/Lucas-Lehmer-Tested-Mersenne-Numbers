@@ -174,7 +174,7 @@ jobs:
 
       - name: Merge CSVs
         run: |
-          echo "p,is_prime,time_sec" > sweep_summary.csv
+          echo "p,is_prime,residue_hex,time_elapsed" > sweep_summary.csv
           for f in shard_results/*.csv; do
             [ -f "$f" ] && tail -n +2 "$f" >> sweep_summary.csv || true
           done

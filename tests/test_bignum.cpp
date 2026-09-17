@@ -49,6 +49,15 @@ static void test_is_known_mersenne_prime() {
     assert(!mersenne::is_known_mersenne_prime(UINT64_C(5000000000)));
 }
 
+static void test_format_bench_time_elapsed() {
+    assert(format_bench_time_elapsed(0.0) ==
+           "0 days 0 hours 0 seconds 000 miliseconds");
+    assert(format_bench_time_elapsed(1.234) ==
+           "0 days 0 hours 1 seconds 234 miliseconds");
+    assert(format_bench_time_elapsed(3661.999) ==
+           "0 days 1 hours 61 seconds 999 miliseconds");
+}
+
 static void test_generate_post_known_exponents() {
     // Use small range for speed: primes in (10, 30] are 11, 13, 17, 19, 23, 29.
     const auto v = mersenne::generate_post_known_exponents(UINT64_C(10), UINT64_C(30));
@@ -403,6 +412,7 @@ int main() {
     test_sweep_apply_shard();
     test_sweep_mersenne_first_determinism();
     test_precharge_distribution();
+    test_format_bench_time_elapsed();
 
     // --- discover-mode tests ---
     test_is_known_mersenne_prime();

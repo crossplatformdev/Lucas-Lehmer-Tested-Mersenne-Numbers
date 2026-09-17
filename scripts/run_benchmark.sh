@@ -47,7 +47,7 @@ run_once() {
 echo "=== Benchmark: start_index=$START  max_index=$MAX_IDX  binary=$BIN ==="
 
 # Write header once
-echo "threads,p,is_prime,time_sec" > "$OUTPUT"
+echo "threads,p,is_prime,residue_hex,time_elapsed" > "$OUTPUT"
 
 # 1-thread run
 echo "--- 1 thread ---"
