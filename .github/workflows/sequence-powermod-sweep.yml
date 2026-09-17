@@ -827,10 +827,16 @@ jobs:
               echo ""
               echo "| Exponent p | PRP | Residue | Time elapsed | M_p = 2^p − 1 |"
               echo "|------------|-----|---------|--------------|---------------|"
-              grep ",true," merged_out/merged_results.csv 2>/dev/null | \
-                while IFS=, read -r p result residue_hex time_elapsed; do
-                  echo "| ${p} | ${result} | \`${residue_hex}\` | ${time_elapsed} | M_${p} |"
-                done
+              python3 - <<'PYEOF'
+          import csv
+          with open("merged_out/merged_results.csv", newline="") as f:
+              for row in csv.DictReader(f):
+                  if row.get("is_prime") == "true":
+                      print(
+                          f"| {row['p']} | {row['is_prime']} | `{row['residue_hex']}` | "
+                          f"{row['time_elapsed']} | M_{row['p']} |"
+                      )
+          PYEOF
             fi
             echo ""
             echo "## Worker Summary"

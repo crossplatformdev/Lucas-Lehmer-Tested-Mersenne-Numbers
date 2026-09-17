@@ -279,9 +279,13 @@ jobs:
             if [ -n "${CSV_PATH}" ] && [ -f "${CSV_PATH}" ] && grep -q ",true," "${CSV_PATH}"; then
               echo "| Exponent | PRP | Residue | Time elapsed |"
               echo "|----------|-----|---------|--------------|"
-              grep ",true," "${CSV_PATH}" | while IFS=, read -r p is_prime residue_hex time_elapsed; do
-                echo "| M_${p} | ${is_prime} | \`${residue_hex}\` | ${time_elapsed} |"
-              done
+              python3 - <<'PYEOF'
+          import csv, os
+          with open(os.environ["CSV_PATH"], newline="") as f:
+              for row in csv.DictReader(f):
+                  if row.get("is_prime") == "true":
+                      print(f"| M_{row['p']} | {row['is_prime']} | `{row['residue_hex']}` | {row['time_elapsed']} |")
+          PYEOF
             else
               echo "_No Mersenne primes found in this batch._"
             fi
@@ -336,8 +340,12 @@ jobs:
               echo ""
               echo "| Exponent | PRP | Residue | Time elapsed |"
               echo "|----------|-----|---------|--------------|"
-              grep ",true," "${{ steps.run_ll.outputs.csv_path }}" | while IFS=, read -r p is_prime residue_hex time_elapsed; do
-                echo "| M_${p} | ${is_prime} | \`${residue_hex}\` | ${time_elapsed} |"
-              done
+              python3 - <<'PYEOF'
+          import csv
+          with open("${{ steps.run_ll.outputs.csv_path }}", newline="") as f:
+              for row in csv.DictReader(f):
+                  if row.get("is_prime") == "true":
+                      print(f"| M_{row['p']} | {row['is_prime']} | `{row['residue_hex']}` | {row['time_elapsed']} |")
+          PYEOF
             fi
           } >> "$GITHUB_STEP_SUMMARY"

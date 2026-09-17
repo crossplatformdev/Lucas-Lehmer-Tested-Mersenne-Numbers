@@ -3991,7 +3991,7 @@ int main(int argc, char** argv) {
         if (!bench_fp) return;
         std::lock_guard<std::mutex> lk(bench_mu);
         const std::string time_elapsed = format_bench_time_elapsed(elapsed);
-        std::fprintf(bench_fp, "%u,%s,%s,%s\n",
+        std::fprintf(bench_fp, "%u,%s,%s,\"%s\"\n",
                      p, llr.is_prime ? "true" : "false",
                      llr.final_residue_hex.c_str(), time_elapsed.c_str());
         std::fflush(bench_fp);
