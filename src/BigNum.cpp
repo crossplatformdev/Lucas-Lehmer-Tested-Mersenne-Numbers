@@ -3762,9 +3762,10 @@ static int run_power_bucket_mode(int argc, char** argv) {
 
 static LLResult test_exponent(uint32_t p, bool progress,
                               bool benchmark_mode, double* elapsed_out = nullptr) {
+    const ProgressContext ctx{};
     std::printf("Testing M_%u ...\n", p);
     const auto t0     = std::chrono::steady_clock::now();
-    const LLResult result = mersenne::lucas_lehmer_ex(p, progress, benchmark_mode);
+    const LLResult result = mersenne::lucas_lehmer_ex(p, progress, benchmark_mode, ctx);
     const auto t1     = std::chrono::steady_clock::now();
     const std::chrono::duration<double> elapsed = t1 - t0;
     if (elapsed_out) *elapsed_out = elapsed.count();
@@ -4058,7 +4059,8 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 }
                 const auto t0      = std::chrono::steady_clock::now();
-                const LLResult llr = mersenne::lucas_lehmer_ex(p, progress, benchmark_mode);
+                const ProgressContext ctx{};
+                const LLResult llr = mersenne::lucas_lehmer_ex(p, progress, benchmark_mode, ctx);
                 const auto t1      = std::chrono::steady_clock::now();
                 const double elapsed =
                     std::chrono::duration<double>(t1 - t0).count();
