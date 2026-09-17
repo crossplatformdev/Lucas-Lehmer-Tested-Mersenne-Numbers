@@ -493,18 +493,21 @@ static std::string format_bench_time_elapsed(double elapsed_sec) {
     long long total_ms = static_cast<long long>(std::llround(elapsed_sec * 1000.0));
     const long long kDayMs  = 24ll * 60ll * 60ll * 1000ll;
     const long long kHourMs = 60ll * 60ll * 1000ll;
+    const long long kMinMs  = 60ll * 1000ll;
 
     const long long days = total_ms / kDayMs;
     total_ms %= kDayMs;
     const long long hours = total_ms / kHourMs;
     total_ms %= kHourMs;
+    const long long minutes = total_ms / kMinMs;
+    total_ms %= kMinMs;
     const long long seconds = total_ms / 1000ll;
     const long long millis  = total_ms % 1000ll;
 
     char buf[96];
     std::snprintf(buf, sizeof(buf),
-                  "%lld days %lld hours %lld seconds %03lld miliseconds",
-                  days, hours, seconds, millis);
+                  "%lld days %lld hours %lld minutes %lld seconds %03lld milliseconds",
+                  days, hours, minutes, seconds, millis);
     return std::string(buf);
 }
 
