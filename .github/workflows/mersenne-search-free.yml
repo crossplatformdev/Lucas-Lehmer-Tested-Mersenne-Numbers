@@ -118,12 +118,16 @@ jobs:
             > state_in/state.zip
           unzip -q state_in/state.zip -d state_in/
           rm -f state_in/state.zip
-          STATE_FILE=$(find state_in -name 'search_state.json' | head -1)
-          if [[ -z "${STATE_FILE}" ]]; then
+          mapfile -t STATE_FILES < <(find state_in -name 'search_state.json')
+          if (( ${#STATE_FILES[@]} == 0 )); then
             echo '{}' > state_in/search_state.json
             echo "found_state=false" >> "$GITHUB_OUTPUT"
+          elif (( ${#STATE_FILES[@]} > 1 )); then
+            echo "::error::Expected exactly one search_state.json in the state artifact, found ${#STATE_FILES[@]}"
+            printf ' - %s\n' "${STATE_FILES[@]}"
+            exit 1
           else
-            cp "${STATE_FILE}" state_in/search_state.json
+            cp "${STATE_FILES[0]}" state_in/search_state.json
             echo "found_state=true" >> "$GITHUB_OUTPUT"
             cat state_in/search_state.json
           fi
@@ -455,11 +459,15 @@ jobs:
             > state_prev/state.zip
           unzip -q state_prev/state.zip -d state_prev/
           rm -f state_prev/state.zip
-          STATE_FILE=$(find state_prev -name 'search_state.json' | head -1)
-          if [[ -n "${STATE_FILE}" ]]; then
-            cp "${STATE_FILE}" state_prev/search_state.json
-          else
+          mapfile -t STATE_FILES < <(find state_prev -name 'search_state.json')
+          if (( ${#STATE_FILES[@]} == 0 )); then
             echo '{}' > state_prev/search_state.json
+          elif (( ${#STATE_FILES[@]} > 1 )); then
+            echo "::error::Expected exactly one search_state.json in the state artifact, found ${#STATE_FILES[@]}"
+            printf ' - %s\n' "${STATE_FILES[@]}"
+            exit 1
+          else
+            cp "${STATE_FILES[0]}" state_prev/search_state.json
           fi
 
       - name: Initialize empty previous state
@@ -627,8 +635,9 @@ jobs:
           while IFS= read -r KEY; do
             [[ -z "${KEY}" ]] && continue
             echo "Deleting cache key: ${KEY}"
+            KEY_ESCAPED=$(RAW_KEY="${KEY}" python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["RAW_KEY"], safe=""))')
             gh api --method DELETE \
-              "repos/${GITHUB_REPOSITORY}/actions/caches?key=${KEY}" \
+              "repos/${GITHUB_REPOSITORY}/actions/caches?key=${KEY_ESCAPED}" \
               >/dev/null 2>&1 || echo "::warning::Could not delete cache ${KEY}"
           done < merged_out/stale_cache_keys.txt
 

@@ -2785,7 +2785,7 @@ static void write_discover_json(
           << "      \"iterations_completed\": " << r.iterations_completed << ",\n"
           << "      \"iterations_total\": " << r.iterations_total << ",\n"
           << "      \"checkpoint_file\": \"" << json_escape(r.checkpoint_file) << "\",\n"
-          << "      \"final_residue_hex\": \"" << r.final_residue_hex << "\"\n"
+          << "      \"final_residue_hex\": \"" << json_escape(r.final_residue_hex) << "\"\n"
           << "    }" << (i + 1 < results.size() ? "," : "") << "\n";
     }
     f << "  ]\n}\n";
