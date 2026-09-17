@@ -2710,7 +2710,7 @@ static void write_discover_csv(
           << r.iterations_completed << ","
           << r.iterations_total << ","
           << '"' << json_escape(r.checkpoint_file) << '"' << ","
-          << r.final_residue_hex << "\n";
+          << '"' << json_escape(r.final_residue_hex) << '"' << "\n";
     }
 }
 

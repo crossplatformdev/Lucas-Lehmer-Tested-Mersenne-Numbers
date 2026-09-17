@@ -102,8 +102,10 @@ jobs:
           set -Eeuo pipefail
           mkdir -p state_in
           ARTIFACT_ID=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=mersenne-free-state&per_page=5" \
-            --jq '.artifacts | sort_by(.created_at) | reverse | .[0].id // empty' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts
+              | map(select(.name | startswith("mersenne-free-state-")))
+              | sort_by(.created_at) | reverse | .[0].id // empty' \
             2>/dev/null || true)
           if [[ -z "${ARTIFACT_ID}" ]]; then
             echo '{}' > state_in/search_state.json
@@ -438,8 +440,10 @@ jobs:
           set -Eeuo pipefail
           mkdir -p state_prev
           ARTIFACT_ID=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=mersenne-free-state&per_page=5" \
-            --jq '.artifacts | sort_by(.created_at) | reverse | .[0].id // empty' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts
+              | map(select(.name | startswith("mersenne-free-state-")))
+              | sort_by(.created_at) | reverse | .[0].id // empty' \
             2>/dev/null || true)
           if [[ -z "${ARTIFACT_ID}" ]]; then
             echo '{}' > state_prev/search_state.json
@@ -505,9 +509,9 @@ jobs:
               status = worker["status"]
               resume_key = worker.get("resume_cache_key", "")
               saved_key = worker.get("checkpoint_cache_key", "")
-              if resume_key:
-                  stale_cache_keys.add(resume_key)
               if status == "partial_soft_stop":
+                  if resume_key and saved_key:
+                      stale_cache_keys.add(resume_key)
                   new_partials[exponent] = {
                       "exponent": exponent,
                       "checkpoint_cache_key": saved_key,
@@ -516,6 +520,8 @@ jobs:
                       "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                   }
               elif status in {"completed_composite", "completed_prime", "skipped_exceeds_uint32"}:
+                  if resume_key:
+                      stale_cache_keys.add(resume_key)
                   completed.add(exponent)
                   if status == "completed_prime":
                       prime_candidates.append({
@@ -526,10 +532,15 @@ jobs:
                           "run_url": worker["run_url"],
                       })
               else:
+                  fallback_cache_key = resume_key
+                  fallback_iters = 0
+                  if exponent in prior_partials:
+                      fallback_cache_key = str(prior_partials[exponent].get("checkpoint_cache_key", fallback_cache_key))
+                      fallback_iters = int(prior_partials[exponent].get("iterations_completed", 0))
                   new_partials[exponent] = {
                       "exponent": exponent,
-                      "checkpoint_cache_key": "",
-                      "iterations_completed": 0,
+                      "checkpoint_cache_key": fallback_cache_key,
+                      "iterations_completed": fallback_iters,
                       "backend": worker.get("backend", ""),
                       "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                   }
@@ -624,10 +635,9 @@ jobs:
       - name: Upload updated state
         uses: actions/upload-artifact@v6
         with:
-          name: mersenne-free-state
+          name: mersenne-free-state-${{ github.run_id }}
           path: merged_out/search_state.json
           retention-days: 30
-          overwrite: true
 
       - name: Upload merged results
         uses: actions/upload-artifact@v6
