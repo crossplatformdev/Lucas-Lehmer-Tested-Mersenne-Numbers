@@ -2652,8 +2652,23 @@ struct DiscoverResult {
     unsigned    threads{1};
     uint32_t    shard_index{0};
     uint32_t    shard_count{1};
+    uint64_t    iterations_completed{0};
+    uint64_t    iterations_total{0};
     std::string backend_name;
+    std::string status{"completed_composite"};
+    std::string checkpoint_file;
+    std::string final_residue_hex{"0000000000000000"};
 };
+
+static const char* discover_result_label(const DiscoverResult& r) {
+    if (r.status == "completed_prime")      return "prime";
+    if (r.status == "completed_composite")  return "composite";
+    if (r.status == "partial_soft_stop")    return "partial";
+    if (r.status == "skipped_exceeds_uint32") return "skipped";
+    return r.is_prime ? "prime" : "composite";
+}
+
+static std::string json_escape(const std::string& s);
 
 // Return the backend name that lucas_lehmer() would select for exponent p.
 static std::string discover_backend_name(uint64_t p) {
@@ -2675,13 +2690,15 @@ static void write_discover_csv(
 {
     std::ofstream f(path);
     if (!f) { std::fprintf(stderr, "Cannot write CSV: %s\n", path.c_str()); return; }
-    f << "exponent,result,backend,elapsed_sec,threads,mode,"
-         "shard_index,shard_count,is_explicit_first,is_new_discovery\n";
+    f << "exponent,result,status,backend,elapsed_sec,threads,mode,"
+         "shard_index,shard_count,is_explicit_first,is_new_discovery,"
+         "iterations_completed,iterations_total,checkpoint_file,final_residue_hex\n";
     for (const auto& r : results) {
         char ebuf[32];
         std::snprintf(ebuf, sizeof(ebuf), "%.6f", r.elapsed_sec);
         f << r.exponent << ","
-          << (r.is_prime ? "prime" : "composite") << ","
+          << discover_result_label(r) << ","
+          << r.status << ","
           << r.backend_name << ","
           << ebuf << ","
           << r.threads << ","
@@ -2689,7 +2706,11 @@ static void write_discover_csv(
           << r.shard_index << ","
           << r.shard_count << ","
           << (r.is_explicit_first ? "1" : "0") << ","
-          << (r.is_new_discovery ? "1" : "0") << "\n";
+          << (r.is_new_discovery ? "1" : "0") << ","
+          << r.iterations_completed << ","
+          << r.iterations_total << ","
+          << '"' << json_escape(r.checkpoint_file) << '"' << ","
+          << '"' << json_escape(r.final_residue_hex) << '"' << "\n";
     }
 }
 
@@ -2751,7 +2772,8 @@ static void write_discover_json(
         std::snprintf(ebuf, sizeof(ebuf), "%.6f", r.elapsed_sec);
         f << "    {\n"
           << "      \"exponent\": " << r.exponent << ",\n"
-          << "      \"result\": \"" << (r.is_prime ? "prime" : "composite") << "\",\n"
+          << "      \"result\": \"" << discover_result_label(r) << "\",\n"
+          << "      \"status\": \"" << json_escape(r.status) << "\",\n"
           << "      \"backend\": \"" << json_escape(r.backend_name) << "\",\n"
           << "      \"elapsed_sec\": " << ebuf << ",\n"
           << "      \"threads\": " << r.threads << ",\n"
@@ -2759,7 +2781,11 @@ static void write_discover_json(
           << "      \"shard_count\": " << r.shard_count << ",\n"
           << "      \"is_explicit_first\": " << (r.is_explicit_first ? "true" : "false") << ",\n"
           << "      \"is_known_mersenne_prime\": " << (r.is_known ? "true" : "false") << ",\n"
-          << "      \"is_new_discovery\": " << (r.is_new_discovery ? "true" : "false") << "\n"
+          << "      \"is_new_discovery\": " << (r.is_new_discovery ? "true" : "false") << ",\n"
+          << "      \"iterations_completed\": " << r.iterations_completed << ",\n"
+          << "      \"iterations_total\": " << r.iterations_total << ",\n"
+          << "      \"checkpoint_file\": \"" << json_escape(r.checkpoint_file) << "\",\n"
+          << "      \"final_residue_hex\": \"" << json_escape(r.final_residue_hex) << "\"\n"
           << "    }" << (i + 1 < results.size() ? "," : "") << "\n";
     }
     f << "  ]\n}\n";
@@ -3053,7 +3079,10 @@ static int run_discover_mode(int argc, char** argv) {
             r.threads          = threads;
             r.shard_index      = shard_index;
             r.shard_count      = shard_count;
+            r.iterations_completed = 0u;
+            r.iterations_total  = (p > 1u) ? (p - 2u) : 0u;
             r.backend_name     = "skipped_exceeds_uint32";
+            r.status           = "skipped_exceeds_uint32";
             results.push_back(r);
             ++tested;
             continue;
@@ -3099,6 +3128,7 @@ static int run_discover_mode(int argc, char** argv) {
         bool isPrime = false;
         double elapsed = 0.0;
         std::string chk_written;
+        std::string final_residue_hex = "0000000000000000";
 
         // Use checkpointed path when checkpoint dir is configured.
         // soft_stop_epoch is always 0 when chk_dir is empty (enforced above).
@@ -3119,6 +3149,8 @@ static int run_discover_mode(int argc, char** argv) {
             const auto t1 = std::chrono::steady_clock::now();
             elapsed = std::chrono::duration<double>(t1 - t0).count();
             chk_written = chk.chk_file;
+            final_residue_hex = chk.residue_hex.empty() ? "0000000000000000"
+                                                        : chk.residue_hex;
 
             if (chk.status == CheckpointStatus::soft_stopped) {
                 any_soft_stopped = true;
@@ -3137,7 +3169,11 @@ static int run_discover_mode(int argc, char** argv) {
                 r.threads           = threads;
                 r.shard_index       = shard_index;
                 r.shard_count       = shard_count;
+                r.iterations_completed = chk.iters_done;
+                r.iterations_total  = (p > 1u) ? (p - 2u) : 0u;
                 r.backend_name      = discover_backend_name(p) + "_partial";
+                r.status            = "partial_soft_stop";
+                r.checkpoint_file   = chk_written;
                 results.push_back(r);
                 ++tested;
 
@@ -3149,9 +3185,13 @@ static int run_discover_mode(int argc, char** argv) {
             isPrime = (chk.status == CheckpointStatus::completed_prime);
         } else {
             const auto t0 = std::chrono::steady_clock::now();
-            isPrime = mersenne::lucas_lehmer(p32, progress, /*benchmark_mode=*/false);
+            const ProgressContext ctx{};
+            const LLResult llr =
+                mersenne::lucas_lehmer_ex(p32, progress, /*benchmark_mode=*/false, ctx);
             const auto t1 = std::chrono::steady_clock::now();
             elapsed = std::chrono::duration<double>(t1 - t0).count();
+            isPrime = llr.is_prime;
+            final_residue_hex = llr.final_residue_hex;
         }
 
         const bool is_known = mersenne::is_known_mersenne_prime(p);
@@ -3171,7 +3211,12 @@ static int run_discover_mode(int argc, char** argv) {
         r.threads          = threads;
         r.shard_index      = shard_index;
         r.shard_count      = shard_count;
+        r.iterations_completed = (p > 1u) ? (p - 2u) : 0u;
+        r.iterations_total = (p > 1u) ? (p - 2u) : 0u;
         r.backend_name     = discover_backend_name(p);
+        r.status           = isPrime ? "completed_prime" : "completed_composite";
+        r.checkpoint_file  = chk_written;
+        r.final_residue_hex = final_residue_hex;
         results.push_back(r);
 
         ++tested;

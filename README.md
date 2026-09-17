@@ -150,6 +150,10 @@ variables:
 | `LL_DRY_RUN` | `0` | `1` = print plan without running LL tests |
 | `LL_PROGRESS` | `0` | `1` = show per-iteration LL progress |
 | `LL_OUTPUT_DIR` | `discover_out/` | Directory for result files (CSV, JSON) |
+| `LL_CHECKPOINT_DIR` | *(none)* | Directory for checkpoint files; enables soft-stop/resume support in discover mode |
+| `LL_CHECKPOINT_INTERVAL_ITERS` | `500000` | Iteration cadence for discover-mode checkpoints when `LL_CHECKPOINT_DIR` is set |
+| `LL_SOFT_STOP_EPOCH_SECS` | `0` | Soft-stop Unix epoch; writes a checkpoint and exits with code `4` once reached |
+| `LL_RESUME_CHECKPOINT_FILE` | *(none)* | Resume discover mode from a previously saved checkpoint file |
 
 ### Power-bucket mode
 
@@ -255,6 +259,7 @@ All workflows are in `.github/workflows/`.
 | File | Trigger | Description |
 |---|---|---|
 | `discover-primes.yml` | `workflow_dispatch` | Run discover mode; configurable via inputs |
+| `mersenne-search-free.yml` | `workflow_dispatch` | GitHub Free wave scheduler: up to 20 one-exponent workers, cache-backed checkpoints, local `-march=native` builds |
 | `power-range-prime-sweep.yml` | `workflow_dispatch` | Power-bucket sweep for one or more buckets |
 | `prime-sweep-wrapper.yml` | `workflow_dispatch` | Wrapper that fans out prime-sweep jobs |
 | `manual-sweep.yml` | `workflow_dispatch` | Ad-hoc configurable sweep |

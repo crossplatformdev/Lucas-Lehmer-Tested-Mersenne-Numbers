@@ -1,0 +1,715 @@
+name: Mersenne Search (GitHub Free)
+run-name: "Mersenne Free Wave · frontier>${{ inputs.frontier_exclusive }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      frontier_exclusive:
+        description: "Exclusive lower frontier; planner starts above this exponent"
+        required: false
+        default: "141566917"
+        type: string
+      start_exponent:
+        description: "Optional first exponent to consider (0 = resume state or frontier+1)"
+        required: false
+        default: "0"
+        type: string
+      max_exponent:
+        description: "Optional inclusive upper bound (0 = no upper bound)"
+        required: false
+        default: "0"
+        type: string
+      wave_size:
+        description: "How many exponents to schedule this wave (1-20)"
+        required: false
+        default: "20"
+        type: string
+      ll_threads:
+        description: "Outer Lucas-Lehmer threads per worker"
+        required: false
+        default: "1"
+        type: string
+      fft_threads:
+        description: "Intra-FFT threads per worker"
+        required: false
+        default: "4"
+        type: string
+      checkpoint_interval_iters:
+        description: "Checkpoint cadence in iterations"
+        required: false
+        default: "250000"
+        type: string
+      soft_stop_seconds:
+        description: "Per-worker compute window in seconds before soft stop"
+        required: false
+        default: "19800"
+        type: string
+      progress:
+        description: "Enable sparse in-run progress output"
+        required: false
+        default: false
+        type: boolean
+      reset_state:
+        description: "Ignore the previous wave state and start fresh"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  plan:
+    name: Plan wave
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      worker_matrix: ${{ steps.plan.outputs.worker_matrix }}
+      worker_count: ${{ steps.plan.outputs.worker_count }}
+      next_start_exponent: ${{ steps.plan.outputs.next_start_exponent }}
+    env:
+      FRONTIER_EXCLUSIVE: ${{ inputs.frontier_exclusive }}
+      START_EXPONENT: ${{ inputs.start_exponent }}
+      MAX_EXPONENT: ${{ inputs.max_exponent }}
+      WAVE_SIZE: ${{ inputs.wave_size }}
+      RESET_STATE: ${{ inputs.reset_state && '1' || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate planner inputs
+        run: |
+          set -Eeuo pipefail
+          for VAR in FRONTIER_EXCLUSIVE START_EXPONENT MAX_EXPONENT WAVE_SIZE; do
+            VAL="${!VAR}"
+            if ! [[ "${VAL}" =~ ^[0-9]+$ ]]; then
+              echo "::error::${VAR} must be a non-negative integer, got '${VAL}'"
+              exit 1
+            fi
+          done
+          if (( WAVE_SIZE < 1 || WAVE_SIZE > 20 )); then
+            echo "::error::wave_size must be between 1 and 20, got ${WAVE_SIZE}"
+            exit 1
+          fi
+
+      - name: Restore previous wave state
+        id: restore_state
+        if: env.RESET_STATE != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p state_in
+          ARTIFACT_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts
+              | map(select(.name | startswith("mersenne-free-state-")))
+              | sort_by(.created_at) | reverse | .[0].id // empty' \
+            2>/dev/null || true)
+          if [[ -z "${ARTIFACT_ID}" ]]; then
+            echo '{}' > state_in/search_state.json
+            echo "found_state=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            -H "Accept: application/vnd.github+json" \
+            > state_in/state.zip
+          unzip -q state_in/state.zip -d state_in/
+          rm -f state_in/state.zip
+          mapfile -t STATE_FILES < <(find state_in -name 'search_state.json')
+          if (( ${#STATE_FILES[@]} == 0 )); then
+            echo '{}' > state_in/search_state.json
+            echo "found_state=false" >> "$GITHUB_OUTPUT"
+          elif (( ${#STATE_FILES[@]} > 1 )); then
+            echo "::error::Expected exactly one search_state.json in the state artifact, found ${#STATE_FILES[@]}"
+            printf ' - %s\n' "${STATE_FILES[@]}"
+            exit 1
+          else
+            cp "${STATE_FILES[0]}" state_in/search_state.json
+            echo "found_state=true" >> "$GITHUB_OUTPUT"
+            cat state_in/search_state.json
+          fi
+
+      - name: Initialize empty state
+        if: env.RESET_STATE == '1'
+        run: |
+          mkdir -p state_in
+          echo '{}' > state_in/search_state.json
+
+      - name: Build wave matrix
+        id: plan
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, os.path.join(os.getcwd(), "scripts"))
+          import ll_chain
+
+          state_path = os.path.join("state_in", "search_state.json")
+          try:
+              with open(state_path, "r", encoding="utf-8") as fh:
+                  state = json.load(fh)
+          except Exception:
+              state = {}
+
+          frontier = int(os.environ["FRONTIER_EXCLUSIVE"])
+          start_input = int(os.environ["START_EXPONENT"])
+          max_exponent = int(os.environ["MAX_EXPONENT"])
+          wave_size = int(os.environ["WAVE_SIZE"])
+
+          completed = {int(x) for x in state.get("completed_exponents", [])}
+          prior_partials = []
+          for entry in state.get("partials", []):
+              try:
+                  prior_partials.append({
+                      "exponent": int(entry["exponent"]),
+                      "checkpoint_cache_key": str(entry.get("checkpoint_cache_key", "")),
+                      "iterations_completed": int(entry.get("iterations_completed", 0)),
+                      "updated_at": str(entry.get("updated_at", "")),
+                  })
+              except Exception:
+                  continue
+
+          cursor = max(
+              frontier + 1,
+              start_input if start_input > 0 else int(state.get("next_start_exponent", 0) or 0) or (frontier + 1),
+          )
+
+          scheduled = []
+          scheduled_exponents = set()
+
+          for entry in prior_partials:
+              p = entry["exponent"]
+              if p in completed or p in scheduled_exponents:
+                  continue
+              scheduled.append({
+                  "slot": len(scheduled),
+                  "exponent": p,
+                  "mode": "resume",
+                  "resume_cache_key": entry["checkpoint_cache_key"],
+                  "resume_iterations": entry["iterations_completed"],
+              })
+              scheduled_exponents.add(p)
+              if len(scheduled) >= wave_size:
+                  break
+
+          seen = completed | {entry["exponent"] for entry in prior_partials} | scheduled_exponents
+          candidate = ll_chain.first_prime_ge(cursor)
+          while len(scheduled) < wave_size and (max_exponent == 0 or candidate <= max_exponent):
+              if candidate not in seen:
+                  scheduled.append({
+                      "slot": len(scheduled),
+                      "exponent": candidate,
+                      "mode": "fresh",
+                      "resume_cache_key": "",
+                      "resume_iterations": 0,
+                  })
+                  scheduled_exponents.add(candidate)
+                  seen.add(candidate)
+              candidate = ll_chain.next_prime_after(candidate)
+
+          next_start = candidate
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as gh:
+              gh.write(f"worker_matrix={json.dumps(scheduled)}\n")
+              gh.write(f"worker_count={len(scheduled)}\n")
+              gh.write(f"next_start_exponent={next_start}\n")
+
+          print("Scheduled wave:")
+          print(json.dumps(scheduled, indent=2))
+          print(f"next_start_exponent={next_start}")
+          PYEOF
+
+  search:
+    name: "Search p=${{ matrix.exponent }}"
+    needs: plan
+    if: needs.plan.outputs.worker_count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.worker_matrix) }}
+    env:
+      LL_THREADS: ${{ inputs.ll_threads }}
+      FFT_THREADS: ${{ inputs.fft_threads }}
+      CHECKPOINT_INTERVAL_ITERS: ${{ inputs.checkpoint_interval_iters }}
+      SOFT_STOP_SECONDS: ${{ inputs.soft_stop_seconds }}
+      PROGRESS: ${{ inputs.progress && '1' || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate worker inputs
+        run: |
+          set -Eeuo pipefail
+          for VAR in LL_THREADS FFT_THREADS CHECKPOINT_INTERVAL_ITERS SOFT_STOP_SECONDS; do
+            VAL="${!VAR}"
+            if ! [[ "${VAL}" =~ ^[0-9]+$ ]]; then
+              echo "::error::${VAR} must be a non-negative integer, got '${VAL}'"
+              exit 1
+            fi
+          done
+          if (( LL_THREADS < 1 || FFT_THREADS < 1 )); then
+            echo "::error::LL_THREADS and FFT_THREADS must be >= 1"
+            exit 1
+          fi
+          if (( SOFT_STOP_SECONDS < 60 )); then
+            echo "::error::soft_stop_seconds must be >= 60"
+            exit 1
+          fi
+
+      - name: Restore checkpoint cache
+        id: restore_checkpoint
+        if: matrix.resume_cache_key != ''
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: checkpoint_in
+          key: ${{ matrix.resume_cache_key }}
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++ make libboost-dev pkg-config
+
+      - name: Build bignum locally
+        run: make all
+
+      - name: Run Lucas-Lehmer search
+        id: run
+        env:
+          CURRENT_EXPONENT: ${{ matrix.exponent }}
+          RESUME_CACHE_KEY: ${{ matrix.resume_cache_key }}
+          SEARCH_MODE: ${{ matrix.mode }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p checkpoint_in checkpoint_out checkpoint_cache worker_out/discover_out
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          SOFT_STOP_EPOCH=$(( $(date +%s) + SOFT_STOP_SECONDS ))
+          RESUME_CHK_FILE=""
+          if [[ -n "${RESUME_CACHE_KEY}" ]]; then
+            RESUME_CHK_FILE=$(find checkpoint_in -name 'll_chk_*.bin' | head -1 || true)
+          fi
+
+          echo "Workflow run: ${RUN_URL}"
+          echo "Job         : search"
+          echo "Exponent    : ${CURRENT_EXPONENT}"
+          echo "Mode        : ${SEARCH_MODE}"
+          echo "Resume cache: ${RESUME_CACHE_KEY}"
+          echo "Resume file : ${RESUME_CHK_FILE}"
+          echo "Soft stop   : ${SOFT_STOP_EPOCH}"
+
+          set +e
+          LL_SWEEP_MODE=discover \
+          LL_SINGLE_EXPONENT="${CURRENT_EXPONENT}" \
+          LL_MIN_EXPONENT="${CURRENT_EXPONENT}" \
+          LL_MAX_EXPONENT="${CURRENT_EXPONENT}" \
+          LL_STOP_AFTER_N_CASES=1 \
+          LL_CHECKPOINT_DIR="$(pwd)/checkpoint_out" \
+          LL_CHECKPOINT_INTERVAL_ITERS="${CHECKPOINT_INTERVAL_ITERS}" \
+          LL_SOFT_STOP_EPOCH_SECS="${SOFT_STOP_EPOCH}" \
+          LL_DRY_RUN=0 \
+          LL_PROGRESS="${PROGRESS}" \
+          LL_FFT_THREADS="${FFT_THREADS}" \
+          LL_FFT_ALLOW_NESTED=0 \
+          LL_OUTPUT_DIR="worker_out/discover_out/" \
+          LL_RESUME_CHECKPOINT_FILE="${RESUME_CHK_FILE}" \
+          ./bin/bignum 0 "${LL_THREADS}" 2>&1 | tee worker_out/run.log
+          LL_EXIT=$?
+          set -e
+
+          CHECKPOINT_CACHE_KEY=""
+          if find checkpoint_out -name 'll_chk_*.bin' -print -quit | grep -q .; then
+            cp checkpoint_out/ll_chk_*.bin checkpoint_cache/
+          fi
+
+          if find checkpoint_cache -name 'll_chk_*.bin' -print -quit | grep -q .; then
+            CHECKPOINT_CACHE_KEY="mersenne-free-chk-p${CURRENT_EXPONENT}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          export CHECKPOINT_CACHE_KEY
+
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import platform
+          import sys
+
+          path = os.path.join("worker_out", "discover_out", "discover_results.json")
+          if os.path.exists(path):
+              with open(path, "r", encoding="utf-8") as fh:
+                  payload = json.load(fh)
+              result = payload["results"][0]
+          else:
+              result = {
+                  "exponent": int(os.environ["CURRENT_EXPONENT"]),
+                  "result": "failed",
+                  "status": "failed",
+                  "backend": "unknown",
+                  "elapsed_sec": 0.0,
+                  "iterations_completed": 0,
+                  "iterations_total": max(0, int(os.environ["CURRENT_EXPONENT"]) - 2),
+                  "checkpoint_file": "",
+                  "final_residue_hex": "0000000000000000",
+              }
+          worker = {
+              "exponent": int(result["exponent"]),
+              "result": result["result"],
+              "status": result["status"],
+              "backend": result["backend"],
+              "elapsed_sec": result["elapsed_sec"],
+              "iterations_completed": int(result["iterations_completed"]),
+              "iterations_total": int(result["iterations_total"]),
+              "checkpoint_file": result["checkpoint_file"],
+              "final_residue_hex": result["final_residue_hex"],
+              "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "job_name": "search",
+              "runner_arch": platform.machine(),
+              "ll_threads": int(os.environ["LL_THREADS"]),
+              "fft_threads": int(os.environ["FFT_THREADS"]),
+              "resume_cache_key": os.environ.get("RESUME_CACHE_KEY", ""),
+              "checkpoint_cache_key": os.environ.get("CHECKPOINT_CACHE_KEY", ""),
+              "git_sha": os.environ.get("GITHUB_SHA", ""),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+              "matrix_mode": os.environ.get("SEARCH_MODE", ""),
+          }
+          with open(os.path.join("worker_out", "worker_result.json"), "w", encoding="utf-8") as fh:
+              json.dump(worker, fh, indent=2)
+          print(json.dumps(worker, indent=2))
+          PYEOF
+
+          STATUS=$(python3 -c 'import json; print(json.load(open("worker_out/worker_result.json"))["status"])')
+          RESULT=$(python3 -c 'import json; print(json.load(open("worker_out/worker_result.json"))["result"])')
+          PRIME_CANDIDATE=$([[ "${STATUS}" == "completed_prime" ]] && echo true || echo false)
+          echo "ll_exit=${LL_EXIT}" >> "$GITHUB_OUTPUT"
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
+          echo "prime_candidate=${PRIME_CANDIDATE}" >> "$GITHUB_OUTPUT"
+          echo "checkpoint_cache_key=${CHECKPOINT_CACHE_KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Save checkpoint cache
+        if: steps.run.outputs.status == 'partial_soft_stop' && steps.run.outputs.checkpoint_cache_key != ''
+        uses: actions/cache/save@v4
+        with:
+          path: checkpoint_cache
+          key: ${{ steps.run.outputs.checkpoint_cache_key }}
+
+      - name: Upload worker artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: mersenne-free-worker-p${{ matrix.exponent }}
+          path: |
+            worker_out/worker_result.json
+            worker_out/run.log
+            worker_out/discover_out/
+          retention-days: 30
+          if-no-files-found: warn
+
+  merge:
+    name: Merge wave results
+    needs: [plan, search]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      prime_count: ${{ steps.merge.outputs.prime_count }}
+      prime_matrix: ${{ steps.merge.outputs.prime_matrix }}
+    env:
+      FRONTIER_EXCLUSIVE: ${{ inputs.frontier_exclusive }}
+      NEXT_START_EXPONENT: ${{ needs.plan.outputs.next_start_exponent }}
+      RESET_STATE: ${{ inputs.reset_state && '1' || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download worker artifacts
+        if: needs.plan.outputs.worker_count != '0'
+        uses: actions/download-artifact@v6
+        with:
+          pattern: mersenne-free-worker-p*
+          path: worker_artifacts
+          merge-multiple: false
+
+      - name: Restore previous wave state
+        if: env.RESET_STATE != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p state_prev
+          ARTIFACT_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts
+              | map(select(.name | startswith("mersenne-free-state-")))
+              | sort_by(.created_at) | reverse | .[0].id // empty' \
+            2>/dev/null || true)
+          if [[ -z "${ARTIFACT_ID}" ]]; then
+            echo '{}' > state_prev/search_state.json
+            exit 0
+          fi
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            -H "Accept: application/vnd.github+json" \
+            > state_prev/state.zip
+          unzip -q state_prev/state.zip -d state_prev/
+          rm -f state_prev/state.zip
+          mapfile -t STATE_FILES < <(find state_prev -name 'search_state.json')
+          if (( ${#STATE_FILES[@]} == 0 )); then
+            echo '{}' > state_prev/search_state.json
+          elif (( ${#STATE_FILES[@]} > 1 )); then
+            echo "::error::Expected exactly one search_state.json in the state artifact, found ${#STATE_FILES[@]}"
+            printf ' - %s\n' "${STATE_FILES[@]}"
+            exit 1
+          else
+            cp "${STATE_FILES[0]}" state_prev/search_state.json
+          fi
+
+      - name: Initialize empty previous state
+        if: env.RESET_STATE == '1'
+        run: |
+          mkdir -p state_prev
+          echo '{}' > state_prev/search_state.json
+
+      - name: Merge and summarize
+        id: merge
+        run: |
+          set -Eeuo pipefail
+          mkdir -p merged_out
+          python3 - <<'PYEOF'
+          import glob
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          prev_path = os.path.join("state_prev", "search_state.json")
+          try:
+              with open(prev_path, "r", encoding="utf-8") as fh:
+                  prev = json.load(fh)
+          except Exception:
+              prev = {}
+
+          workers = []
+          for path in sorted(glob.glob("worker_artifacts/**/worker_result.json", recursive=True)):
+              with open(path, "r", encoding="utf-8") as fh:
+                  workers.append(json.load(fh))
+          workers.sort(key=lambda item: item["exponent"])
+
+          scheduled = {int(w["exponent"]) for w in workers}
+          prior_partials = {
+              int(entry["exponent"]): entry
+              for entry in prev.get("partials", [])
+              if isinstance(entry, dict) and "exponent" in entry
+          }
+
+          completed = {int(x) for x in prev.get("completed_exponents", [])}
+          new_partials = {}
+          stale_cache_keys = set()
+          prime_candidates = []
+
+          for worker in workers:
+              exponent = int(worker["exponent"])
+              status = worker["status"]
+              resume_key = worker.get("resume_cache_key", "")
+              saved_key = worker.get("checkpoint_cache_key", "")
+              if status == "partial_soft_stop":
+                  if resume_key and saved_key:
+                      stale_cache_keys.add(resume_key)
+                  new_partials[exponent] = {
+                      "exponent": exponent,
+                      "checkpoint_cache_key": saved_key,
+                      "iterations_completed": int(worker["iterations_completed"]),
+                      "backend": worker["backend"],
+                      "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  }
+              elif status in {"completed_composite", "completed_prime", "skipped_exceeds_uint32"}:
+                  if resume_key:
+                      stale_cache_keys.add(resume_key)
+                  completed.add(exponent)
+                  if status == "completed_prime":
+                      prime_candidates.append({
+                          "exponent": exponent,
+                          "backend": worker["backend"],
+                          "elapsed_sec": worker["elapsed_sec"],
+                          "final_residue_hex": worker["final_residue_hex"],
+                          "run_url": worker["run_url"],
+                      })
+              else:
+                  fallback_cache_key = resume_key
+                  fallback_iters = 0
+                  if exponent in prior_partials:
+                      fallback_cache_key = str(prior_partials[exponent].get("checkpoint_cache_key", fallback_cache_key))
+                      fallback_iters = int(prior_partials[exponent].get("iterations_completed", 0))
+                  new_partials[exponent] = {
+                      "exponent": exponent,
+                      "checkpoint_cache_key": fallback_cache_key,
+                      "iterations_completed": fallback_iters,
+                      "backend": worker.get("backend", ""),
+                      "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  }
+
+          for exponent, entry in prior_partials.items():
+              if exponent not in scheduled and exponent not in completed:
+                  new_partials[exponent] = entry
+
+          state = {
+              "schema_version": 1,
+              "frontier_exclusive": int(os.environ["FRONTIER_EXCLUSIVE"]),
+              "next_start_exponent": int(os.environ["NEXT_START_EXPONENT"]),
+              "completed_exponents": sorted(completed),
+              "partials": [new_partials[k] for k in sorted(new_partials)],
+              "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "workflow_run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "workflow_job": "merge",
+              "git_sha": os.environ.get("GITHUB_SHA", ""),
+          }
+
+          summary = {
+              "workers_scheduled": len(workers),
+              "completed_this_wave": sum(1 for w in workers if w["status"] in {"completed_composite", "completed_prime", "skipped_exceeds_uint32"}),
+              "partials_this_wave": sum(1 for w in workers if w["status"] == "partial_soft_stop"),
+              "prime_candidates_this_wave": prime_candidates,
+              "workers": workers,
+              "state": state,
+          }
+
+          with open("merged_out/search_state.json", "w", encoding="utf-8") as fh:
+              json.dump(state, fh, indent=2)
+          with open("merged_out/merged_results.json", "w", encoding="utf-8") as fh:
+              json.dump(summary, fh, indent=2)
+          with open("merged_out/prime_candidates.json", "w", encoding="utf-8") as fh:
+              json.dump(prime_candidates, fh, indent=2)
+          with open("merged_out/stale_cache_keys.txt", "w", encoding="utf-8") as fh:
+              for key in sorted(k for k in stale_cache_keys if k):
+                  fh.write(f"{key}\n")
+
+          lines = [
+              "# Mersenne Search (GitHub Free)",
+              "",
+              f"- Workflow run: {state['workflow_run_url']}",
+              "- Job: merge",
+              f"- Workers scheduled: {len(workers)}",
+              f"- Completed this wave: {summary['completed_this_wave']}",
+              f"- Partial checkpoints kept: {summary['partials_this_wave']}",
+              f"- Pending partial exponents: {len(state['partials'])}",
+              f"- Next fresh exponent cursor: {state['next_start_exponent']}",
+              "",
+              "| Exponent | Status | Backend | Iterations | Residue | Run |",
+              "|---|---|---|---:|---|---|",
+          ]
+          for worker in workers:
+              run_link = f"[run]({worker['run_url']})"
+              lines.append(
+                  f"| {worker['exponent']} | {worker['status']} | {worker['backend']} | "
+                  f"{worker['iterations_completed']}/{worker['iterations_total']} | "
+                  f"`{worker['final_residue_hex']}` | {run_link} |"
+              )
+          if prime_candidates:
+              lines.extend(["", "## Prime candidates", ""])
+              for candidate in prime_candidates:
+                  lines.append(f"- M_{candidate['exponent']} ({candidate['run_url']})")
+          with open("merged_out/summary.md", "w", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+
+          prime_matrix = json.dumps([{"exponent": item["exponent"]} for item in prime_candidates])
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as gh:
+              gh.write(f"prime_count={len(prime_candidates)}\n")
+              gh.write(f"prime_matrix={prime_matrix}\n")
+          PYEOF
+
+      - name: Delete stale checkpoint caches
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          if [[ ! -s merged_out/stale_cache_keys.txt ]]; then
+            echo "No stale checkpoint caches to delete."
+            exit 0
+          fi
+          while IFS= read -r KEY; do
+            [[ -z "${KEY}" ]] && continue
+            echo "Deleting cache key: ${KEY}"
+            KEY_ESCAPED=$(RAW_KEY="${KEY}" python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["RAW_KEY"], safe=""))')
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/caches?key=${KEY_ESCAPED}" \
+              >/dev/null 2>&1 || echo "::warning::Could not delete cache ${KEY}"
+          done < merged_out/stale_cache_keys.txt
+
+      - name: Upload updated state
+        uses: actions/upload-artifact@v6
+        with:
+          name: mersenne-free-state-${{ github.run_id }}
+          path: merged_out/search_state.json
+          retention-days: 30
+
+      - name: Upload merged results
+        uses: actions/upload-artifact@v6
+        with:
+          name: mersenne-free-results-${{ github.run_id }}
+          path: merged_out/
+          retention-days: 30
+
+      - name: Append workflow summary
+        if: always()
+        run: cat merged_out/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+  verify-candidate:
+    name: "Verify M_${{ matrix.exponent }}"
+    needs: merge
+    if: needs.merge.outputs.prime_count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJson(needs.merge.outputs.prime_matrix) }}
+    env:
+      LL_THREADS: ${{ inputs.ll_threads }}
+      FFT_THREADS: ${{ inputs.fft_threads }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++ make libboost-dev pkg-config
+
+      - name: Build bignum locally
+        run: make all
+
+      - name: Re-run Lucas-Lehmer verification
+        run: |
+          set -Eeuo pipefail
+          mkdir -p verify_out/discover_out
+          LL_SWEEP_MODE=discover \
+          LL_SINGLE_EXPONENT="${{ matrix.exponent }}" \
+          LL_MIN_EXPONENT="${{ matrix.exponent }}" \
+          LL_MAX_EXPONENT="${{ matrix.exponent }}" \
+          LL_STOP_AFTER_N_CASES=1 \
+          LL_DRY_RUN=0 \
+          LL_PROGRESS=0 \
+          LL_FFT_THREADS="${FFT_THREADS}" \
+          LL_FFT_ALLOW_NESTED=0 \
+          LL_OUTPUT_DIR="verify_out/discover_out/" \
+          ./bin/bignum 0 "${LL_THREADS}" 2>&1 | tee verify_out/run.log
+
+          STATUS=$(python3 -c 'import json; print(json.load(open("verify_out/discover_out/discover_results.json"))["results"][0]["status"])')
+          if [[ "${STATUS}" != "completed_prime" ]]; then
+            echo "::error::Independent verification did not reproduce a prime result for M_${{ matrix.exponent }} (status=${STATUS})."
+            exit 1
+          fi
+
+      - name: Upload verification artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: mersenne-free-verify-p${{ matrix.exponent }}
+          path: verify_out/
+          retention-days: 30
