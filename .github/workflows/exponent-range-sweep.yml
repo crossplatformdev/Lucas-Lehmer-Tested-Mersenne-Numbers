@@ -320,7 +320,7 @@ jobs:
           mkdir -p merged_out/
 
           # Concatenate all worker CSVs (skip header from all but the first).
-          echo "p,is_prime,time_sec" > merged_out/merged_results.csv
+          echo "p,is_prime,residue_hex,time_elapsed" > merged_out/merged_results.csv
           for f in batch_artifacts/*.csv; do
             [ -f "$f" ] && tail -n +2 "$f" >> merged_out/merged_results.csv || true
           done
@@ -387,12 +387,15 @@ jobs:
             if [ "${PRIMES}" -gt 0 ]; then
               echo "### 🎉 Mersenne Primes Found!"
               echo ""
-              echo "| Exponent | Time (s) |"
-              echo "|----------|----------|"
-              grep ",true," merged_out/merged_results.csv 2>/dev/null | \
-                while IFS=, read -r p result time_sec; do
-                  echo "| M_${p} | ${time_sec} |"
-                done
+              echo "| Exponent | PRP | Residue | Time elapsed |"
+              echo "|----------|-----|---------|--------------|"
+              python3 - <<'PYEOF'
+          import csv
+          with open("merged_out/merged_results.csv", newline="") as f:
+              for row in csv.DictReader(f):
+                  if row.get("is_prime") == "true":
+                      print(f"| M_{row['p']} | {row['is_prime']} | `{row['residue_hex']}` | {row['time_elapsed']} |")
+          PYEOF
             fi
             echo ""
             echo "_Full results available in the \`range-sweep-merged-results\` artifact._"

@@ -192,7 +192,7 @@ jobs:
           fi
 
           # Collect all exponents whose is_prime column is "true".
-          # bignum LL_BENCH_OUTPUT CSV format: p,is_prime,time_sec
+          # bignum LL_BENCH_OUTPUT CSV format: p,is_prime,residue_hex,time_elapsed
           MERSENNE_EXPS=$(grep -E ",true," "${CSV_PATH}" | cut -d, -f1 | tr '\n' ' ' | sed 's/ $//' || true)
 
           if [ -z "${MERSENNE_EXPS}" ]; then
@@ -259,6 +259,38 @@ jobs:
           && echo "Run renamed successfully." \
           || echo "WARNING: failed to rename run (non-fatal)."
 
+      - name: Write worker README
+        if: always() && !inputs.dry_run
+        env:
+          CSV_PATH: ${{ steps.run_ll.outputs.csv_path }}
+        run: |
+          set -euo pipefail
+          REPORT_PATH="worker_out/README.md"
+          {
+            echo "# LL 4-Prime Worker Report"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Primes requested | p=${{ inputs.p1 }}, ${{ inputs.p2 || 'N/A' }}, ${{ inputs.p3 || 'N/A' }}, ${{ inputs.p4 || 'N/A' }} |"
+            echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+            echo ""
+            echo "## Prime Findings"
+            echo ""
+            if [ -n "${CSV_PATH}" ] && [ -f "${CSV_PATH}" ] && grep -q ",true," "${CSV_PATH}"; then
+              echo "| Exponent | PRP | Residue | Time elapsed |"
+              echo "|----------|-----|---------|--------------|"
+              python3 - <<'PYEOF'
+          import csv, os
+          with open(os.environ["CSV_PATH"], newline="") as f:
+              for row in csv.DictReader(f):
+                  if row.get("is_prime") == "true":
+                      print(f"| M_{row['p']} | {row['is_prime']} | `{row['residue_hex']}` | {row['time_elapsed']} |")
+          PYEOF
+            else
+              echo "_No Mersenne primes found in this batch._"
+            fi
+          } > "${REPORT_PATH}"
+
       - name: Upload results
         if: always() && !inputs.dry_run
         uses: actions/upload-artifact@v6
@@ -302,4 +334,18 @@ jobs:
             echo "| Elapsed time | ${ELAPSED_FMT} |"
             echo "| Status | ${STATUS_LABEL} |"
             echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+            echo ""
+            if [ -f "${{ steps.run_ll.outputs.csv_path }}" ] && grep -q ",true," "${{ steps.run_ll.outputs.csv_path }}"; then
+              echo "### Prime Findings"
+              echo ""
+              echo "| Exponent | PRP | Residue | Time elapsed |"
+              echo "|----------|-----|---------|--------------|"
+              python3 - <<'PYEOF'
+          import csv
+          with open("${{ steps.run_ll.outputs.csv_path }}", newline="") as f:
+              for row in csv.DictReader(f):
+                  if row.get("is_prime") == "true":
+                      print(f"| M_{row['p']} | {row['is_prime']} | `{row['residue_hex']}` | {row['time_elapsed']} |")
+          PYEOF
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

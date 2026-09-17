@@ -486,6 +486,31 @@ struct LLResult {
     std::string final_residue_hex{"0000000000000000"}; // 16-char lowercase hex
 };
 
+static std::string format_bench_time_elapsed(double elapsed_sec) {
+    if (!(elapsed_sec >= 0.0) || !std::isfinite(elapsed_sec))
+        elapsed_sec = 0.0;
+
+    long long total_ms = static_cast<long long>(std::llround(elapsed_sec * 1000.0));
+    const long long kDayMs  = 24ll * 60ll * 60ll * 1000ll;
+    const long long kHourMs = 60ll * 60ll * 1000ll;
+    const long long kMinMs  = 60ll * 1000ll;
+
+    const long long days = total_ms / kDayMs;
+    total_ms %= kDayMs;
+    const long long hours = total_ms / kHourMs;
+    total_ms %= kHourMs;
+    const long long minutes = total_ms / kMinMs;
+    total_ms %= kMinMs;
+    const long long seconds = total_ms / 1000ll;
+    const long long millis  = total_ms % 1000ll;
+
+    char buf[96];
+    std::snprintf(buf, sizeof(buf),
+                  "%lld days %lld hours %lld minutes %lld seconds %03lld milliseconds",
+                  days, hours, minutes, seconds, millis);
+    return std::string(buf);
+}
+
 // ============================================================
 // Checkpoint / resume support
 //
@@ -3738,15 +3763,19 @@ static int run_power_bucket_mode(int argc, char** argv) {
     return 0;
 }
 
-static bool test_exponent(uint32_t p, bool progress, bool benchmark_mode) {
+static LLResult test_exponent(uint32_t p, bool progress,
+                              bool benchmark_mode, double* elapsed_out = nullptr) {
+    const ProgressContext ctx{};
     std::printf("Testing M_%u ...\n", p);
     const auto t0     = std::chrono::steady_clock::now();
-    const bool isPrime = mersenne::lucas_lehmer(p, progress, benchmark_mode);
+    const LLResult result = mersenne::lucas_lehmer_ex(p, progress, benchmark_mode, ctx);
     const auto t1     = std::chrono::steady_clock::now();
     const std::chrono::duration<double> elapsed = t1 - t0;
-    std::printf("M_%u is %s. Time: %.3f s\n",
-                p, isPrime ? "prime" : "composite", elapsed.count());
-    return isPrime;
+    if (elapsed_out) *elapsed_out = elapsed.count();
+    std::printf("M_%u is %s. Time: %.3f s  residue: %s\n",
+                p, result.is_prime ? "prime" : "composite", elapsed.count(),
+                result.final_residue_hex.c_str());
+    return result;
 }
 
 int main(int argc, char** argv) {
@@ -3952,17 +3981,19 @@ int main(int argc, char** argv) {
     if (bench_output_path && *bench_output_path) {
         bench_fp = std::fopen(bench_output_path, "w");
         if (bench_fp)
-            std::fprintf(bench_fp, "p,is_prime,time_sec\n");
+            std::fprintf(bench_fp, "p,is_prime,residue_hex,time_elapsed\n");
         else
             std::fprintf(stderr, "Warning: cannot open LL_BENCH_OUTPUT='%s'\n",
                          bench_output_path);
     }
     std::mutex bench_mu;
-    auto record_result = [&](uint32_t p, bool isPrime, double elapsed) {
+    auto record_result = [&](uint32_t p, const LLResult& llr, double elapsed) {
         if (!bench_fp) return;
         std::lock_guard<std::mutex> lk(bench_mu);
-        std::fprintf(bench_fp, "%u,%s,%.6f\n",
-                     p, isPrime ? "true" : "false", elapsed);
+        const std::string time_elapsed = format_bench_time_elapsed(elapsed);
+        std::fprintf(bench_fp, "%u,%s,%s,\"%s\"\n",
+                     p, llr.is_prime ? "true" : "false",
+                     llr.final_residue_hex.c_str(), time_elapsed.c_str());
         std::fflush(bench_fp);
     };
 
@@ -3979,27 +4010,26 @@ int main(int argc, char** argv) {
             work.push_back(exponents[startIndex]);
         }
         const uint32_t p = work[0];
-        const bool isPrime = test_exponent(p, progress, benchmark_mode);
-        record_result(p, isPrime, 0.0);  // timing already printed by test_exponent
+        double elapsed = 0.0;
+        const LLResult llr = test_exponent(p, progress, benchmark_mode, &elapsed);
+        record_result(p, llr, elapsed);
         if (bench_fp) std::fclose(bench_fp);
-        return isPrime ? 0 : 2;
+        return llr.is_prime ? 0 : 2;
     }
 
     // --- Sequential execution ---
     if (threads == 1u) {
         for (uint32_t p : work) {
-            const auto t0     = std::chrono::steady_clock::now();
-            const bool isPrime = test_exponent(p, progress, benchmark_mode);
-            const auto t1     = std::chrono::steady_clock::now();
-            record_result(p, isPrime,
-                          std::chrono::duration<double>(t1 - t0).count());
+            double elapsed = 0.0;
+            const LLResult llr = test_exponent(p, progress, benchmark_mode, &elapsed);
+            record_result(p, llr, elapsed);
         }
         if (bench_fp) std::fclose(bench_fp);
         return 0;
     }
 
     // Result of one Lucas-Lehmer test, stored by work-list index for ordered output.
-    struct WorkResult { bool isPrime; double elapsed; };
+    struct WorkResult { LLResult llr; double elapsed; };
 
     // --- Thread-pool throughput mode ---
     // Workers pull from the work list via an atomic index counter so that
@@ -4032,12 +4062,13 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 }
                 const auto t0      = std::chrono::steady_clock::now();
-                const bool isPrime = mersenne::lucas_lehmer(p, progress, benchmark_mode);
+                const ProgressContext ctx{};
+                const LLResult llr = mersenne::lucas_lehmer_ex(p, progress, benchmark_mode, ctx);
                 const auto t1      = std::chrono::steady_clock::now();
                 const double elapsed =
                     std::chrono::duration<double>(t1 - t0).count();
-                results[idx] = {isPrime, elapsed};
-                record_result(p, isPrime, elapsed);
+                results[idx] = {llr, elapsed};
+                record_result(p, llr, elapsed);
             }
         });
     }
@@ -4047,8 +4078,9 @@ int main(int argc, char** argv) {
     // Print final verdicts in the original input order.
     for (size_t i = 0; i < work.size(); ++i) {
         const auto& r = results[i];
-        std::printf("M_%u is %s. Time: %.3f s\n",
-                    work[i], r.isPrime ? "prime" : "composite", r.elapsed);
+        std::printf("M_%u is %s. Time: %.3f s  residue: %s\n",
+                    work[i], r.llr.is_prime ? "prime" : "composite", r.elapsed,
+                    r.llr.final_residue_hex.c_str());
     }
     if (bench_fp) std::fclose(bench_fp);
     return 0;

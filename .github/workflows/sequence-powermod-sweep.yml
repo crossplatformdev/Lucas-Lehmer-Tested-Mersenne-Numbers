@@ -756,8 +756,8 @@ jobs:
           set -euo pipefail
           mkdir -p merged_out/
 
-          # bignum LL_BENCH_OUTPUT format: p,is_prime,time_sec
-          echo "p,is_prime,time_sec" > merged_out/merged_results.csv
+          # bignum LL_BENCH_OUTPUT format: p,is_prime,residue_hex,time_elapsed
+          echo "p,is_prime,residue_hex,time_elapsed" > merged_out/merged_results.csv
 
           for f in results/*.csv; do
             [ -f "$f" ] && tail -n +2 "$f" >> merged_out/merged_results.csv || true
@@ -825,12 +825,18 @@ jobs:
             if [ "${PRIMES}" -gt 0 ]; then
               echo "## 🎉 Mersenne Primes Found"
               echo ""
-              echo "| Exponent p | M_p = 2^p − 1 |"
-              echo "|------------|---------------|"
-              grep ",true," merged_out/merged_results.csv 2>/dev/null | \
-                while IFS=, read -r p _rest; do
-                  echo "| ${p} | M_${p} |"
-                done
+              echo "| Exponent p | PRP | Residue | Time elapsed | M_p = 2^p − 1 |"
+              echo "|------------|-----|---------|--------------|---------------|"
+              python3 - <<'PYEOF'
+          import csv
+          with open("merged_out/merged_results.csv", newline="") as f:
+              for row in csv.DictReader(f):
+                  if row.get("is_prime") == "true":
+                      print(
+                          f"| {row['p']} | {row['is_prime']} | `{row['residue_hex']}` | "
+                          f"{row['time_elapsed']} | M_{row['p']} |"
+                      )
+          PYEOF
             fi
             echo ""
             echo "## Worker Summary"
@@ -869,12 +875,13 @@ jobs:
             echo "_Full results available in the \`seqmod-merged-results-epoch${{ inputs.run_epoch }}\` artifact._"
           } > "${REPORT}"
 
+          cp "${REPORT}" merged_out/README.md
           cat "${REPORT}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Zip merged results
         run: |
           if [ -f merged_out/merged_results.csv ]; then
-            zip -9 merged_results.zip merged_out/merged_results.csv merged_out/report.md
+            zip -9 merged_results.zip merged_out/merged_results.csv merged_out/report.md merged_out/README.md
           fi
 
       - name: Upload merged results artifact

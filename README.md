@@ -123,7 +123,7 @@ variables:
 | `LL_STOP_AFTER_ONE` | `0` | `1` = run exactly one exponent then exit |
 | `LL_BENCHMARK_MODE` | `1` for known-list/prime/Mersenne modes; `0` for natural mode | Skip `is_prime_exponent()` check (safe when the input list is already prime) |
 | `LL_MAX_EXPONENT_INDEX` | *(list length)* | Exclusive upper bound on the known-list index (used to keep CI bounded) |
-| `LL_BENCH_OUTPUT` | *(none)* | Path for machine-readable CSV output (`p,is_prime,time_sec`) |
+| `LL_BENCH_OUTPUT` | *(none)* | Path for report CSV output (`p,is_prime,residue_hex,time_elapsed`) |
 
 ### Sweep / range controls
 

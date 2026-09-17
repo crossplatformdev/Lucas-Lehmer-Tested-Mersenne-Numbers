@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 #define BIGNUM_NO_MAIN
@@ -47,6 +48,21 @@ static void test_is_known_mersenne_prime() {
     assert(!mersenne::is_known_mersenne_prime(1u));
     // Values above uint32 max can never be known.
     assert(!mersenne::is_known_mersenne_prime(UINT64_C(5000000000)));
+}
+
+static void test_format_bench_time_elapsed() {
+    assert(format_bench_time_elapsed(0.0) ==
+           "0 days 0 hours 0 minutes 0 seconds 000 milliseconds");
+    assert(format_bench_time_elapsed(1.234) ==
+           "0 days 0 hours 0 minutes 1 seconds 234 milliseconds");
+    assert(format_bench_time_elapsed(3661.999) ==
+           "0 days 1 hours 1 minutes 1 seconds 999 milliseconds");
+    assert(format_bench_time_elapsed(1.9996) ==
+           "0 days 0 hours 0 minutes 2 seconds 000 milliseconds");
+    assert(format_bench_time_elapsed(-1.0) ==
+           "0 days 0 hours 0 minutes 0 seconds 000 milliseconds");
+    assert(format_bench_time_elapsed(std::numeric_limits<double>::quiet_NaN()) ==
+           "0 days 0 hours 0 minutes 0 seconds 000 milliseconds");
 }
 
 static void test_generate_post_known_exponents() {
@@ -403,6 +419,7 @@ int main() {
     test_sweep_apply_shard();
     test_sweep_mersenne_first_determinism();
     test_precharge_distribution();
+    test_format_bench_time_elapsed();
 
     // --- discover-mode tests ---
     test_is_known_mersenne_prime();
